@@ -4,13 +4,13 @@
 
 | Backlog | Готово к обсуждению | Обсуждаем | Готово |
 | --- | --- | --- | --- |
-| [#6 Bot API эксперимент](https://github.com/Hanan4ik/tgfs/issues/6) | [#3 FUSE и контракт MVP](https://github.com/Hanan4ik/tgfs/issues/3) | [#1 Выбор транспорта](https://github.com/Hanan4ik/tgfs/issues/1) | Первичный обзор официальных источников |
+| [#6 Bot API эксперимент](https://github.com/Hanan4ik/tgfs/issues/6) | — | [#3 FUSE и контракт MVP](https://github.com/Hanan4ik/tgfs/issues/3) | [#1 Выбран Bot API](https://github.com/Hanan4ik/tgfs/issues/1) |
 | [#7 Сбои записи FUSE](https://github.com/Hanan4ik/tgfs/issues/7) | [#4 Профили и mount](https://github.com/Hanan4ik/tgfs/issues/4) | [#2 Каталог и восстановление](https://github.com/Hanan4ik/tgfs/issues/2) | Начальная документация и задачи |
 | [#8 Read-only MVP после проектирования](https://github.com/Hanan4ik/tgfs/issues/8) | [#5 Части и целостность](https://github.com/Hanan4ik/tgfs/issues/5) | — | — |
 
 ## Правила
 
-- Одновременно обсуждать не больше двух тем; следующий фокус — #1.
+- Одновременно обсуждать не больше двух тем; текущий фокус — #3: терминология и файловые операции.
 - «Готово к обсуждению» означает наличие постановки, не готовность реализации.
 - Перемещать в «Готово» после критериев Issue и фиксации решения/результата в документах.
 - Сначала транспорт и формат, потом контракты и эксперименты; #8 заблокирован проектированием.
