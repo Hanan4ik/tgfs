@@ -10,6 +10,7 @@
 - [Исходные требования и оценка](docs/REQUIREMENTS.md).
 - [Словарь терминов с примерами](docs/GLOSSARY.md).
 - [Архитектура и контракт FUSE](docs/ARCHITECTURE.md).
+- [Создание файла: поля, сообщения и сбои](docs/CREATE_FILE_SCENARIO.md).
 - [Формат хранения и восстановление](docs/PROTOCOL.md).
 - [Конфигурация и монтирование](docs/CONFIGURATION.md).
 - [Проверенные ограничения Telegram](docs/TELEGRAM.md).

@@ -2,6 +2,8 @@
 
 Статус: proposed, версия эскиза 0.1; не совместимый с реализацией wire-format. [#2](https://github.com/Hanan4ik/tgfs/issues/2), [#5](https://github.com/Hanan4ik/tgfs/issues/5).
 
+Подробный пример с полями и последовательностью сообщений: [создание hello.txt](CREATE_FILE_SCENARIO.md). Это конкретизация эскиза, пока proposed.
+
 ## Три разные сущности
 
 **Inode** задаёт идентичность файла. **Version** задаёт неизменяемое содержимое inode в момент фиксации. **Chunk** — диапазон байт версии, отправленный отдельным document. Directory entry связывает parent_inode + name с inode.
