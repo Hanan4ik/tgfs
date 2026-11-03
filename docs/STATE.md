@@ -19,7 +19,7 @@
 - Принята архитектура каталогов/имён: каталог — объект со своим object_id; связь parent_object_id + name -> object_id отделена от содержимого. Пустые каталоги имеют удалённые метаданные и восстанавливаются без локального индекса; фиктивные data documents не нужны. Точные записи создания/публикации ещё обсуждаются.
 - Сводный SUPERBLOCK: JSON-текст в закреплённом сообщении; magic, format_version, type, start_id, root_object_id (UUIDv4), next_message. channel_id берётся из локальной конфигурации. Заголовок объявляет корень. Примеры локального размещения и индекса: SUPERBLOCK_V1.md; формат остальных типов ещё обсуждается.
 - Принято сохранение part_sha256 для проверки отдельных частей. Пустой файл — текстовый FILE_COMMIT без document/CHUNK и без байтов-заглушек: метаданные читаются из Message.text; у CHUNK — из Message.caption. Точный JSON commit/манифеста ещё обсуждается.
-- Записана рассмотренная схема отправки 60 MiB: три части по 20971520 и текстовый FILE_COMMIT со встроенным parts — FILE_COMMIT_V1.md. Общие object_id/version_id читаются второй машиной без регенерации; локальные inode могут различаться. Это не закрывает первые имена/каталоги, большие манифесты, генераторы ID, parser limits или эксперименты. part_index пока сохраняется в caption.
+- Записана рассмотренная схема отправки 60 MiB: три части по 20971520 и текстовый FILE_COMMIT со встроенным parts — FILE_COMMIT_V1.md. Общие object_id/version_id читаются второй машиной без регенерации; локальные inode могут различаться. Это не закрывает первые имена/каталоги, большие манифесты, генераторы ID, parser limits или эксперименты. Номер части берётся из последнего суффикса document.file_name вида video.mp4.0; part_index в caption отсутствует.
 - Принята обратная ссылка из CHUNK на FILE_COMMIT. Рабочее поле file_commit_id: строка исходного ID либо null до публикации; после commit captions выбранных частей дополняются каноническим ID операции. Это восстанавливаемая служебная ссылка, не новая точка публикации и не доказательство отсутствия commit при null. Переиспользование/очистка требуют проверки refs.
 - После MVP regular/directory нужно реализовать symlink, hardlink и специальные биты прав (sticky/setuid/setgid); принято требование предусмотреть это в архитектуре. План POSIX_METADATA_PLAN.md: тип объекта, несколько entries на один object_id, target_path ссылки и метаданные отдельно от bytes. Точные поля, UID/GID-политика и исполнение прав ещё proposed.
 - Сейчас проектируем вместе, программирование не начинаем.
@@ -31,7 +31,7 @@
 | Интеграция Linux | FUSE в userspace | [#3](https://github.com/Hanan4ik/tgfs/issues/3) |
 | Конфигурация | Один тип tgfs, именованные TOML-профили | [#4](https://github.com/Hanan4ik/tgfs/issues/4) |
 | Метаданные журнала | Точные поля FILE_COMMIT, кодирование ID, коллизии путей, checkpoint | [#2](https://github.com/Hanan4ik/tgfs/issues/2) |
-| Содержимое | CHUNK/FILE_COMMIT: рассмотренный вариант 20 MiB и JSON; точные limits/генераторы и filename ещё открыты | [#5](https://github.com/Hanan4ik/tgfs/issues/5) |
+| Содержимое | CHUNK/FILE_COMMIT: рассмотренный вариант 20 MiB и JSON; номер из filename принят; limits/генераторы и проверка сохранности filename ещё открыты | [#5](https://github.com/Hanan4ik/tgfs/issues/5) |
 | Порядок разработки | Read-only и контракт записи; ограничения multiwriter ещё уточняются | [#3](https://github.com/Hanan4ik/tgfs/issues/3) |
 
 ## Что выяснено
