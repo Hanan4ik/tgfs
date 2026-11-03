@@ -12,6 +12,7 @@
 - [Архитектура и контракт FUSE](docs/ARCHITECTURE.md).
 - [Создание файла: поля, сообщения и сбои](docs/CREATE_FILE_SCENARIO.md).
 - [Формат хранения и восстановление](docs/PROTOCOL.md).
+- [Открытые сценарии сбоев и варианты решений](docs/UNRESOLVED_FAILURE_SCENARIOS.md).
 - [Конфигурация и монтирование](docs/CONFIGURATION.md).
 - [Проверенные ограничения Telegram](docs/TELEGRAM.md).
 - [Канбан](docs/KANBAN.md) и [GitHub Issues](https://github.com/Hanan4ik/tgfs/issues).
