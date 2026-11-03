@@ -1,4 +1,4 @@
-# TGFS — Telegram Cloud Core
+# TGFS — Telegram File System
 
 Файловая система для Linux, в которой Telegram-канал хранит документы с данными и служебный каталог.
 
