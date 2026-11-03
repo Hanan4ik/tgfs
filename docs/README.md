@@ -5,11 +5,11 @@
 | Тип | Назначение | Caption | Document | Подробности |
 | --- | --- | --- | --- | --- |
 | CHUNK | Часть байтов файла | Объект, родитель-директория, версия, диапазон, размеры/хеши, file_commit_id, next_message | Сырые байты части | [CHUNK_V1.md](CHUNK_V1.md) |
-| DIRECTORY | Содержимое каталога | object_id, parent_id, общие поля и next_message | JSON со списком объектов и прямых Telegram ID | [DIRECTORY_V1.md](DIRECTORY_V1.md) |
+| DIRECTORY | Содержимое каталога | object_id, parent_id, общие поля и next_message | JSON со списком name + object_id | [DIRECTORY_V1.md](DIRECTORY_V1.md) |
 | FILE_COMMIT | Публикация завершённой версии | В рабочем варианте общие поля, операция/объект/версия, размер/хеш и next_message | JSON с parts | [FILE_COMMIT_V1.md](FILE_COMMIT_V1.md) |
 | SUPERBLOCK | Заголовок тома и корень | Не используется | Не используется: JSON находится в Message.text | [SUPERBLOCK_V1.md](SUPERBLOCK_V1.md) |
 
-Для FILE_COMMIT перенос parts в document выбран; точное распределение полей и отдельный манифест ещё обсуждаются. Для DIRECTORY выбран document; entries и полная схема записей для каталогов/пустых файлов ещё не утверждены.
+Для FILE_COMMIT перенос parts в document выбран; точное распределение полей и отдельный манифест ещё обсуждаются. Для DIRECTORY выбран document с entries из name + object_id, без file_commit_id. Публикация и выбор актуального каталога ещё открыты.
 
 ## Как связаны примеры
 
@@ -17,7 +17,8 @@
 
 | Переход | Где взять ссылку |
 | --- | --- |
-| Каталог → части файла | entries в document DIRECTORY |
+| Каталог → дочерний объект | name + object_id в entries document DIRECTORY |
+| object_id файла → FILE_COMMIT | Локальный индекс, восстановленный из журнала |
 | CHUNK → публикация | file_commit_id в caption; до заполнения может быть null |
 | FILE_COMMIT → полный комплект | parts в document |
 | Файл/обычная директория → родитель | parent_id, UUIDv4 директории; для корня правило ещё уточняется |
@@ -28,6 +29,10 @@ object_id — постоянная идентичность объекта; vers
 ## Общее кодирование
 
 JSON UTF-8; caption отправляется без parse_mode. UUID в примерах — строки нижнего регистра с дефисами; object_id принят как UUIDv4, генерация operation_id/version_id ещё уточняется. ID сообщений, размеры и смещения показаны десятичными строками; счётчики и format_version — целыми JSON. SHA-256 — 64 hex-символа нижнего регистра. Точные числовые пределы ещё открыты.
+
+## Перечисление и чтение
+
+[Mermaid-схемы сканирования журнала, ls и cat](READ_PROTOCOL.md). Правило выбора актуального DIRECTORY явно оставлено открытым.
 
 ## Решения и задачи
 

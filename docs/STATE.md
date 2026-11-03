@@ -23,7 +23,7 @@
 - Принят обязательный parent_id в caption CHUNK: UUIDv4 object_id родительской директории, для корня root_object_id. Цель должна иметь тип directory, а не файл или symlink. Все части комплекта содержат одинаковый parent_id; он сохраняется в локальном индексе. Публикация первого имени/пустого файла и правила rename/move/hardlink ещё требуют отдельного решения.
 - Принята обратная ссылка из CHUNK на FILE_COMMIT. Рабочее поле file_commit_id: строка исходного ID либо null до публикации; после commit captions выбранных частей дополняются каноническим ID операции. Это восстанавливаемая служебная ссылка, не новая точка публикации и не доказательство отсутствия commit при null. Переиспользование/очистка требуют проверки refs.
 - После MVP regular/directory нужно реализовать symlink, hardlink и специальные биты прав (sticky/setuid/setgid); принято требование предусмотреть это в архитектуре. План POSIX_METADATA_PLAN.md: тип объекта, несколько entries на один object_id, target_path ссылки и метаданные отдельно от bytes. Точные поля, UID/GID-политика и исполнение прав ещё proposed.
-- Ответы по MVP записаны в [MVP_DESIGN_DECISIONS.md](MVP_DESIGN_DECISIONS.md): каталог-document с object_id/parent_id в caption и прямыми refs в содержимом; parts FILE_COMMIT переносятся в document. При переотправке document message_id меняется, object_id остаётся. Точные схемы, выбор refs каталога и порядок публикации ещё открыты.
+- Ответы по MVP записаны в [MVP_DESIGN_DECISIONS.md](MVP_DESIGN_DECISIONS.md): каталог-document с object_id/parent_id в caption и name + object_id в entries, без ID commit и частей; parts FILE_COMMIT переносятся в document. При переотправке document message_id меняется, object_id остаётся. Выбор актуального каталога и порядок публикации ещё открыты.
 - Классификацию ошибок, включая ошибки формата и целостности, и действия при несостыковках отложили в [#10](https://github.com/Hanan4ik/tgfs/issues/10), Backlog. Пока продвигаемся по успешному сценарию MVP; детальные retry/errno/recovery ещё не выбраны.
 - Сейчас проектируем вместе, программирование не начинаем.
 
@@ -49,7 +49,9 @@
 
 ## Структуры на виду
 
-Точка входа: [docs/README.md](README.md). Отдельные описания: [CHUNK](CHUNK_V1.md), [DIRECTORY](DIRECTORY_V1.md), [FILE_COMMIT](FILE_COMMIT_V1.md) — примеры caption/document и таблицы полей. Схема DIRECTORY и распределение полей FILE_COMMIT обозначены рабочими предложениями; принятые направления сохранены. Прежний текстовый commit и пример 60 MiB вынесены в [историю](FILE_COMMIT_V1_TEXT_HISTORY.md). Это не утверждение окончательного wire-format и не закрытие Issues.
+Точка входа: [docs/README.md](README.md). Отдельные описания: [CHUNK](CHUNK_V1.md), [DIRECTORY](DIRECTORY_V1.md), [FILE_COMMIT](FILE_COMMIT_V1.md) — примеры caption/document и таблицы полей. DIRECTORY уточнён до entries с name + object_id без file_commit_id; CHUNK и FILE_COMMIT в этой правке не менялись. Прежний текстовый commit и пример 60 MiB вынесены в [историю](FILE_COMMIT_V1_TEXT_HISTORY.md). Это не утверждение окончательного wire-format и не закрытие Issues.
+
+Добавлены [Mermaid-схемы](READ_PROTOCOL.md) сканирования журнала, ls и cat. Шаг выбора актуального DIRECTORY показан как открытая предпосылка; контракты свежести и версии открытого handle не утверждены.
 
 ## Следующий вопрос
 
