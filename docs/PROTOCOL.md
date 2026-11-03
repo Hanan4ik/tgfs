@@ -50,7 +50,7 @@ object_id не является локальным Linux inode number, Telegram 
 
 ## Superblock и caption
 
-Сводная схема заголовка, типов полей и его локального/удалённого размещения: [SUPERBLOCK_V1.md](SUPERBLOCK_V1.md). Заголовок объявляет корневой каталог; его UUID не равен Telegram message_id по смыслу. Схема caption ниже ещё эскиз.
+Сводная схема заголовка, типов полей и его локального/удалённого размещения: [SUPERBLOCK_V1.md](SUPERBLOCK_V1.md). Заголовок объявляет корневой каталог; его UUID не равен Telegram message_id по смыслу. Схема caption ниже ещё эскиз; сводные размышления, пример двух частей и локальное размещение: [CHUNK_V1.md](CHUNK_V1.md), статус proposed.
 
 ```json
 {"magic":"TGFS","format_version":1,"type":"SUPERBLOCK","start_id":"100","root_object_id":"550e8400-e29b-41d4-a716-446655440000","next_message":null}

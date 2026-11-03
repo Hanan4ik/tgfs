@@ -4,7 +4,7 @@
 
 ## Облачный Bot API
 
-[FAQ по файлам](https://core.telegram.org/bots/faq#handling-media) указывает отправку файлов до 50 MB и скачивание через getFile до 20 MB. Следствие для TGFS: выбирать chunk по минимуму возможностей чтения и записи. Предлагаемые 16 MiB = 16 777 216 байт ниже обоих пределов. Не переносить неоднозначное обозначение MB в точный byte-limit без проверки.
+[FAQ по файлам](https://core.telegram.org/bots/faq#handling-media) указывает отправку файлов до 50 MB и скачивание через getFile до 20 MB. Следствие для TGFS: выбирать chunk по минимуму возможностей чтения и записи. Изначально предлагались 16 MiB. Уточнение 2026-11-03: в [Client.h официального сервера](https://github.com/tdlib/telegram-bot-api/blob/master/telegram-bot-api/Client.h) MAX_DOWNLOAD_FILE_SIZE = 20 << 20, то есть 20 971 520 байт. Это предел размера файла, не HTTP-запроса с caption. Новый кандидат для TGFS — 20 MiB; финальное принятие и проверка публичного endpoint ровно на границе ещё впереди. Размышления: [CHUNK_V1.md](CHUNK_V1.md).
 
 ## Собственный Bot API server
 
