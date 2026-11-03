@@ -30,10 +30,12 @@ channel2 /media/channel2  tgfs  ro,_netdev,nofail  0  0
 | Bot default | /etc/tgfs/bot.toml | $XDG_CONFIG_HOME/tgfs/bot.toml |
 | Channel default | /etc/tgfs/channel.toml | $XDG_CONFIG_HOME/tgfs/channel.toml |
 | Именованные профили | /etc/tgfs/profiles.d/name.toml | $XDG_CONFIG_HOME/tgfs/profiles.d/name.toml |
-| Индекс, intent, dirty staging | /var/lib/tgfs/fs_uuid/ | $XDG_STATE_HOME/tgfs/fs_uuid/ |
-| Чистый cache | /var/cache/tgfs/fs_uuid/ | $XDG_CACHE_HOME/tgfs/fs_uuid/ |
+| Индекс, intent, dirty staging | /var/lib/tgfs/channels/<channel_id>/ | $XDG_STATE_HOME/tgfs/channels/<channel_id>/ |
+| Чистый cache | /var/cache/tgfs/channels/<channel_id>/ | $XDG_CACHE_HOME/tgfs/channels/<channel_id>/ |
 
 XDG fallback — стандартные ~/.config, ~/.local/state, ~/.cache. Default синтетически использует bot.toml + channel.toml; отдельный profiles.d/default.toml не обязателен. Команда tgfs mount работает без root через FUSE в пределах прав пользователя. Системный helper не читает произвольный профиль из пользовательского каталога автоматически.
+
+Размещение заголовка тома и его проекция в локальный индекс: [SUPERBLOCK_V1.md](SUPERBLOCK_V1.md). Примеры index.sqlite3/staging — план размещения прототипа, не существующие файлы. channel_id берётся из конфигурации, root_object_id — из удалённого заголовка.
 
 ## bot.toml
 
@@ -67,7 +69,7 @@ id = -1001234567890
 null_channel_id = -1001234567891 # необязателен для TDLib/если recovery не нужен
 autoclean_null = true
 # superblock_message_id = 42 # заполняется после init
-# expected_fs_uuid = "..."    # защита от подключения другого тома
+# root_object_id читается из SUPERBLOCK; fs_uuid не используется
 
 [filesystem]
 read_only = true
