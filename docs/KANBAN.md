@@ -8,10 +8,13 @@
 | [#7 Сбои записи FUSE](https://github.com/Hanan4ik/tgfs/issues/7) | [#4 Профили и mount](https://github.com/Hanan4ik/tgfs/issues/4) | [#2 Каталог и восстановление](https://github.com/Hanan4ik/tgfs/issues/2) | Начальная документация и задачи |
 | [#8 Read-only MVP после проектирования](https://github.com/Hanan4ik/tgfs/issues/8) | [#5 Части и целостность](https://github.com/Hanan4ik/tgfs/issues/5) | — | — |
 | [#9 Очистка физических дубликатов](https://github.com/Hanan4ik/tgfs/issues/9) | — | — | — |
+| [#10 Классификация ошибок и несостыковок](https://github.com/Hanan4ik/tgfs/issues/10) | — | — | — |
 
 Сводный список открытых сценариев: [UNRESOLVED_FAILURE_SCENARIOS.md](UNRESOLVED_FAILURE_SCENARIOS.md). 51 сценарий с постановкой, статусом решения и критерием проверки; наличие записи не означает выполнения карточки.
 
 ## Правила
+
+- Новые ответы по MVP: [MVP_DESIGN_DECISIONS.md](MVP_DESIGN_DECISIONS.md). Каталог-document и перенос parts в document выбраны как направление; точные поля и публикация ещё обсуждаются. #10 — отложенная классификация ошибок формата/API/данных/локального слоя, без детального проектирования сейчас.
 
 - Текущий фокус — #2 совместно с #3: точные поля commit, генерация ID и контракт записи. FILE_COMMIT, refs частей, общий object_id и последняя публикация как текущая версия содержимого согласованы; правило повторов operation_id также принято; UUIDv4 для object_id выбран, SUPERBLOCK собран в [SUPERBLOCK_V1.md](SUPERBLOCK_V1.md); рассмотренный пример частей и встроенного FILE_COMMIT записан в [FILE_COMMIT_V1.md](FILE_COMMIT_V1.md). Следующий вопрос — создание имени с первой версией; большие манифесты, генераторы ID и parser limits ещё открыты. [ADR-0003](decisions/0003-journal-discovery.md) принят: маркер границы и обязательный next_message; #2 остаётся открытой, точный формат и rename/delete ещё обсуждаются. #6/#7 остаются Backlog: эксперименты не проведены.
 - «Готово к обсуждению» означает наличие постановки, не готовность реализации.
