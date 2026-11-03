@@ -6,6 +6,8 @@
 
 ## Навигация
 
+- **[Структуры CHUNK, DIRECTORY и FILE_COMMIT](docs/README.md)** — caption, содержимое document и поля каждой записи.
+
 - [Состояние и следующий вопрос](docs/STATE.md) — короткая точка входа для следующих сессий.
 - [Исходные требования и оценка](docs/REQUIREMENTS.md).
 - [Словарь терминов с примерами](docs/GLOSSARY.md).

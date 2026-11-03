@@ -34,7 +34,7 @@
 
 ## 3. Список parts в document
 
-Выбрано направление: перенести список parts FILE_COMMIT в document, чтобы его размер не ограничивался длиной текста Telegram. Прежние примеры текстового FILE_COMMIT с inline parts в FILE_COMMIT_V1.md сохраняются как история рассмотренного варианта; они больше не определяют окончательное размещение parts.
+Выбрано направление: перенести список parts FILE_COMMIT в document, чтобы его размер не ограничивался длиной текста Telegram. Прежние примеры текстового FILE_COMMIT с inline parts сохранены в [FILE_COMMIT_V1_TEXT_HISTORY.md](FILE_COMMIT_V1_TEXT_HISTORY.md); они больше не определяют окончательное размещение parts. Текущее описание структуры: [FILE_COMMIT_V1.md](FILE_COMMIT_V1.md), навигация по CHUNK/DIRECTORY/FILE_COMMIT — [README.md](README.md).
 
 Рабочее предложение ассистента: отправлять FILE_COMMIT одним document с описанием версии и parts, а в caption оставлять тип, идентификаторы и служебные ссылки. Завершённая отправка такого сообщения после частей служила бы публикацией версии.
 
