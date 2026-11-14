@@ -23,6 +23,9 @@ typedef struct {
  * Production endpoint is fixed to https://api.telegram.org. */
 int tgfs_bot_open(const char *token_file, unsigned timeout_seconds,
                   tgfs_bot **out, tgfs_bot_error *error);
+/* NULL: environment; empty: direct; explicit URL overrides NO_PROXY.
+ * Supported schemes: http, https, socks5, socks5h. No URL credentials. */
+int tgfs_bot_set_proxy(tgfs_bot *bot, const char *url, tgfs_bot_error *error);
 void tgfs_bot_close(tgfs_bot *bot);
 
 /* Allowed JSON methods: getMe/getChat/getFile/sendMessage/forwardMessage/

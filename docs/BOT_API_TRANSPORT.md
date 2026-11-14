@@ -88,11 +88,42 @@ forward_origin, небезопасный file_path, дубли ключей JSON
 TGFS_TEST_API_BASE=http://127.0.0.1:PORT. Рабочий build/tgfs игнорирует эту
 переменную; тестовый бинарник нельзя использовать с настоящим токеном.
 
-Локально прошли 30 тестов ядра и 5 тестов транспорта (включая подслучаи),
-также ASan/UBSan с detect_leaks=0 из-за ptrace среды. Живой Telegram-тест
-**не выполнен**: токен остаётся у пользователя. Критерии #6 не закрыты.
+Локально прошли 30 тестов ядра и 7 тестов транспорта (включая подслучаи),
+также ASan/UBSan с detect_leaks=0 из-за ptrace среды. Живой Telegram-тест выполнен пользователем 2026-11-14 через proxychains: все шаги PASS, 4096 байт, source_id=2 и copy_id=2 в разных каналах. SHA-256: `5aab18ea9659e7bd091b79d633c092fa67d846bf0d3b3c729dbc1f4cc7b29366`. Подтверждены document.file_name, изменение caption и forward_origin. Граничный размер и остальные эксперименты #6 не проверены. Токен остаётся у пользователя.
 
 Документация API: [Bot API](https://core.telegram.org/bots/api),
 [sendDocument](https://core.telegram.org/bots/api#senddocument),
 [getFile](https://core.telegram.org/bots/api#getfile),
 [MessageOriginChannel](https://core.telegram.org/bots/api#messageoriginchannel).
+
+## Прокси без proxychains
+
+```bash
+./build/tgfs probe \
+  --token-file "$HOME/.config/tgfs/secrets/test.token" \
+  --storage-chat-id -1003916921678 \
+  --service-chat-id -1004400939172 \
+  --proxy socks5h://127.0.0.1:10808
+```
+
+`--proxy` поддерживает http://, https://, socks5:// и socks5h://.
+Для SOCKS5 используйте socks5h, если DNS должен разрешаться на прокси.
+Явный прокси применяется ко всем запросам, включая multipart и скачивание,
+и имеет приоритет над proxy/NO_PROXY переменными окружения. Если прокси
+недоступен, запрос завершается ошибкой без перехода на прямое соединение.
+`--direct` отключает прокси окружения; вместе с `--proxy` не допускается.
+Без этих аргументов сохраняется стандартное поведение libcurl:
+HTTPS_PROXY/https_proxy, ALL_PROXY/all_proxy и NO_PROXY/no_proxy.
+
+Пароли в аргументе --proxy не принимаются (URL с userinfo отвергается).
+Для прокси с авторизацией пока используйте стандартные переменные окружения
+libcurl, заданные вне истории shell; не сохраняйте секреты в Git или mount options.
+Полный конфигурационный файл TGFS пока не подключён.
+
+Проверено локальным SOCKS5-сервером: весь probe, включая download, проходит
+через прокси; недоступный прокси не вызывает прямого запроса; credentials
+в CLI отвергаются без вывода секрета. Работоспособность встроенного прокси
+с Telegram предстоит подтвердить повторным запуском пользователя.
+
+Семантика: [CURLOPT_PROXY](https://curl.se/libcurl/c/CURLOPT_PROXY.html),
+[CURLOPT_NOPROXY](https://curl.se/libcurl/c/CURLOPT_NOPROXY.html).

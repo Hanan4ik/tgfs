@@ -171,14 +171,20 @@ done:
 int tgfs_probe_main(int argc, char **argv)
 {
     const char *token_file = NULL, *storage_text = NULL, *service_text = NULL, *timeout_text = NULL;
+    const char *proxy = NULL;
     unsigned timeout = 60;
     long long storage, service;
     for (int i = 2; i < argc; i += 2) {
+        if (!strcmp(argv[i], "--direct")) {
+            if (proxy) goto usage;
+            proxy = ""; i--; continue;
+        }
         if (i + 1 >= argc) goto usage;
         const char **slot;
         if (!strcmp(argv[i], "--token-file")) slot = &token_file;
         else if (!strcmp(argv[i], "--storage-chat-id")) slot = &storage_text;
         else if (!strcmp(argv[i], "--service-chat-id")) slot = &service_text;
+        else if (!strcmp(argv[i], "--proxy")) slot = &proxy;
         else if (!strcmp(argv[i], "--timeout-seconds")) slot = &timeout_text;
         else goto usage;
         if (*slot) goto usage;
@@ -196,11 +202,15 @@ int tgfs_probe_main(int argc, char **argv)
     if (tgfs_bot_open(token_file, timeout, &bot, &e)) {
         fprintf(stderr, "FAIL token/client: %s\n", e.message); return 1;
     }
+    if (tgfs_bot_set_proxy(bot, proxy, &e)) {
+        fprintf(stderr, "FAIL proxy: %s\n", e.message);
+        tgfs_bot_close(bot); return 1;
+    }
     int rc = probe(bot, storage_text, service_text, storage, service);
     tgfs_bot_close(bot);
     return rc;
 usage:
     fprintf(stderr, "usage: tgfs probe --token-file PATH --storage-chat-id -100... "
-                    "--service-chat-id -100... [--timeout-seconds 60]\n");
+                    "--service-chat-id -100... [--timeout-seconds 60] [--proxy URL | --direct]\n");
     return 2;
 }
