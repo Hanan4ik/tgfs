@@ -18,7 +18,7 @@ typedef struct {
     int message_unforwardable; /* Exact Bot API 400: message cannot be forwarded. */
     int message_missing; /* Exact Bot API 400: message to forward not found. */
     int outcome_unknown; /* A mutating request may have succeeded; never retry blindly. */
-    char message[160];   /* Controlled text only: no tokens, URLs or raw server bodies. */
+    char message[160];   /* Bounded printable diagnostic; token/secret and URLs suppressed. */
 } tgfs_bot_error;
 
 /* One synchronous client, owned by one thread. timeout_seconds: 1..300.

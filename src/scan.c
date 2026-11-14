@@ -161,7 +161,7 @@ static int scan(scanner *s, const char *directory, long long locator, unsigned b
 {
     cJSON *chat = NULL, *message = NULL, *sb = NULL, *journal = NULL, *r = NULL;
     cJSON *records = NULL, *missing = NULL, *objects = NULL;
-    long long start = 0, boundary = 0, last = 0;
+    long long start = 0, boundary = 0, last = 0, requested = 0;
     int dirfd = -1, rc = 1;
     unsigned found = 0;
     if (mkdir(directory, 0700)) { bad(s, "output directory must not already exist"); goto done; }
@@ -171,6 +171,7 @@ static int scan(scanner *s, const char *directory, long long locator, unsigned b
     if (s->copy_log < 0 || fsync(dirfd)) { bad(s, "cannot create service copy log"); goto done; }
     if (check_chat(s, s->storage, s->storage_id, &chat)) goto done;
     if (locator) {
+        requested = locator;
         if (forward(s, locator, &message)) goto done;
         /* Header() expects source addressing, never the copied message ID. */
         cJSON *source = cJSON_Duplicate(message, 1);
@@ -207,6 +208,7 @@ static int scan(scanner *s, const char *directory, long long locator, unsigned b
     if ((unsigned long long)(boundary - start) > budget) { bad(s, "scan range exceeds --max-messages; marker remains"); goto done; }
     for (long long id = start + 1; id < boundary; id++) {
         cJSON_Delete(message); message = NULL;
+        requested = id;
         if (forward(s, id, &message)) {
             if (!s->error.message_missing && !s->error.message_unforwardable) goto done;
             fprintf(stderr, "scan: source message_id=%lld unavailable (%s)\n", id,
@@ -269,8 +271,8 @@ static int scan(scanner *s, const char *directory, long long locator, unsigned b
     rc = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(journal, "coverage_verified")) ? 0 : 3;
 done:
     if (rc == 1) {
-        fprintf(stderr, "FAIL scan last_examined_id=%lld marker_id=%lld: %s [http=%ld api=%d retry_after=%u outcome_unknown=%d]\n",
-                last, boundary, s->error.message, s->error.http_status, s->error.api_code,
+        fprintf(stderr, "FAIL scan requested_id=%lld last_examined_id=%lld marker_id=%lld: %s [http=%ld api=%d retry_after=%u outcome_unknown=%d]\n",
+                requested, last, boundary, s->error.message, s->error.http_status, s->error.api_code,
                 s->error.retry_after, s->error.outcome_unknown);
         /* On failure retain known copy IDs even if cleanup itself fails. */
         cleanup(s);
