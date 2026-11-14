@@ -10,6 +10,7 @@
 
 int fail(tgfs_error *e, const char *format, ...);
 cJSON *json_load_at(int dirfd, const char *file, tgfs_error *e);
+cJSON *json_parse_bytes(const unsigned char *raw, size_t length, tgfs_error *e);
 unsigned char *bytes_load_at(int dirfd, const char *file, size_t limit,
                              size_t *length, tgfs_error *e);
 const char *json_string(const cJSON *object, const char *key);

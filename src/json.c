@@ -127,18 +127,30 @@ static int unique_keys(const cJSON *node, unsigned depth)
     return 1;
 }
 
+cJSON *json_parse_bytes(const unsigned char *raw, size_t len, tgfs_error *e)
+{
+    cJSON *root = NULL;
+    if (raw && len <= TGFS_MAX_JSON && preflight(raw, len)) {
+        char *copy = malloc(len + 1);
+        if (!copy) { fail(e, "out of memory"); return NULL; }
+        memcpy(copy, raw, len);
+        copy[len] = 0;
+        root = cJSON_ParseWithLengthOpts(copy, len + 1, NULL, 1);
+        free(copy);
+    }
+    if (!root || !unique_keys(root, 0)) {
+        cJSON_Delete(root); fail(e, "invalid JSON or duplicate keys"); return NULL;
+    }
+    return root;
+}
+
 cJSON *json_load_at(int dirfd, const char *file, tgfs_error *e)
 {
     size_t len;
     unsigned char *raw = bytes_load_at(dirfd, file, TGFS_MAX_JSON, &len, e);
     if (!raw) return NULL;
-    cJSON *root = NULL;
-    if (preflight(raw, len))
-        root = cJSON_ParseWithLengthOpts((const char *)raw, len + 1, NULL, 1);
+    cJSON *root = json_parse_bytes(raw, len, e);
     free(raw);
-    if (!root || !unique_keys(root, 0)) {
-        cJSON_Delete(root); fail(e, "invalid JSON or duplicate keys in %s", file); return NULL;
-    }
     return root;
 }
 

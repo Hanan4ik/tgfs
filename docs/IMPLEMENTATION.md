@@ -16,16 +16,15 @@ operation_id используется первое корректное сооб
 next_message не создаёт новую операцию. Входной порядок записей не важен.
 
 Это CLI и библиотечный интерфейс чтения, а не смонтированная файловая система.
-Нет обращений к Telegram, сканирования канала, SQLite, записи, автоматической
-очистки, кэша скачиваний или FUSE. Токен и тестовый канал не требуются.
+Snapshot ls/cat не обращаются к Telegram. Отдельно реализованы [Bot API транспорт и probe](BOT_API_TRANSPORT.md). Сканирования канала, SQLite, записи TGFS, автоматической очистки, кэша скачиваний или FUSE пока нет. Для snapshot токен не нужен.
 
 ## Сборка и запуск
 
-Зависимости: компилятор C11, Make, заголовки/библиотека OpenSSL libcrypto.
+Зависимости: компилятор C11, Make, заголовки/библиотека OpenSSL libcrypto, libcurl >= 7.85.
 Для тестов нужен Python 3 из стандартной библиотеки.
 
-Debian/Ubuntu: `sudo apt-get install build-essential libssl-dev python3`.
-Arch Linux: `sudo pacman -S --needed base-devel openssl python`.
+Debian/Ubuntu: `sudo apt-get install build-essential libssl-dev libcurl4-openssl-dev python3`.
+Arch Linux: `sudo pacman -S --needed base-devel openssl curl python`.
 
 ```sh
 make
@@ -100,8 +99,7 @@ root_entries задаётся явно, чтобы не выбирать за п
 | tests/integration.py | Сквозные проверки запуска с временными снимками |
 
 Для первого этапа выбраны cJSON и OpenSSL: cJSON включён в дерево с точной
-версией и лицензией, SHA-256 считается через EVP. Это не выбор HTTP/SQLite/FUSE
-зависимостей. LICENSE TGFS сохранён без изменений.
+версией и лицензией, SHA-256 считается через EVP. Для HTTP теперь используется libcurl; SQLite/FUSE зависимости ещё не выбраны. LICENSE TGFS сохранён без изменений.
 
 Проверяются несколько частей, UTF-8 имена, пустые файлы/каталоги,
 незавершённая загрузка, конфликт повторов, повреждения размера/хеша,
@@ -114,7 +112,7 @@ JSON/диапазоны. CI запускает сборку, тесты, ASan и
 
 ## Следующий шаг
 
-Добавить транспорт Bot API и получение метаданных по исходному message_id,
+Провести живой probe транспорта Bot API и подключить получение метаданных по исходному message_id,
 затем восстановление индекса до SCAN_MARKER. После проверки на выделенном
 канале подключить FUSE read/getattr/readdir/open. Перед выбором актуальных
 DIRECTORY и реализацией записи нужно отдельно завершить соответствующие

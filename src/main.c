@@ -1,4 +1,5 @@
 #include "tgfs/tgfs.h"
+#include "tgfs/bot_api.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -10,6 +11,7 @@ static int print_entry(const char *name, const char *object_id, void *arg)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "probe")) return tgfs_probe_main(argc, argv);
     if (argc != 5 || strcmp(argv[1], "--snapshot") ||
         (strcmp(argv[3], "ls") && strcmp(argv[3], "cat"))) {
         fprintf(stderr, "usage: tgfs --snapshot DIRECTORY {ls|cat} /absolute/path\n");
