@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import socketserver
+import select
 import subprocess
 import sys
 import tempfile
@@ -102,8 +104,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = bytes([payload[0] ^ 1]) + payload[1:]
         self.reply(payload)
 
+class Socks(socketserver.BaseRequestHandler):
+    def exact(self, n):
+        data = b''
+        while len(data) < n:
+            chunk = self.request.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError('short SOCKS request')
+            data += chunk
+        return data
+
+    def handle(self):
+        version, count = self.exact(2)
+        assert version == 5 and 0 in self.exact(count)
+        self.request.sendall(b'\x05\x00')
+        version, command, _, kind = self.exact(4)
+        assert version == 5 and command == 1
+        if kind == 1:
+            host = socket.inet_ntoa(self.exact(4))
+        elif kind == 3:
+            host = self.exact(self.exact(1)[0]).decode()
+        else:
+            raise AssertionError(kind)
+        port = int.from_bytes(self.exact(2), 'big')
+        self.server.targets.append((host, port))
+        with socket.create_connection((host, port), timeout=3) as upstream:
+            self.request.sendall(b'\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00')
+            while True:
+                ready, _, _ = select.select([self.request, upstream], [], [], 3)
+                if not ready:
+                    return
+                for source in ready:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    (upstream if source is self.request else self.request).sendall(data)
+
 class Transport(unittest.TestCase):
-    def run_probe(self, mode='ok', permissions=0o600):
+    def run_probe(self, mode='ok', permissions=0o600, extra=()):
         with tempfile.TemporaryDirectory() as temp:
             token = Path(temp) / 'token'
             token.write_text(TOKEN + '\n')
@@ -116,7 +154,7 @@ class Transport(unittest.TestCase):
                 env = dict(os.environ, TGFS_TEST_API_BASE=f'http://127.0.0.1:{server.server_port}')
                 result = subprocess.run([BINARY, 'probe', '--token-file', str(token),
                     '--storage-chat-id', str(STORAGE), '--service-chat-id', str(SERVICE),
-                    '--timeout-seconds', '2'], env=env, capture_output=True, text=True, timeout=10)
+                    '--timeout-seconds', '2', *extra], env=env, capture_output=True, text=True, timeout=10)
                 output = result.stdout + result.stderr
                 self.assertNotIn(TOKEN, output)
                 self.assertNotIn('AddressSanitizer', output)
@@ -126,6 +164,36 @@ class Transport(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join()
+
+    def test_socks_proxy_all_requests(self):
+        proxy = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Socks)
+        proxy.daemon_threads = True
+        proxy.targets = []
+        worker = threading.Thread(target=proxy.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+        worker.start()
+        try:
+            rc, out, calls = self.run_probe(extra=('--proxy', f'socks5h://127.0.0.1:{proxy.server_address[1]}'))
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(len(proxy.targets), len(calls))
+            self.assertEqual(len(calls), 8)
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            worker.join()
+
+    def test_proxy_failure_and_validation(self):
+        with socket.socket() as closed:
+            closed.bind(('127.0.0.1', 0))
+            port = closed.getsockname()[1]
+        rc, out, calls = self.run_probe(extra=('--proxy', f'socks5h://127.0.0.1:{port}'))
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [])  # Never silently fall back to direct.
+        rc, out, calls = self.run_probe(extra=('--proxy', 'http://user:SECRET@localhost:80'))
+        self.assertEqual(rc, 1)
+        self.assertNotIn('SECRET', out)
+        self.assertEqual(calls, [])
+        rc, out, calls = self.run_probe(extra=('--direct',))
+        self.assertEqual(rc, 0, out)
 
     def test_roundtrip(self):
         rc, out, calls = self.run_probe()

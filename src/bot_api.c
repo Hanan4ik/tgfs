@@ -21,6 +21,7 @@ struct tgfs_bot {
     char token[TOKEN_LIMIT + 1];
     char base[96];
     unsigned timeout;
+    char *proxy;
 };
 typedef struct {
     unsigned char *data;
@@ -121,10 +122,30 @@ int tgfs_bot_open(const char *file, unsigned timeout, tgfs_bot **out, tgfs_bot_e
     return 0;
 }
 
+int tgfs_bot_set_proxy(tgfs_bot *b, const char *url, tgfs_bot_error *e)
+{
+    clear_error(e);
+    if (!b) return bot_fail(e, TGFS_BOT_LOCAL, "missing client");
+    if (url && *url) {
+        const char *host = NULL;
+        const char *schemes[] = {"http://", "https://", "socks5://", "socks5h://"};
+        for (size_t i = 0; i < sizeof(schemes) / sizeof(*schemes); i++)
+            if (!strncmp(url, schemes[i], strlen(schemes[i]))) host = url + strlen(schemes[i]);
+        if (!host || !*host || strlen(url) > 1024 || strpbrk(host, "@/?#\\ \t\r\n"))
+            return bot_fail(e, TGFS_BOT_LOCAL, "invalid proxy URL (credentials are not accepted)");
+    }
+    char *copy = url ? strdup(url) : NULL;
+    if (url && !copy) return bot_fail(e, TGFS_BOT_LOCAL, "out of memory");
+    free(b->proxy);
+    b->proxy = copy;
+    return 0;
+}
+
 void tgfs_bot_close(tgfs_bot *b)
 {
     if (!b) return;
     curl_easy_cleanup(b->curl);
+    free(b->proxy);
     OPENSSL_cleanse(b, sizeof(*b));
     free(b);
     curl_global_cleanup();
@@ -167,6 +188,10 @@ static int configure(tgfs_bot *b, const char *url, response *r, tgfs_bot_error *
 #else
     OPT(CURLOPT_PROTOCOLS_STR, "https");
 #endif
+    if (b->proxy) {
+        OPT(CURLOPT_PROXY, b->proxy);
+        OPT(CURLOPT_NOPROXY, "");
+    }
 #undef OPT
     return 0;
 }
