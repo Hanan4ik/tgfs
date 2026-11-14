@@ -1,0 +1,67 @@
+{
+  "superblock": {
+    "magic": "TGFS",
+    "format_version": 1,
+    "type": "SUPERBLOCK",
+    "next_message": null,
+    "start_id": "1",
+    "root_object_id": "a30d487f-167a-4eb3-8b06-b0676a039470"
+  },
+  "root_entries": [
+    {
+      "name": "documents",
+      "object_id": "c5ccf4d2-79ba-4ab7-a4d0-d9b84b40a8cd"
+    }
+  ],
+  "messages": [
+    {
+      "message_id": "10",
+      "caption": {
+        "magic": "TGFS",
+        "format_version": 1,
+        "type": "DIRECTORY",
+        "next_message": null,
+        "object_id": "c5ccf4d2-79ba-4ab7-a4d0-d9b84b40a8cd",
+        "parent_id": "a30d487f-167a-4eb3-8b06-b0676a039470"
+      },
+      "document": "10.json"
+    },
+    {
+      "message_id": "101",
+      "filename": "hello.txt.0",
+      "caption": {
+        "magic": "TGFS",
+        "format_version": 1,
+        "type": "CHUNK",
+        "next_message": null,
+        "object_id": "550e8400-e29b-41d4-a716-446655440000",
+        "parent_id": "c5ccf4d2-79ba-4ab7-a4d0-d9b84b40a8cd",
+        "version_id": "5d5d82f0-1445-4b81-9a45-501cc939b56e",
+        "part_count": 1,
+        "offset": "0",
+        "part_size": "6",
+        "part_sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+        "file_size": "6",
+        "file_sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+        "file_commit_id": null
+      },
+      "document": "101.bin"
+    },
+    {
+      "message_id": "110",
+      "caption": {
+        "magic": "TGFS",
+        "format_version": 1,
+        "type": "FILE_COMMIT",
+        "next_message": null,
+        "operation_id": "3f9c7148-61a2-4c70-9a8d-53f98166e510",
+        "object_id": "550e8400-e29b-41d4-a716-446655440000",
+        "version_id": "5d5d82f0-1445-4b81-9a45-501cc939b56e",
+        "file_size": "6",
+        "file_sha256": "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+        "part_count": 1
+      },
+      "document": "110.json"
+    }
+  ]
+}
