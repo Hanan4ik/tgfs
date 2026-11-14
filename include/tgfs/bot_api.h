@@ -3,6 +3,7 @@
 
 #include "cJSON.h"
 #include <stddef.h>
+#include <stdio.h>
 
 typedef struct tgfs_bot tgfs_bot;
 typedef enum {
@@ -44,6 +45,7 @@ int tgfs_bot_download(tgfs_bot *bot, const char *file_path,
 /* Safe conversions for numeric Telegram response fields (up to 52 bits). */
 int tgfs_bot_integer(const cJSON *object, const char *key, long long *out);
 int tgfs_bot_channel_id(const char *text, long long *out);
+void tgfs_probe_help(FILE *stream);
 int tgfs_probe_main(int argc, char **argv);
 
 #endif
