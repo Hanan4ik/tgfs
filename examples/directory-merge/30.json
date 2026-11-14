@@ -1,0 +1,10 @@
+{
+  "operations": [
+    {
+      "operation_id": "1d41ef66-4a5d-46a2-a045-ec58346ff574",
+      "action": "ADD",
+      "name": "photo.jpg",
+      "object_id": "29198b5f-822b-4dfc-aea9-e496e1e0801f"
+    }
+  ]
+}

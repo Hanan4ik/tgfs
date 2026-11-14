@@ -18,6 +18,7 @@ struct tgfs {
     cJSON *snapshot;
     const char *root_id;
     const cJSON *root_entries;
+    cJSON *directory_views;
     message *messages;
     size_t count;
 };
@@ -129,7 +130,7 @@ int tgfs_open_snapshot(const char *directory, tgfs **out, tgfs_error *e)
         fail(e, "invalid SUPERBLOCK root or start_id"); goto invalid;
     }
     fs->root_entries = cJSON_GetObjectItemCaseSensitive(fs->snapshot, "root_entries");
-    if (entries_valid(fs->root_entries, e)) goto invalid;
+    if (fs->root_entries && entries_valid(fs->root_entries, e)) goto invalid;
     const cJSON *messages = cJSON_GetObjectItemCaseSensitive(fs->snapshot, "messages");
     if (!cJSON_IsArray(messages) || cJSON_GetArraySize(messages) > TGFS_MAX_RECORDS) {
         fail(e, "invalid snapshot messages"); goto invalid;
@@ -152,7 +153,7 @@ int tgfs_open_snapshot(const char *directory, tgfs **out, tgfs_error *e)
             fail(e, "invalid snapshot record or unsupported message type"); goto invalid;
         }
         if (envelope(m->caption, m->type, e)) goto invalid;
-        if (same(m->object_id, fs->root_id)) {
+        if (same(m->object_id, fs->root_id) && !same(m->type, "DIRECTORY")) {
             fail(e, "root object is supplied by snapshot root_entries, not message records"); goto invalid;
         }
         if (!same(m->type, "CHUNK")) {
@@ -163,9 +164,12 @@ int tgfs_open_snapshot(const char *directory, tgfs **out, tgfs_error *e)
             }
         }
         if (same(m->type, "DIRECTORY")) {
-            if (!uuid_valid(json_string(m->caption, "parent_id")) ||
-                entries_valid(cJSON_GetObjectItemCaseSensitive(m->body, "entries"), e)) {
-                fail(e, "invalid DIRECTORY metadata or entries"); goto invalid;
+            const cJSON *parent=cJSON_GetObjectItemCaseSensitive(m->caption,"parent_id");
+            int root=same(m->object_id,fs->root_id);
+            if ((root ? !cJSON_IsNull(parent) : !uuid_valid(json_string(m->caption,"parent_id"))) ||
+                (cJSON_HasObjectItem(m->body,"operations") ? directory_operations_valid(m->body,e) :
+                 entries_valid(cJSON_GetObjectItemCaseSensitive(m->body,"entries"),e))) {
+                fail(e,"invalid DIRECTORY metadata or entries/operations");goto invalid;
             }
         }
         if (same(m->type, "FILE_COMMIT") && commit_valid(m, e)) goto invalid;
@@ -176,7 +180,7 @@ int tgfs_open_snapshot(const char *directory, tgfs **out, tgfs_error *e)
         if (i && a->id == fs->messages[i - 1].id) {
             fail(e, "duplicate message_id"); goto invalid;
         }
-        if (same(a->type, "DIRECTORY") && !directory_known(fs, json_string(a->caption, "parent_id"))) {
+        if (same(a->type, "DIRECTORY") && !same(a->object_id, fs->root_id) && !directory_known(fs, json_string(a->caption, "parent_id"))) {
             fail(e, "DIRECTORY parent_id is not a directory"); goto invalid;
         }
         for (size_t j = 0; j < i; j++) {
@@ -186,11 +190,37 @@ int tgfs_open_snapshot(const char *directory, tgfs **out, tgfs_error *e)
                  (same(b->type, "DIRECTORY") && !same(a->type, "DIRECTORY")))) {
                 fail(e, "object_id has inconsistent object types"); goto invalid;
             }
+            if (same(a->type,"DIRECTORY") && same(b->type,"DIRECTORY") && same(a->object_id,b->object_id) &&
+                ((!same(a->object_id,fs->root_id) && !same(json_string(a->caption,"parent_id"),json_string(b->caption,"parent_id"))) ||
+                 cJSON_HasObjectItem(a->body,"operations") != cJSON_HasObjectItem(b->body,"operations"))) {
+                fail(e,"DIRECTORY parent or document mode changed");goto invalid;
+            }
             if (same(a->type, "FILE_COMMIT") && same(b->type, "FILE_COMMIT") &&
                 same(json_string(a->caption, "operation_id"), json_string(b->caption, "operation_id")) &&
                 (!json_semantic_equal(a->caption, b->caption) || !cJSON_Compare(a->body, b->body, 1))) {
                 fail(e, "operation_id reused with different commit contents"); goto invalid;
             }
+        }
+    }
+    tgfs_directory_batch *batches=calloc(fs->count ? fs->count : 1,sizeof(*batches));
+    if(!batches) {fail(e,"out of memory");goto invalid;}
+    size_t batch_count=0;
+    int root_record=0;
+    for(size_t i=0;i<fs->count;i++) if(same(fs->messages[i].type,"DIRECTORY")) {
+        message *m=&fs->messages[i];
+        batches[batch_count++]=(tgfs_directory_batch){m->id,m->object_id,m->body};
+        if(same(m->object_id,fs->root_id)) root_record=1;
+    }
+    if(root_record && fs->root_entries && cJSON_GetArraySize(fs->root_entries)) {
+        free(batches);fail(e,"root_entries cannot be mixed with root DIRECTORY");goto invalid;
+    }
+    fs->directory_views=directory_merge(batches,batch_count,e);
+    free(batches);
+    if(!fs->directory_views) goto invalid;
+    if(!root_record && !fs->root_entries) {
+        cJSON *empty=cJSON_CreateArray();
+        if(!empty || !cJSON_AddItemToObject(fs->directory_views,fs->root_id,empty)) {
+            cJSON_Delete(empty);fail(e,"out of memory");goto invalid;
         }
     }
     *out = fs;
@@ -206,6 +236,7 @@ void tgfs_close(tgfs *fs)
     if (fs->messages)
         for (size_t i = 0; i < fs->count; i++) cJSON_Delete(fs->messages[i].body);
     free(fs->messages);
+    cJSON_Delete(fs->directory_views);
     cJSON_Delete(fs->snapshot);
     if (fs->dirfd >= 0) close(fs->dirfd);
     free(fs);
@@ -213,7 +244,9 @@ void tgfs_close(tgfs *fs)
 
 static const cJSON *directory_entries(tgfs *fs, const char *id, tgfs_error *e)
 {
-    if (same(id, fs->root_id)) return fs->root_entries;
+    const cJSON *merged=cJSON_GetObjectItemCaseSensitive(fs->directory_views,id);
+    if(merged) return merged;
+    if (same(id, fs->root_id) && fs->root_entries && cJSON_GetArraySize(fs->root_entries)) return fs->root_entries;
     const message *found = NULL;
     for (size_t i = 0; i < fs->count; i++) {
         message *m = &fs->messages[i];
@@ -221,7 +254,10 @@ static const cJSON *directory_entries(tgfs *fs, const char *id, tgfs_error *e)
         if (found) { fail(e, "ambiguous DIRECTORY: publication selection is not defined"); return NULL; }
         found = m;
     }
-    if (!found) { fail(e, "path component is not an available directory"); return NULL; }
+    if (!found) {
+        if(same(id,fs->root_id)) return fs->root_entries;
+        fail(e, "path component is not an available directory"); return NULL;
+    }
     return cJSON_GetObjectItemCaseSensitive(found->body, "entries");
 }
 

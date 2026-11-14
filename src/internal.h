@@ -22,4 +22,13 @@ int hash_valid(const char *s);
 int name_valid(const char *s);
 int json_semantic_equal(const cJSON *a, const cJSON *b);
 
+/* Batches must be sorted by source message ID. Bodies are borrowed. */
+typedef struct {
+    uint64_t message_id;
+    const char *object_id;
+    const cJSON *body;
+} tgfs_directory_batch;
+cJSON *directory_merge(const tgfs_directory_batch *batches, size_t count, tgfs_error *e);
+int directory_operations_valid(const cJSON *body, tgfs_error *e);
+
 #endif

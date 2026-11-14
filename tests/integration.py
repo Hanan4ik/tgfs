@@ -237,6 +237,108 @@ class ReadCore(unittest.TestCase):
         self.write("110.json", dict(parts=[dict(message_id="101", offset="0", part_size="20971521", part_sha256=SHA(b""))]))
         self.run_cli(ok=False, error="range or reference")
 
+    def directory_op(self, index, action='ADD', name='hello.txt', object_id=FILE, observed=None):
+        import uuid
+        op=dict(operation_id=str(uuid.UUID(int=(4<<76)|(2<<62)|index)), action=action, name=name)
+        if action=='ADD': op['object_id']=object_id
+        else: op['observed_adds']=observed
+        return op
+
+    def operation_directory(self, *ops):
+        self.write('10.json',dict(operations=list(ops)))
+
+    def directory_batch(self, mid, *ops, directory=DIRECTORY, parent=ROOT):
+        return self.add(mid,envelope('DIRECTORY',object_id=directory,parent_id=parent),dict(operations=list(ops)))
+
+    def test_directory_independent_additions_merge_and_read(self):
+        hello=self.directory_op(1)
+        self.operation_directory(hello)
+        self.directory_batch(20,self.directory_op(2,name='notes.txt',object_id=EMPTY))
+        self.directory_batch(30,self.directory_op(3,name='photo.jpg',object_id=EMPTY))
+        expected=b'hello.txt\nnotes.txt\nphoto.jpg\n'
+        self.assertEqual(self.run_cli('ls','/documents'),expected)
+        self.snapshot['messages'].reverse()
+        self.assertEqual(self.run_cli('ls','/documents'),expected)
+        self.assertEqual(self.run_cli(),self.data)
+
+    def test_directory_remove_and_old_retry_do_not_resurrect(self):
+        add=self.directory_op(1)
+        self.operation_directory(add)
+        remove=self.directory_op(2,'REMOVE',observed=[add['operation_id']])
+        self.directory_batch(20,remove)
+        self.directory_batch(30,add)
+        self.directory_batch(40,remove)
+        self.assertEqual(self.run_cli('ls','/documents'),b'')
+        self.run_cli(ok=False,error='path does not exist')
+
+    def test_directory_unobserved_add_survives_remove(self):
+        add=self.directory_op(1)
+        self.operation_directory(add)
+        self.directory_batch(20,self.directory_op(2,name='hello.txt',object_id=FILE))
+        self.directory_batch(30,self.directory_op(3,'REMOVE',observed=[add['operation_id']]))
+        self.assertEqual(self.run_cli('ls','/documents'),b'hello.txt\n')
+        self.assertEqual(self.run_cli(),self.data)
+
+    def test_directory_readd_after_remove(self):
+        add=self.directory_op(1)
+        self.operation_directory(add)
+        self.directory_batch(20,self.directory_op(2,'REMOVE',observed=[add['operation_id']]))
+        self.directory_batch(30,self.directory_op(3))
+        self.assertEqual(self.run_cli(),self.data)
+
+    def test_directory_same_name_different_object_conflict(self):
+        self.operation_directory(self.directory_op(1))
+        self.directory_batch(20,self.directory_op(2,object_id=EMPTY))
+        self.run_cli('ls','/documents',ok=False,error='name conflict')
+
+    def test_directory_conflict_resolved_by_observed_remove(self):
+        a,b=self.directory_op(1),self.directory_op(2,object_id=EMPTY)
+        self.operation_directory(a)
+        self.directory_batch(20,b)
+        self.directory_batch(30,self.directory_op(3,'REMOVE',observed=[b['operation_id']]))
+        self.assertEqual(self.run_cli(),self.data)
+
+    def test_directory_missing_or_wrong_remove_target(self):
+        a=self.directory_op(1)
+        for target,name in ((self.directory_op(9)['operation_id'],'hello.txt'),(a['operation_id'],'wrong.txt')):
+            self.operation_directory(a)
+            self.write('10.json',dict(operations=[a,self.directory_op(2,'REMOVE',name=name,observed=[target])]))
+            self.run_cli('ls','/documents',ok=False,error='observed ADD')
+
+    def test_directory_operation_id_reuse_is_rejected(self):
+        a=self.directory_op(1)
+        self.operation_directory(a)
+        self.directory_batch(20,dict(a,name='different.txt'))
+        self.run_cli(ok=False,error='operation_id reused')
+
+    def test_directory_root_operations_and_empty_root(self):
+        del self.snapshot['root_entries']
+        self.assertEqual(self.run_cli('ls','/'),b'')
+        self.directory_batch(20,self.directory_op(1,name='documents',object_id=DIRECTORY),directory=ROOT,parent=None)
+        self.assertEqual(self.run_cli(),self.data)
+        self.assertEqual(self.run_cli('ls','/'),b'documents\n')
+
+    def test_directory_root_cannot_mix_with_adapter_seed(self):
+        self.directory_batch(20,directory=ROOT,parent=None)
+        self.run_cli(ok=False,error='root_entries cannot be mixed')
+
+    def test_directory_cannot_merge_legacy_snapshots_and_operations(self):
+        self.directory_batch(20,self.directory_op(1))
+        self.run_cli(ok=False,error='document mode changed')
+
+    def test_directory_parent_cannot_change_on_merge(self):
+        self.operation_directory(self.directory_op(1))
+        self.directory_batch(20,parent=DIRECTORY)
+        self.run_cli(ok=False,error='parent or document mode changed')
+
+    def test_directory_malformed_operations(self):
+        a=self.directory_op(1)
+        for body in (dict(entries=[],operations=[]),dict(operations=[dict(a,action='INVALID')]),
+                     dict(operations=[self.directory_op(2,'REMOVE',observed=[])]),
+                     dict(operations=[dict(a,operation_id='invalid')])):
+            self.write('10.json',body)
+            self.run_cli(ok=False,error='invalid DIRECTORY')
+
 
 if __name__ == "__main__":
     unittest.main()

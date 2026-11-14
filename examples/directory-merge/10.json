@@ -1,0 +1,10 @@
+{
+  "operations": [
+    {
+      "operation_id": "46d7a7f2-582a-4f2f-a683-f109379159b4",
+      "action": "ADD",
+      "name": "hello.txt",
+      "object_id": "550e8400-e29b-41d4-a716-446655440000"
+    }
+  ]
+}
