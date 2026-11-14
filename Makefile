@@ -2,18 +2,24 @@ CC ?= cc
 CPPFLAGS += -Iinclude -Ithird_party/cjson -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror
-LDLIBS += -lcrypto -lm
-SOURCES = src/main.c src/core.c src/json.c third_party/cjson/cJSON.c
+LDLIBS += -lcrypto -lcurl -lm
+SOURCES = src/main.c src/core.c src/json.c src/bot_api.c src/probe.c third_party/cjson/cJSON.c
+HEADERS = include/tgfs/tgfs.h include/tgfs/bot_api.h src/internal.h third_party/cjson/cJSON.h
 
 .PHONY: all test sanitize clean
 all: build/tgfs
 
-build/tgfs: $(SOURCES) include/tgfs/tgfs.h src/internal.h third_party/cjson/cJSON.h
+build/tgfs: $(SOURCES) $(HEADERS)
 	mkdir -p build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
 
-test: build/tgfs
+build/tgfs-test: $(SOURCES) $(HEADERS)
+	mkdir -p build
+	$(CC) $(CPPFLAGS) -DTGFS_TESTING $(CFLAGS) $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $@
+
+test: build/tgfs build/tgfs-test
 	python3 tests/integration.py ./build/tgfs
+	python3 tests/transport.py ./build/tgfs-test
 
 sanitize:
 	$(MAKE) clean
