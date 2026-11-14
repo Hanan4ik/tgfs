@@ -15,6 +15,8 @@ typedef struct {
     long http_status;
     int api_code;
     unsigned retry_after;
+    int message_unforwardable; /* Exact Bot API 400: message cannot be forwarded. */
+    int message_missing; /* Exact Bot API 400: message to forward not found. */
     int outcome_unknown; /* A mutating request may have succeeded; never retry blindly. */
     char message[160];   /* Controlled text only: no tokens, URLs or raw server bodies. */
 } tgfs_bot_error;
@@ -30,7 +32,7 @@ int tgfs_bot_set_proxy(tgfs_bot *bot, const char *url, tgfs_bot_error *error);
 void tgfs_bot_close(tgfs_bot *bot);
 
 /* Allowed JSON methods: getMe/getChat/getFile/sendMessage/forwardMessage/
- * editMessageText/editMessageCaption. params is borrowed, result is owned by
+ * editMessageText/editMessageCaption/deleteMessage. params is borrowed, result is owned by
  * caller (cJSON_Delete); result is NULL on failure. No automatic retries. */
 int tgfs_bot_call(tgfs_bot *bot, const char *method, const cJSON *params,
                   cJSON **result, tgfs_bot_error *error);

@@ -227,6 +227,11 @@ static int api_result(response *r, long http, int mutating, cJSON **result, tgfs
         }
         if (e) {
             e->api_code = (int)code;
+            const char *description = json_string(root, "description");
+            e->message_unforwardable = http == 400 && code == 400 && description &&
+                !strcmp(description, "Bad Request: message can't be forwarded");
+            e->message_missing = http == 400 && code == 400 && description &&
+                !strcmp(description, "Bad Request: message to forward not found");
             /* 5xx after a mutating request does not prove that nothing happened. */
             e->outcome_unknown = mutating && (code >= 500 || http >= 500);
             if (!tgfs_bot_integer(parameters, "retry_after", &retry) && retry > 0 && retry <= UINT_MAX)
@@ -249,7 +254,7 @@ int tgfs_bot_call(tgfs_bot *b, const char *method, const cJSON *params, cJSON **
     clear_error(e);
     if (result) *result = NULL;
     const char *allowed[] = {"getMe", "getChat", "getFile", "sendMessage", "forwardMessage",
-                             "editMessageText", "editMessageCaption"};
+                             "editMessageText", "editMessageCaption", "deleteMessage"};
     int index = -1;
     for (size_t i = 0; method && i < sizeof(allowed) / sizeof(*allowed); i++)
         if (!strcmp(method, allowed[i])) index = (int)i;
