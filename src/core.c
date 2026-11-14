@@ -15,6 +15,8 @@ typedef struct {
 
 struct tgfs {
     int dirfd;
+    tgfs_chunk_loader loader;
+    void *loader_context;
     cJSON *snapshot;
     const char *root_id;
     const cJSON *root_entries;
@@ -113,11 +115,18 @@ static int directory_known(tgfs *fs, const char *id)
 
 int tgfs_open_snapshot(const char *directory, tgfs **out, tgfs_error *e)
 {
+    return tgfs_open_snapshot_loader(directory,NULL,NULL,out,e);
+}
+
+int tgfs_open_snapshot_loader(const char *directory, tgfs_chunk_loader loader,
+                             void *context, tgfs **out, tgfs_error *e)
+{
     if (!out) return fail(e, "missing output pointer");
     *out = NULL;
     if (!directory) return fail(e, "missing snapshot directory");
     tgfs *fs = calloc(1, sizeof(*fs));
     if (!fs) return fail(e, "out of memory");
+    fs->loader=loader; fs->loader_context=context;
     fs->dirfd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fs->dirfd < 0) { tgfs_close(fs); return fail(e, "cannot open snapshot directory"); }
     fs->snapshot = json_load_at(fs->dirfd, "snapshot.json", e);
@@ -386,7 +395,8 @@ int tgfs_cat(tgfs *fs, const char *path, FILE *output, tgfs_error *e)
         }
         message *chunk = message_find(fs, mid);
         size_t length;
-        unsigned char *bytes = bytes_load_at(fs->dirfd, chunk->document, TGFS_MAX_CHUNK, &length, e);
+        unsigned char *bytes = fs->loader ? fs->loader(mid,&length,fs->loader_context,e) :
+            bytes_load_at(fs->dirfd, chunk->document, TGFS_MAX_CHUNK, &length, e);
         if (!bytes) goto done;
         char hash[65];
         if (length != expected || digest(bytes, length, hash) ||
