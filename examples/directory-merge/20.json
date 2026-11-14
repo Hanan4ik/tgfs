@@ -1,0 +1,10 @@
+{
+  "operations": [
+    {
+      "operation_id": "e1f4d5cb-2dba-445c-9332-b1a71e317a9f",
+      "action": "ADD",
+      "name": "notes.txt",
+      "object_id": "6e65ed68-f274-4d0a-810c-9396815ed248"
+    }
+  ]
+}

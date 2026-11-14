@@ -4,6 +4,10 @@
 
 Навигация: [все структуры](README.md), [CHUNK](CHUNK_V1.md), [FILE_COMMIT](FILE_COMMIT_V1.md). Основания: [ответы по MVP](MVP_DESIGN_DECISIONS.md). Основная задача: [#2](https://github.com/Hanan4ik/tgfs/issues/2).
 
+## Реализация слияния (2026-11-15)
+
+После согласования пользователем реализовано [добавление/удаление имён через операции](DIRECTORY_OPERATIONS.md). Новый document содержит operations с ADD/REMOVE и устойчивыми operation_id. entries ниже сохранён как старый статический формат, а не правило слияния. Корневой DIRECTORY использует parent_id=null.
+
 ## Что где находится
 
 | Место | Содержимое |
@@ -38,7 +42,7 @@
 | parent_id | UUIDv4 string для обычного каталога | object_id родительской директории; не файл, не symlink, не Telegram ID |
 | next_message | decimal string или null | Обязательная навигация по журналу |
 
-object_id корневой директории задаётся root_object_id в SUPERBLOCK. Значение parent_id у самого корня пока не выбрано; приведённый caption относится только к некорневому каталогу. Автоматически назначать корню родителя или считать null уже принятым правилом нельзя.
+object_id корневой директории задаётся root_object_id в SUPERBLOCK. Обновление 2026-11-15: parent_id корня — null; приведённый caption относится только к некорневому каталогу. Текущая реализация корня описана в DIRECTORY_OPERATIONS.md.
 
 ## Содержимое document
 

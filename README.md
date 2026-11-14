@@ -27,6 +27,8 @@ make test
 
 [Инициализация тестового тома](docs/INITIALIZATION.md): `tgfs init --help`.
 
+[Слияние изменений каталогов](docs/DIRECTORY_OPERATIONS.md) — ADD/REMOVE и локальный пример.
+
 ## Навигация
 
 - **[Структуры CHUNK, DIRECTORY и FILE_COMMIT](docs/README.md)** — caption, содержимое document и поля каждой записи.
