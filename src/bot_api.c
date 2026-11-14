@@ -63,7 +63,8 @@ static int token_read(const char *file, char token[TOKEN_LIMIT + 1], tgfs_bot_er
     }
     size_t done = 0, size = (size_t)st.st_size;
     while (done < size) {
-        ssize_t n = read(fd, token + done, size - done);
+        /* A token is at most 256 bytes; keep the read bound explicit for fortify. */
+        ssize_t n = read(fd, token + done, 1);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) { close(fd); return bot_fail(e, TGFS_BOT_LOCAL, "cannot read token file"); }
         done += (size_t)n;
