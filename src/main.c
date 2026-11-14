@@ -9,12 +9,31 @@ static int print_entry(const char *name, const char *object_id, void *arg)
     return fprintf((FILE *)arg, "%s\n", name) < 0;
 }
 
+static void help(FILE *stream)
+{
+    fputs("TGFS - Telegram File System prototype\n\n"
+          "usage: tgfs --snapshot DIRECTORY {ls|cat} /absolute/path\n"
+          "       tgfs probe --token-file PATH --storage-chat-id ID --service-chat-id ID [options]\n"
+          "       tgfs --help\n\n"
+          "Snapshot commands (local data, no Telegram connection):\n"
+          "  --snapshot DIRECTORY     Read snapshot.json and documents from DIRECTORY.\n"
+          "  ls /absolute/path        List immediate directory entries.\n"
+          "  cat /absolute/path       Read a file and verify part/file SHA-256.\n\n"
+          "  -h, --help               Show all available commands and options.\n\n"
+          "Channel mounting/FUSE is not implemented.\n"
+          "Exit codes: 0 success/help, 1 operation failed, 2 invalid arguments.\n\n", stream);
+    tgfs_probe_help(stream);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+        help(stdout); return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "probe")) return tgfs_probe_main(argc, argv);
     if (argc != 5 || strcmp(argv[1], "--snapshot") ||
         (strcmp(argv[3], "ls") && strcmp(argv[3], "cat"))) {
-        fprintf(stderr, "usage: tgfs --snapshot DIRECTORY {ls|cat} /absolute/path\n");
+        help(stderr);
         return 2;
     }
     tgfs_error error = {{0}};

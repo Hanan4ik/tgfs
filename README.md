@@ -8,6 +8,7 @@
 
 ```sh
 make
+./build/tgfs --help
 ./build/tgfs --snapshot examples/hello ls /documents
 ./build/tgfs --snapshot examples/hello cat /documents/hello.txt
 make test
@@ -17,6 +18,10 @@ make test
 [Описание реализации и границ прототипа](docs/IMPLEMENTATION.md).
 
 [Транспорт и запуск проверки на тестовых каналах](docs/BOT_API_TRANSPORT.md).
+
+`tgfs --help` (также `-h`) описывает все команды и параметры;
+`tgfs probe --help` показывает справку живой проверки. Запуск без аргументов
+выводит общую справку в stderr с кодом 2. Запрос справки возвращает 0 и не обращается к сети.
 
 ## Навигация
 
