@@ -53,11 +53,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
             return
-        if s.mode in ('missing', 'unforwardable', 'unforwardable_upper', 'invalid_id', 'other400', 'rate', 'forbidden') and mid == 3:
-            if s.mode in ('invalid_id','other400','unforwardable_upper'):
+        if s.mode in ('missing', 'unforwardable', 'unforwardable_upper', 'unforwardable_the', 'invalid_id', 'other400', 'rate', 'forbidden') and mid == 3:
+            if s.mode in ('invalid_id','other400','unforwardable_upper','unforwardable_the'):
                 description={'invalid_id':'Bad Request: MESSAGE_ID_INVALID',
                     'other400':'Bad Request: chat not found',
-                    'unforwardable_upper':"Bad Request: Message can't be forwarded"}[s.mode]
+                    'unforwardable_upper':"Bad Request: Message can't be forwarded",
+                    'unforwardable_the':"Bad Request: the message can't be forwarded"}[s.mode]
                 return self.reply(error=dict(ok=False,error_code=400,description=description),status=400)
             if s.mode == 'unforwardable':
                 return self.reply(error=dict(ok=False, error_code=400,
@@ -163,7 +164,7 @@ class Scan(unittest.TestCase):
                     self.assertEqual(sum(m=='forwardMessage' and p['message_id']==3 for m,p in calls),1)
 
     def test_error_variants_and_diagnostics(self):
-        for mode in ('invalid_id','unforwardable_upper'):
+        for mode in ('invalid_id','unforwardable_upper','unforwardable_the'):
             rc,out,j,_,_=self.scan(mode)
             self.assertEqual(rc,3,out)
             self.assertFalse(j['coverage_verified'])

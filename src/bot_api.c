@@ -230,7 +230,8 @@ static int api_result(response *r, long http, int mutating, const char *token, c
             const char *description = json_string(root, "description");
             e->message_unforwardable = http == 400 && code == 400 && description &&
                 (!strcmp(description, "Bad Request: message can't be forwarded") ||
-                 !strcmp(description, "Bad Request: Message can't be forwarded"));
+                 !strcmp(description, "Bad Request: Message can't be forwarded") ||
+                 !strcmp(description, "Bad Request: the message can't be forwarded"));
             e->message_missing = http == 400 && code == 400 && description &&
                 (!strcmp(description, "Bad Request: message to forward not found") ||
                  !strcmp(description, "Bad Request: MESSAGE_ID_INVALID") ||
