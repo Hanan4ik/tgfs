@@ -122,3 +122,7 @@ origin, malformed envelope, лимит диапазона и очередь оч
 API сверено 2026-11-14: [getChat](https://core.telegram.org/bots/api#getchat),
 [forwardMessage](https://core.telegram.org/bots/api#forwardmessage),
 [deleteMessage](https://core.telegram.org/bots/api#deletemessage).
+
+## Диагностика после первого живого scan
+
+Маркер 5 отправлен успешно, ошибка возникла на ID 4 после SUPERBLOCK 3. Это вероятная запись закрепления, не установленный факт. Теперь FAIL показывает requested_id и ограниченное печатное описание API; описания с токеном/его секретной частью или URL скрываются. Дополнительно распознаются MESSAGE_ID_INVALID/message_id_invalid и вариант Message can't be forwarded: они означают только недоступный ID (код 3), не доказанное отсутствие данных. Другие 400, включая chat not found, по-прежнему останавливают обход. Для повтора используйте новый --output, например capture-002; init повторять не требуется.

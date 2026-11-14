@@ -211,7 +211,7 @@ static int perform(tgfs_bot *b, response *r, int mutating, tgfs_bot_error *e, lo
         ? "request timed out" : "network or TLS request failed");
 }
 
-static int api_result(response *r, long http, int mutating, cJSON **result, tgfs_bot_error *e)
+static int api_result(response *r, long http, int mutating, const char *token, cJSON **result, tgfs_bot_error *e)
 {
     if (e) e->outcome_unknown = mutating;
     tgfs_error parse_error;
@@ -229,16 +229,32 @@ static int api_result(response *r, long http, int mutating, cJSON **result, tgfs
             e->api_code = (int)code;
             const char *description = json_string(root, "description");
             e->message_unforwardable = http == 400 && code == 400 && description &&
-                !strcmp(description, "Bad Request: message can't be forwarded");
+                (!strcmp(description, "Bad Request: message can't be forwarded") ||
+                 !strcmp(description, "Bad Request: Message can't be forwarded"));
             e->message_missing = http == 400 && code == 400 && description &&
-                !strcmp(description, "Bad Request: message to forward not found");
+                (!strcmp(description, "Bad Request: message to forward not found") ||
+                 !strcmp(description, "Bad Request: MESSAGE_ID_INVALID") ||
+                 !strcmp(description, "Bad Request: message_id_invalid"));
             /* 5xx after a mutating request does not prove that nothing happened. */
             e->outcome_unknown = mutating && (code >= 500 || http >= 500);
             if (!tgfs_bot_integer(parameters, "retry_after", &retry) && retry > 0 && retry <= UINT_MAX)
                 e->retry_after = (unsigned)retry;
         }
+        bot_fail(e, TGFS_BOT_API, "Telegram API rejected the request");
+        const char *description = json_string(root, "description");
+        const char *secret = strchr(token, ':');
+        /* Bounded printable diagnostic; never expose credentials or URLs. */
+        if (e && description && !strstr(description, token) &&
+            (!secret || !strstr(description, secret + 1)) &&
+            !strstr(description, "://")) {
+            size_t n = strlen(description);
+            if (n > 120) n = 120;
+            snprintf(e->message, sizeof(e->message), "Telegram API: %.*s", (int)n, description);
+            for (char *p = e->message; *p; p++)
+                if ((unsigned char)*p < 32 || (unsigned char)*p > 126) *p = '?';
+        }
         cJSON_Delete(root);
-        return bot_fail(e, TGFS_BOT_API, "Telegram API rejected the request");
+        return -1;
     }
     if (http < 200 || http >= 300 || !cJSON_IsTrue(ok) || !cJSON_HasObjectItem(root, "result")) {
         cJSON_Delete(root); return bot_fail(e, TGFS_BOT_FORMAT, "unexpected HTTP status or API envelope");
@@ -277,7 +293,7 @@ int tgfs_bot_call(tgfs_bot *b, const char *method, const cJSON *params, cJSON **
         bot_fail(e, TGFS_BOT_LOCAL, "cannot configure JSON request"); goto done;
     }
     int mutating = index >= 3 && strcmp(method, "getChatMember");
-    if (!perform(b, &r, mutating, e, &status)) rc = api_result(&r, status, mutating, result, e);
+    if (!perform(b, &r, mutating, e, &status)) rc = api_result(&r, status, mutating, b->token, result, e);
 done:
     curl_easy_reset(b->curl);
     curl_slist_free_all(headers);
@@ -322,7 +338,7 @@ int tgfs_bot_send_document(tgfs_bot *b, const char *chat_id, const char *filenam
         curl_mime_data(part, bytes, length) || curl_easy_setopt(b->curl, CURLOPT_MIMEPOST, mime)) {
         bot_fail(e, TGFS_BOT_LOCAL, "cannot build document upload"); goto done;
     }
-    if (!perform(b, &r, 1, e, &status)) rc = api_result(&r, status, 1, result, e);
+    if (!perform(b, &r, 1, e, &status)) rc = api_result(&r, status, 1, b->token, result, e);
 done:
     curl_easy_reset(b->curl);
     curl_mime_free(mime); free(r.data);
