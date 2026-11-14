@@ -1,0 +1,16 @@
+name: C read core
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev python3
+      - name: Build and integration tests
+        run: make test
+      - name: AddressSanitizer and UndefinedBehaviorSanitizer
+        run: make sanitize
