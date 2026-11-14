@@ -168,8 +168,29 @@ done:
     return rc;
 }
 
+void tgfs_probe_help(FILE *stream)
+{
+    fputs("usage: tgfs probe --token-file PATH --storage-chat-id -100... "
+          "--service-chat-id -100... [options]\n"
+          "\nProbe: upload 4096 random bytes, edit caption, forward to service channel,\n"
+          "verify forward_origin, download and compare bytes/SHA-256.\n"
+          "Leaves two test messages in the channels.\n\n"
+          "  --token-file PATH        Owner-only token file (for example chmod 600).\n"
+          "  --storage-chat-id ID     Full negative Bot API ID of storage channel.\n"
+          "  --service-chat-id ID     Full negative Bot API ID of distinct service channel.\n"
+          "  --timeout-seconds N      Request timeout: 1..300 seconds (default 60).\n"
+          "  --proxy URL              http://, https://, socks5:// or socks5h:// proxy;\n"
+          "                           no credentials in URL; overrides proxy/NO_PROXY env.\n"
+          "  --direct                 Disable proxies; mutually exclusive with --proxy.\n"
+          "                           Without either flag, use libcurl proxy environment.\n"
+          "  -h, --help               Show this help without contacting Telegram.\n", stream);
+}
+
 int tgfs_probe_main(int argc, char **argv)
 {
+    if (argc == 3 && (!strcmp(argv[2], "--help") || !strcmp(argv[2], "-h"))) {
+        tgfs_probe_help(stdout); return 0;
+    }
     const char *token_file = NULL, *storage_text = NULL, *service_text = NULL, *timeout_text = NULL;
     const char *proxy = NULL;
     unsigned timeout = 60;
@@ -210,7 +231,6 @@ int tgfs_probe_main(int argc, char **argv)
     tgfs_bot_close(bot);
     return rc;
 usage:
-    fprintf(stderr, "usage: tgfs probe --token-file PATH --storage-chat-id -100... "
-                    "--service-chat-id -100... [--timeout-seconds 60] [--proxy URL | --direct]\n");
+    tgfs_probe_help(stderr);
     return 2;
 }
