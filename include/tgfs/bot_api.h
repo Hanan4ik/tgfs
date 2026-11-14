@@ -32,7 +32,7 @@ int tgfs_bot_set_proxy(tgfs_bot *bot, const char *url, tgfs_bot_error *error);
 void tgfs_bot_close(tgfs_bot *bot);
 
 /* Allowed JSON methods: getMe/getChat/getFile/sendMessage/forwardMessage/
- * editMessageText/editMessageCaption/deleteMessage. params is borrowed, result is owned by
+ * editMessageText/editMessageCaption/deleteMessage/getChatMember/pinChatMessage. params is borrowed, result is owned by
  * caller (cJSON_Delete); result is NULL on failure. No automatic retries. */
 int tgfs_bot_call(tgfs_bot *bot, const char *method, const cJSON *params,
                   cJSON **result, tgfs_bot_error *error);
