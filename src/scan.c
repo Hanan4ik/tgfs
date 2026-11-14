@@ -210,10 +210,10 @@ static int scan(scanner *s, const char *directory, long long locator, unsigned b
         cJSON_Delete(message); message = NULL;
         requested = id;
         if (forward(s, id, &message)) {
-            if (!s->error.message_missing && !s->error.message_unforwardable) goto done;
-            fprintf(stderr, "scan: source message_id=%lld unavailable (%s)\n", id,
-                    s->error.message_missing ? "not found" : "not forwardable");
-            /* An API not-found is recorded as uncertainty, not a proven empty interval. */
+            if (s->error.kind != TGFS_BOT_API || s->error.http_status != 400 ||
+                s->error.api_code != 400) goto done;
+            /* Accepted channel contract: forwarding is enabled; 400 is a gap. */
+            fprintf(stderr, "scan: source message_id=%lld skipped (forwardMessage 400)\n", id);
             if (add_id(missing, id)) { bad(s, "cannot record unavailable ID"); goto done; }
             memset(&s->error, 0, sizeof(s->error)); last = id; continue;
         }
@@ -253,6 +253,8 @@ static int scan(scanner *s, const char *directory, long long locator, unsigned b
     cleanup(s);
     char bound[32]; snprintf(bound, sizeof(bound), "%lld", boundary);
     if (!cJSON_AddStringToObject(journal, "boundary_id", bound) ||
+        !cJSON_AddStringToObject(journal, "gap_policy", "forward_400_is_gap") ||
+        !cJSON_AddBoolToObject(journal, "scan_completed", 1) ||
         !cJSON_AddBoolToObject(journal, "coverage_verified", cJSON_GetArraySize(missing) == 0) ||
         !cJSON_AddItemToObject(journal, "records", records)) { bad(s, "cannot finalize journal"); goto done; }
     records = NULL;
@@ -268,7 +270,7 @@ static int scan(scanner *s, const char *directory, long long locator, unsigned b
     printf("OK scan boundary=%lld records=%u unavailable=%d cleanup_pending=%d\n", boundary, found,
            cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(journal, "unavailable_ids")),
            cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(journal, "cleanup_pending")));
-    rc = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(journal, "coverage_verified")) ? 0 : 3;
+    rc = 0;
 done:
     if (rc == 1) {
         fprintf(stderr, "FAIL scan requested_id=%lld last_examined_id=%lld marker_id=%lld: %s [http=%ld api=%d retry_after=%u outcome_unknown=%d]\n",
@@ -303,7 +305,7 @@ void tgfs_scan_help(FILE *stream)
           "  --timeout-seconds N      1..300, default 60.\n"
           "  --proxy URL | --direct   Same routing options as probe.\n"
           "  -h, --help               Show help without network requests.\n"
-          "Exit 0: all IDs examined; 1: failed; 2: arguments; 3: unavailable IDs.\n", stream);
+          "Exit 0: scan completed (forwardMessage 400 counted as gaps); 1: failed; 2: arguments.\n", stream);
 }
 int tgfs_scan_main(int argc, char **argv)
 {

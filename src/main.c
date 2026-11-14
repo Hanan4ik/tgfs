@@ -23,8 +23,7 @@ static void help(FILE *stream)
           "  cat /absolute/path       Read a file and verify part/file SHA-256.\n\n"
           "  -h, --help               Show all available commands and options.\n\n"
           "Channel mounting/FUSE is not implemented.\n"
-          "Exit codes: 0 success/help, 1 operation failed, 2 invalid arguments;\n"
-          "            scan also returns 3 for unavailable source IDs.\n\n", stream);
+          "Exit codes: 0 success/help, 1 operation failed, 2 invalid arguments.\n\n", stream);
     tgfs_probe_help(stream);
     fputc('\n', stream);
     tgfs_scan_help(stream);
