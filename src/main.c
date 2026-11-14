@@ -28,6 +28,8 @@ static void help(FILE *stream)
     tgfs_probe_help(stream);
     fputc('\n', stream);
     tgfs_scan_help(stream);
+    fputc('\n', stream);
+    tgfs_init_help(stream);
 }
 
 int main(int argc, char **argv)
@@ -35,6 +37,7 @@ int main(int argc, char **argv)
     if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         help(stdout); return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "init")) return tgfs_init_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "scan")) return tgfs_scan_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "probe")) return tgfs_probe_main(argc, argv);
     if (argc != 5 || strcmp(argv[1], "--snapshot") ||

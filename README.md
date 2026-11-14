@@ -25,6 +25,8 @@ make test
 
 [Сканирование канала и индекс записей](docs/CHANNEL_SCAN.md).
 
+[Инициализация тестового тома](docs/INITIALIZATION.md): `tgfs init --help`.
+
 ## Навигация
 
 - **[Структуры CHUNK, DIRECTORY и FILE_COMMIT](docs/README.md)** — caption, содержимое document и поля каждой записи.

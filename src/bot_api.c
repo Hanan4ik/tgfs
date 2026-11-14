@@ -254,7 +254,7 @@ int tgfs_bot_call(tgfs_bot *b, const char *method, const cJSON *params, cJSON **
     clear_error(e);
     if (result) *result = NULL;
     const char *allowed[] = {"getMe", "getChat", "getFile", "sendMessage", "forwardMessage",
-                             "editMessageText", "editMessageCaption", "deleteMessage"};
+                             "editMessageText", "editMessageCaption", "deleteMessage", "getChatMember", "pinChatMessage"};
     int index = -1;
     for (size_t i = 0; method && i < sizeof(allowed) / sizeof(*allowed); i++)
         if (!strcmp(method, allowed[i])) index = (int)i;
@@ -276,7 +276,8 @@ int tgfs_bot_call(tgfs_bot *b, const char *method, const cJSON *params, cJSON **
         curl_easy_setopt(b->curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(body))) {
         bot_fail(e, TGFS_BOT_LOCAL, "cannot configure JSON request"); goto done;
     }
-    if (!perform(b, &r, index >= 3, e, &status)) rc = api_result(&r, status, index >= 3, result, e);
+    int mutating = index >= 3 && strcmp(method, "getChatMember");
+    if (!perform(b, &r, mutating, e, &status)) rc = api_result(&r, status, mutating, result, e);
 done:
     curl_easy_reset(b->curl);
     curl_slist_free_all(headers);
