@@ -31,4 +31,7 @@ typedef struct {
 cJSON *directory_merge(const tgfs_directory_batch *batches, size_t count, tgfs_error *e);
 int directory_operations_valid(const cJSON *body, tgfs_error *e);
 
+struct tgfs_bot;
+int remote_check_root_name(struct tgfs_bot *bot, const cJSON *journal, const char *name, tgfs_error *e);
+
 #endif

@@ -17,6 +17,7 @@ static void help(FILE *stream)
           "       tgfs probe --token-file PATH --storage-chat-id ID --service-chat-id ID [options]\n"
           "       tgfs scan --token-file PATH --storage-chat-id ID --service-chat-id ID --output DIRECTORY [options]\n"
           "       tgfs read --capture DIRECTORY --token-file PATH [options] {ls|cat} /absolute/path\n"
+          "       tgfs put --capture DIRECTORY --file PATH --name NAME --state-dir DIRECTORY --token-file PATH [options]\n"
           "       tgfs --help\n\n"
           "Snapshot commands (local data, no Telegram connection):\n"
           "  --snapshot DIRECTORY     Read snapshot.json and documents from DIRECTORY.\n"
@@ -31,6 +32,7 @@ static void help(FILE *stream)
     fputc('\n', stream);
     tgfs_init_help(stream);
     fputc('\n',stream);tgfs_read_help(stream);
+    fputc('\n',stream);tgfs_put_help(stream);
 }
 
 int main(int argc, char **argv)
@@ -38,6 +40,7 @@ int main(int argc, char **argv)
     if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         help(stdout); return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "put")) return tgfs_put_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "read")) return tgfs_read_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "init")) return tgfs_init_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "scan")) return tgfs_scan_main(argc, argv);

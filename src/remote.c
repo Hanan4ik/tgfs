@@ -86,7 +86,14 @@ static void clean(int dir,const char *path)
     }
     close(dir);rmdir(path);
 }
-static int read_capture(remote *r,const cJSON *journal,const char *command,const char *path,tgfs_error *e)
+typedef struct { const char *name; int found; } name_check;
+static int check_entry(const char *name,const char *object,void *arg)
+{
+    (void)object;name_check *check=arg;
+    if(same(name,check->name)) check->found=1;
+    return 0;
+}
+static int read_capture(remote *r,const cJSON *journal,const char *command,const char *path,const char *new_name,tgfs_error *e)
 {
     const cJSON *sb=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
     uint64_t start,boundary;
@@ -169,10 +176,19 @@ static int read_capture(remote *r,const cJSON *journal,const char *command,const
         write_file(dir,"snapshot.json",(const unsigned char *)raw,length,e);
     free(raw);
     if(written || tgfs_open_snapshot_loader(temp,load_chunk,r,&fs,e)) goto done;
-    rc=same(command,"ls") ? tgfs_list(fs,path,emit,stdout,e) : tgfs_cat(fs,path,stdout,e);
-    if(!rc && fflush(stdout)) rc=fail(e,"cannot flush output");
+    if(new_name) {
+        name_check check={.name=new_name};
+        rc=tgfs_list(fs,"/",check_entry,&check,e);
+        if(!rc && check.found) rc=fail(e,"name already exists in captured root");
+    } else rc=same(command,"ls") ? tgfs_list(fs,path,emit,stdout,e) : tgfs_cat(fs,path,stdout,e);
+    if(!new_name && !rc && fflush(stdout)) rc=fail(e,"cannot flush output");
 done:
     tgfs_close(fs);cJSON_Delete(snapshot);cJSON_Delete(messages);clean(dir,temp);return rc;
+}
+int remote_check_root_name(tgfs_bot *bot,const cJSON *journal,const char *name,tgfs_error *e)
+{
+    remote r={.bot=bot};
+    return read_capture(&r,journal,"ls","/",name,e);
 }
 void tgfs_read_help(FILE *stream)
 {
@@ -213,7 +229,7 @@ int tgfs_read_main(int argc,char **argv)
     if(tgfs_bot_open(token,(unsigned)timeout,&r.bot,&b) || tgfs_bot_set_proxy(r.bot,proxy,&b)) {
         api_failure(&e,&b);goto done;
     }
-    rc=read_capture(&r,journal,argv[argc-2],argv[argc-1],&e) ? 1 : 0;
+    rc=read_capture(&r,journal,argv[argc-2],argv[argc-1],NULL,&e) ? 1 : 0;
 done:
     if(rc) fprintf(stderr,"FAIL read: %s\n",e.message);
     tgfs_bot_close(r.bot);cJSON_Delete(journal);return rc;
