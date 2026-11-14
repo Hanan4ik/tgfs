@@ -33,6 +33,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         p = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         s = self.server
         s.calls.append((method, p))
+        if method == 'getChat' and s.mode == 'getchat400':
+            return self.reply(error=dict(ok=False,error_code=400,description='arbitrary text'),status=400)
         if method == 'getChat':
             chat = dict(id=int(p['chat_id']), type='channel')
             if int(p['chat_id']) == STORAGE and s.mode != 'noheader':
@@ -56,7 +58,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if s.mode in ('missing', 'unforwardable', 'unforwardable_upper', 'unforwardable_the', 'invalid_id', 'other400', 'rate', 'forbidden') and mid == 3:
             if s.mode in ('invalid_id','other400','unforwardable_upper','unforwardable_the'):
                 description={'invalid_id':'Bad Request: MESSAGE_ID_INVALID',
-                    'other400':'Bad Request: chat not found',
+                    'other400':'arbitrary new error wording',
                     'unforwardable_upper':"Bad Request: Message can't be forwarded",
                     'unforwardable_the':"Bad Request: the message can't be forwarded"}[s.mode]
                 return self.reply(error=dict(ok=False,error_code=400,description=description),status=400)
@@ -138,18 +140,18 @@ class Scan(unittest.TestCase):
 
     def test_missing_is_not_verified(self):
         rc, out, j, _, _ = self.scan('missing')
-        self.assertEqual(rc, 3, out)
+        self.assertEqual(rc, 0, out)
         self.assertEqual(j['unavailable_ids'], ['3'])
         self.assertFalse(j['coverage_verified'])
 
     def test_unforwardable_is_not_verified(self):
         rc, out, j, _, _ = self.scan('unforwardable')
-        self.assertEqual(rc, 3, out)
+        self.assertEqual(rc, 0, out)
         self.assertEqual(j['unavailable_ids'], ['3'])
         self.assertFalse(j['coverage_verified'])
 
     def test_failure_no_published_journal(self):
-        for mode in ('rate','forbidden','origin','bad_envelope','marker_identity','noheader','lost','malformed'):
+        for mode in ('rate','forbidden','origin','bad_envelope','marker_identity','noheader','lost','malformed','getchat400'):
             with self.subTest(mode=mode):
                 rc, out, j, calls, _ = self.scan(mode)
                 self.assertEqual(rc, 1, out)
@@ -166,14 +168,14 @@ class Scan(unittest.TestCase):
     def test_error_variants_and_diagnostics(self):
         for mode in ('invalid_id','unforwardable_upper','unforwardable_the'):
             rc,out,j,_,_=self.scan(mode)
-            self.assertEqual(rc,3,out)
+            self.assertEqual(rc,0,out)
             self.assertFalse(j['coverage_verified'])
             self.assertEqual(j['unavailable_ids'],['3'])
         rc,out,j,_,_=self.scan('other400')
-        self.assertEqual(rc,1,out)
-        self.assertIsNone(j)
-        self.assertIn('requested_id=3',out)
-        self.assertIn('Bad Request: chat not found',out)
+        self.assertEqual(rc,0,out)
+        self.assertTrue(j['scan_completed'])
+        self.assertEqual(j['gap_policy'],'forward_400_is_gap')
+        self.assertEqual(j['unavailable_ids'],['3'])
 
     def test_cleanup_queue(self):
         rc,out,j,_,_ = self.scan('cleanup')
