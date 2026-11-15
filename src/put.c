@@ -209,50 +209,53 @@ invalid:
     cJSON_Delete(entry);cJSON_Delete(ops);cJSON_Delete(body);return NULL;
 }
 static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *name,const char *parent_path,
-               const char *state,size_t chunk_size,tgfs_error *e)
+               const char *state,size_t chunk_size,int replace,tgfs_error *e)
 {
     int rc=-1,dir=-1,parts_attached=0;
     unsigned char *bytes=NULL;
     size_t size=0,commit_size=0,directory_size=0;
     cJSON *intent=NULL,*parts=NULL,*captions=NULL,*commit=NULL,*body=NULL,*directory=NULL,*directory_body=NULL;
     const char *chat=json_string(journal,"storage_chat_id");long long channel=0,commit_id=0,directory_id=0;
-    char parent_id[37],grandparent[37];
+    char parent_id[37],grandparent[37],base_version[37],object[37];uint64_t base_commit=0;
     cJSON *wire=cJSON_CreateString(name);char *encoded=wire?cJSON_PrintUnformatted(wire):NULL;
     cJSON *decoded=encoded?json_parse_bytes((const unsigned char *)encoded,strlen(encoded),e):NULL;
     cJSON_Delete(wire);free(encoded);
     if(!decoded) {fail(e,"filename must be valid UTF-8");goto done;}cJSON_Delete(decoded);
-    if(remote_directory_target(bot,journal,parent_path,name,parent_id,grandparent,e) || tgfs_bot_channel_id(chat,&channel) || !uuid_valid(parent_id) ||
-        check_pin(bot,journal,e)) goto done;
+    int target=replace ? remote_replacement_target(bot,journal,parent_path,name,object,parent_id,base_version,&base_commit,e) :
+        remote_directory_target(bot,journal,parent_path,name,parent_id,grandparent,e);
+    if(target || tgfs_bot_channel_id(chat,&channel) || !uuid_valid(parent_id) || check_pin(bot,journal,e)) goto done;
     bytes=read_input(file,&size,e);if(!bytes) goto done;
     size_t count=(size+chunk_size-1)/chunk_size;
     if(count>PUT_MAX_PARTS) {fail(e,"too many parts for put prototype");goto done;}
     uint64_t boundary;
     if(json_decimal(journal,"boundary_id",&boundary)) {fail(e,"invalid captured boundary");goto done;}
     long long previous=(long long)boundary;
-    char object[37],version[37],operation[37],add[37],full_hash[65];
-    if(uuid_new(object) || uuid_new(version) || uuid_new(operation) || uuid_new(add) || digest(bytes,size,full_hash)) {
+    char version[37],operation[37],add[37],full_hash[65];
+    if((!replace && (uuid_new(object) || uuid_new(add))) || uuid_new(version) || uuid_new(operation) || digest(bytes,size,full_hash)) {
         fail(e,"cannot generate publication IDs or SHA-256");goto done;
     }
     dir=stage_open(state,e);if(dir<0) goto done;
     if(write_file(dir,"data.bin",bytes,size,e)) goto done;
     intent=cJSON_CreateObject();parts=cJSON_CreateArray();captions=cJSON_CreateArray();
     commit=envelope("FILE_COMMIT",object);body=cJSON_CreateObject();
-    directory=envelope("DIRECTORY",parent_id);directory_body=addition(add,name,object);
-    if(!intent || !parts || !captions || !commit || !body || !directory || !directory_body ||
+    if(!replace) {directory=envelope("DIRECTORY",parent_id);directory_body=addition(add,name,object);}
+    if(!intent || !parts || !captions || !commit || !body || (!replace && (!directory || !directory_body)) ||
         !cJSON_AddStringToObject(intent,"kind","put") || !cJSON_AddStringToObject(intent,"storage_chat_id",chat) || !cJSON_AddStringToObject(intent,"parent_id",parent_id) ||
         !cJSON_AddStringToObject(intent,"source_boundary_id",json_string(journal,"boundary_id")) ||
         !cJSON_AddStringToObject(intent,"parent_path",parent_path) || !cJSON_AddStringToObject(intent,"name",name) || !cJSON_AddStringToObject(intent,"object_id",object) ||
         !cJSON_AddStringToObject(intent,"version_id",version) || !cJSON_AddStringToObject(intent,"operation_id",operation) ||
-        !cJSON_AddStringToObject(intent,"add_operation_id",add) || !cJSON_AddStringToObject(intent,"file_sha256",full_hash) ||
+        !cJSON_AddBoolToObject(intent,"replace",replace) || !cJSON_AddStringToObject(intent,"file_sha256",full_hash) ||
         add_id(intent,"file_size",(long long)size) || !cJSON_AddNumberToObject(intent,"chunk_bytes",(double)chunk_size) ||
         !cJSON_AddItemToObject(intent,"parts",parts)) {fail(e,"cannot allocate intent");goto done;}
     parts_attached=1;
     if(!cJSON_AddStringToObject(commit,"version_id",version) || !cJSON_AddStringToObject(commit,"operation_id",operation) ||
         !cJSON_AddStringToObject(commit,"parent_id",parent_id) || !cJSON_AddStringToObject(commit,"file_sha256",full_hash) ||
         !cJSON_AddNumberToObject(commit,"part_count",(double)count) || add_id(commit,"file_size",(long long)size) ||
-        caption_parent(directory,grandparent)) {fail(e,"out of memory");goto done;}
-    if(!cJSON_AddItemToObject(intent,"directory_caption",cJSON_Duplicate(directory,1)) ||
-        !cJSON_AddItemToObject(intent,"directory_document",cJSON_Duplicate(directory_body,1)) ||
+        (!replace && caption_parent(directory,grandparent))) {fail(e,"out of memory");goto done;}
+    if((replace && (!cJSON_AddStringToObject(intent,"base_version_id",base_version) || add_id(intent,"base_commit_id",(long long)base_commit))) ||
+        (!replace && (!cJSON_AddStringToObject(intent,"add_operation_id",add) ||
+        !cJSON_AddItemToObject(intent,"directory_caption",cJSON_Duplicate(directory,1)) ||
+        !cJSON_AddItemToObject(intent,"directory_document",cJSON_Duplicate(directory_body,1)))) ||
         !cJSON_AddItemToObject(intent,"commit_caption",cJSON_Duplicate(commit,1))) {fail(e,"out of memory");goto done;}
     if(persist(dir,intent,"prepared",e)) goto done;
     for(size_t i=0;i<count;i++) {
@@ -288,13 +291,14 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
         if(uploaded) {tgfs_error saved=*e;persist(dir,intent,"chunk_response_uncertain",e);*e=saved;goto done;}
         if(persist(dir,intent,"chunk_sent",e)) goto done;
     }
+    if(replace && check_pin(bot,journal,e)) goto done;
     if(!cJSON_AddItemToObject(body,"parts",cJSON_Duplicate(parts,1)) ||
         !cJSON_AddItemToObject(intent,"commit_document",cJSON_Duplicate(body,1)) || persist(dir,intent,"commit_send_pending",e)) goto done;
     int committed=upload_json(bot,chat,channel,"file-commit.json",body,commit,&commit_id,&commit_size,e);
     if(!committed && commit_id<=previous) committed=fail(e,"non-increasing commit ID");
     if(commit_id>0 && add_id(intent,"file_commit_id",commit_id)) {fail(e,"out of memory");goto done;}
     if(committed) {tgfs_error saved=*e;persist(dir,intent,"commit_response_uncertain",e);*e=saved;goto done;}
-    if(persist(dir,intent,"backlinks_pending",e)) goto done;
+    if(persist(dir,intent,replace?"published_backlinks_pending":"backlinks_pending",e)) goto done;
     for(size_t i=0;i<count;i++) {
         cJSON *caption=cJSON_GetArrayItem(captions,(int)i);
         const cJSON *part=cJSON_GetArrayItem(parts,(int)i);uint64_t mid,next;
@@ -308,18 +312,20 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
         uint64_t part_size;if(json_decimal(part,"part_size",&part_size)) {fail(e,"invalid local part size");goto done;}
         if(edit(bot,chat,channel,(long long)mid,filename,(size_t)part_size,caption,e)) goto done;
     }
-    if(check_pin(bot,journal,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
-    int published=upload_json(bot,chat,channel,"directory.json",directory_body,directory,&directory_id,&directory_size,e);
-    (void)directory_size;
-    if(!published && directory_id<=commit_id) published=fail(e,"non-increasing directory ID");
-    if(directory_id>0 && add_id(intent,"directory_message_id",directory_id)) {fail(e,"out of memory");goto done;}
-    if(published) {tgfs_error saved=*e;persist(dir,intent,"directory_response_uncertain",e);*e=saved;goto done;}
-    if(persist(dir,intent,"published_navigation_pending",e)) goto done;
-    cJSON_DeleteItemFromObjectCaseSensitive(commit,"next_message");
-    if(add_id(commit,"next_message",directory_id) || edit(bot,chat,channel,commit_id,"file-commit.json",commit_size,commit,e)) goto done;
+    if(!replace) {
+        if(check_pin(bot,journal,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
+        int published=upload_json(bot,chat,channel,"directory.json",directory_body,directory,&directory_id,&directory_size,e);
+        (void)directory_size;
+        if(!published && directory_id<=commit_id) published=fail(e,"non-increasing directory ID");
+        if(directory_id>0 && add_id(intent,"directory_message_id",directory_id)) {fail(e,"out of memory");goto done;}
+        if(published) {tgfs_error saved=*e;persist(dir,intent,"directory_response_uncertain",e);*e=saved;goto done;}
+        if(persist(dir,intent,"published_navigation_pending",e)) goto done;
+        cJSON_DeleteItemFromObjectCaseSensitive(commit,"next_message");
+        if(add_id(commit,"next_message",directory_id) || edit(bot,chat,channel,commit_id,"file-commit.json",commit_size,commit,e)) goto done;
+    }
     if(persist(dir,intent,"complete",e)) goto done;
-    printf("OK put name=%s object_id=%s parts=%zu bytes=%zu commit_id=%lld directory_id=%lld\n",
-        name,object,count,size,commit_id,directory_id);rc=0;
+    printf("OK put name=%s object_id=%s parts=%zu bytes=%zu commit_id=%lld directory_id=%lld replaced=%d\n",
+        name,object,count,size,commit_id,directory_id,replace);rc=0;
 done:
     if(rc && intent) {
         const cJSON *last=cJSON_GetArrayItem(parts,cJSON_GetArraySize(parts)-1);
@@ -337,10 +343,11 @@ done:
 void tgfs_put_help(FILE *stream)
 {
     fputs("usage: tgfs put --capture DIRECTORY --file PATH --name NAME --state-dir NEW_DIRECTORY --token-file PATH [options]\n"
-          "Publish a NEW file in a captured directory: CHUNK -> FILE_COMMIT -> DIRECTORY ADD.\n"
+          "Create a file (CHUNK -> FILE_COMMIT -> ADD), or replace its contents explicitly.\n"
           "  --capture DIRECTORY      Completed journal; root pin must still match.\n"
           "  --file PATH              Stable regular input file, max 64 MiB; empty is allowed.\n"
-          "  --name NAME              New filename, max 245 bytes (no path separators).\n"
+          "  --name NAME              Target filename, max 245 bytes (no path separators).\n"
+          "  --replace                Require an existing file, keep object_id, publish a new version.\n"
           "  --parent /absolute/path  Existing captured directory (default /).\n"
           "  --state-dir DIRECTORY    New private staging/intent directory; preserve on failure.\n"
           "  --token-file PATH        Owner-only token file for the bot used by scan.\n"
@@ -349,15 +356,16 @@ void tgfs_put_help(FILE *stream)
           "  --timeout-seconds N      1..300, default 60.\n"
           "  --send-interval-ms N     Minimum mutation interval, 0..10000, default 1100.\n"
           "  -h, --help               Show help without network.\n"
-          "No overwrite, automatic resume or retry. Concurrent same-name creates may conflict.\n",stream);
+          "No automatic resume/retry. Concurrent replacements use the latest published FILE_COMMIT.\n",stream);
 }
 int tgfs_put_main(int argc,char **argv)
 {
-    const char *parent_path="/";int parent_seen=0;
+    const char *parent_path="/";int parent_seen=0,replace=0;
     const char *capture=NULL,*file=NULL,*name=NULL,*state=NULL,*token=NULL,*proxy=NULL,*timeout_text=NULL,*chunk_text=NULL,*interval_text=NULL;
     if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_put_help(stdout);return 0;}
     for(int i=2;i<argc;i++) {
         const char **slot=NULL;
+        if(same(argv[i],"--replace")) {if(replace) goto usage;replace=1;continue;}
         if(same(argv[i],"--parent")) {if(parent_seen || i+1>=argc) goto usage;parent_seen=1;parent_path=argv[++i];continue;}
         if(same(argv[i],"--direct")) {if(proxy) goto usage;proxy="";continue;}
         if(same(argv[i],"--capture")) slot=&capture;
@@ -383,7 +391,7 @@ int tgfs_put_main(int argc,char **argv)
     if(dir<0) {fail(&e,"cannot open capture");goto done;}
     journal=json_load_at(dir,"journal.json",&e);close(dir);if(!journal) goto done;
     if(tgfs_bot_open(token,(unsigned)timeout,&bot,&b) || tgfs_bot_set_proxy(bot,proxy,&b)) {api_fail(&e,&b);goto done;}
-    rc=put(bot,journal,file,name,parent_path,state,(size_t)chunk,&e) ? 1 : 0;
+    rc=put(bot,journal,file,name,parent_path,state,(size_t)chunk,replace,&e) ? 1 : 0;
 done:
     if(rc) fprintf(stderr,"FAIL put: %s; preserve state directory\n",e.message);
     cJSON_Delete(journal);tgfs_bot_close(bot);return rc;

@@ -353,6 +353,24 @@ static message *selected_commit(tgfs *fs, const char *id, tgfs_error *e)
     return selected;
 }
 
+int replacement_target(tgfs *fs,const char *path,const char *name,char object[37],char parent[37],
+                       char version[37],uint64_t *commit_id,tgfs_error *e)
+{
+    const char *id=resolve(fs,path,e);if(!id) return -1;
+    const cJSON *entries=directory_entries(fs,id,e),*entry;
+    if(!entries) return -1;
+    cJSON_ArrayForEach(entry,entries) if(same(name,json_string(entry,"name"))) {
+        const char *child=json_string(entry,"object_id");
+        if(directory_known(fs,child)) return fail_code(e,EISDIR,"replace target is a directory");
+        message *commit=selected_commit(fs,child,e);if(!commit) return -1;
+        if(!same(json_string(commit->caption,"parent_id"),id))
+            return fail(e,"replace target parent disagrees with selected FILE_COMMIT");
+        memcpy(object,child,37);memcpy(parent,id,37);
+        memcpy(version,json_string(commit->caption,"version_id"),37);*commit_id=commit->id;return 0;
+    }
+    return fail_code(e,ENOENT,"replace target does not exist in capture");
+}
+
 static int digest(const void *data, size_t length, char hex[65])
 {
     unsigned char hash[32]; unsigned n;

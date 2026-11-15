@@ -37,4 +37,9 @@ int directory_target(tgfs *fs, const char *path, const char *name, char object[3
 int remote_directory_target(struct tgfs_bot *bot, const cJSON *journal, const char *path,
                             const char *name, char object[37], char parent[37], tgfs_error *e);
 
+int replacement_target(tgfs *fs, const char *path, const char *name, char object[37], char parent[37],
+                       char version[37], uint64_t *commit_id, tgfs_error *e);
+int remote_replacement_target(struct tgfs_bot *bot, const cJSON *journal, const char *path,
+                              const char *name, char object[37], char parent[37], char version[37],
+                              uint64_t *commit_id, tgfs_error *e);
 #endif

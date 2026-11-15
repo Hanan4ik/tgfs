@@ -35,6 +35,8 @@ make test
 
 [Создание каталогов и загрузка по пути](docs/DIRECTORY_WRITE.md): `tgfs mkdir --help`, `tgfs put --parent /documents`.
 
+[Замена содержимого файла](docs/FILE_REPLACE.md): `tgfs put --replace`.
+
 [Постоянный индекс, кэш и offline](docs/PERSISTENT_CACHE.md) — включены по умолчанию в read.
 
 [Монтирование через FUSE](docs/FUSE_READONLY.md): `tgfs mount --help`.
