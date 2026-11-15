@@ -122,3 +122,14 @@ metadata в более новом capture, отчёт исходных ID/confir
 ASan/UBSan. Следующая пользовательская проверка — intent завершённого unlink
 с capture-010; новый scan не нужен. Дальше — проверка refs/staging и план
 безопасного продолжения с теми же UUID.
+
+## Проверка данных перед recovery (2026-11-15)
+
+Пользователь подтвердил intent unlink: directory_ids=[43], complete/confirmed.
+[intent](INTENT_CHECK.md) теперь проверяет staging и CHUNK put по размерам,
+SHA/bytes, metadata и refs; сообщает ненаблюдённые/неоднозначные части и
+предложения backlinks подтверждённого canonical commit. can_resume=false,
+изменяющих API запросов нет. 113 тестов со сценариями повреждений/duplicates.
+Следующий живой тест — intent replace-documents-hello-001 на capture-010.
+Далее — ограниченный ремонт metadata и безопасное продолжение; полный resume,
+GC и write-FUSE пока не реализованы.
