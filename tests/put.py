@@ -167,7 +167,7 @@ class Put(unittest.TestCase):
                         self.assertEqual(listing.stdout,b'hello.txt\nnotes.txt\n')
             finally:
                 s.shutdown();s.server_close();t.join()
-    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok'):
+    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok',diagnose=False):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -201,7 +201,15 @@ class Put(unittest.TestCase):
                 return out
             def read(cap,action,path):
                 return run(['read','--no-cache','--capture',str(cap),'--token-file',str(token),action,path]).stdout
+            def check_intent(state,cap,expected):
+                before=(state/'intent.json').read_bytes();start=len(s.calls)
+                result=run(['intent','--state-dir',str(state),'--capture',str(cap),'--token-file',str(token)])
+                report=json.loads(result.stdout);self.assertEqual(report['publication'],expected)
+                self.assertFalse(report['resumed']);self.assertEqual((state/'intent.json').read_bytes(),before)
+                self.assertTrue(set(s.calls[start:])<={'getChat','getFile'})
+                return report
             try:
+                run(['intent','--help']);self.assertEqual(s.calls,[])
                 run(['mkdir','--help']);self.assertEqual(s.calls,[])
                 result,directory=write('mkdir',capture,'--path','/documents',code=0 if mode=='ok' else 1)
                 if mode!='ok':
@@ -301,6 +309,7 @@ class Put(unittest.TestCase):
                             '--replace',state=state,code=1)
                         self.assertEqual(len(s.sent),count)
                         final=scan()
+                        if diagnose: check_intent(state,final,'confirmed' if replace_mode in ('ok','replace-lost-commit','replace-edit') else 'not_observed')
                         self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),expected_data)
                         self.assertEqual(read(original_cap,'cat','/documents/sub/multi.txt'),b'abcdefghij\n')
                         self.assertEqual(read(final,'ls','/documents/sub'),b'multi.txt\nempty.txt\n')
@@ -381,6 +390,7 @@ class Put(unittest.TestCase):
                     self.assertEqual(len(s.sent),count)
                     inject_ops([copy.deepcopy(original_add)]) # Retry of the old ADD cannot resurrect the name.
                     final=scan()
+                    if diagnose: check_intent(saved,final,'not_observed' if unlink_mode in ('unlink-pin','unlink-apierror') else 'confirmed')
                     file_exists=unlink_mode in ('unlink-pin','unlink-apierror','concurrent')
                     listing=read(final,'ls','/documents/sub')
                     self.assertEqual(b'multi.txt\n' in listing,file_exists)
@@ -404,6 +414,18 @@ class Put(unittest.TestCase):
                         cap=scan();write('unlink',cap,'--path','/root.txt')
                         final=scan();self.assertEqual(read(final,'ls','/'),b'documents\n')
                         self.assertEqual(read(final,'ls','/documents/sub'),b'multi.txt\n')
+                if diagnose and not unlink and not replace:
+                    for state_file in root.glob('state-*/intent.json'):
+                        if json.loads(state_file.read_text())['phase']=='complete': check_intent(state_file.parent,final,'confirmed')
+                    state_file=next(f for f in root.glob('state-*/intent.json') if json.loads(f.read_text()).get('object_id')==file['object_id'])
+                    run(['intent','--state-dir',str(state_file.parent),'--capture',str(capture),'--token-file',str(token)],code=1)
+                    original_state=state_file.read_bytes();bad=json.loads(original_state)
+                    bad['commit_document']['parts'][0]['part_sha256']='0'*64;state_file.write_text(json.dumps(bad))
+                    result=run(['intent','--state-dir',str(state_file.parent),'--capture',str(final),'--token-file',str(token)],code=1)
+                    self.assertIn(b'disagrees',result.stderr);state_file.write_bytes(original_state)
+                    state_file.chmod(0o644)
+                    run(['intent','--state-dir',str(state_file.parent),'--capture',str(final),'--token-file',str(token)],code=1)
+                    state_file.chmod(0o600)
                 # Parent documents stay append-only; only the new child caption was edited.
 
                 original=json.loads(s.messages[int(directory['child_message_id'])]['caption'])
@@ -435,6 +457,13 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
+    def test_intent_complete_and_validation(self): self.directories(diagnose=True)
+    def test_intent_lost_commit(self):
+        for mode in ('replace-lost-commit','replace-lost-chunk','replace-edit'):
+            with self.subTest(mode=mode): self.directories(replace=True,replace_mode=mode,diagnose=True)
+    def test_intent_lost_remove(self):
+        for mode in ('unlink-lost','unlink-apierror','unlink-pin'):
+            with self.subTest(mode=mode): self.directories(unlink=True,unlink_mode=mode,diagnose=True)
     def test_unlink_and_observed_adds(self):
         for mode in ('ok','recreate','concurrent','legacy'):
             with self.subTest(mode=mode): self.directories(unlink=True,unlink_mode=mode)

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #define META_BUDGET (64U * 1024U * 1024U)
 typedef struct {
@@ -394,4 +395,115 @@ done:
     cache_close(r.cache);tgfs_bot_close(r.bot);cJSON_Delete(journal);return rc;
 usage:
     tgfs_read_help(stderr);return 2;
+}
+
+static int intent_stage(remote *r,const cJSON *journal,const cJSON *caption,const cJSON *body,
+                        const char *operation,cJSON *matches,tgfs_error *e)
+{
+    if(!caption || !body) return 0;
+    const cJSON *record;int count=0;
+    cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(journal,"records")) {
+        const cJSON *c=cJSON_GetObjectItemCaseSensitive(record,"record");
+        if(!same(json_string(c,"type"),json_string(caption,"type")) ||
+            !same(json_string(c,"object_id"),json_string(caption,"object_id"))) continue;
+        if(same(json_string(c,"type"),"FILE_COMMIT") && !same(json_string(c,"operation_id"),operation)) continue;
+        size_t length=0;
+        unsigned char *bytes=network_download(r,record,TGFS_MAX_JSON,&length,e);
+        if(!bytes) return -1;
+        cJSON *document=json_parse_bytes(bytes,length,e);free(bytes);if(!document) return -1;
+        int relevant=!operation || same(json_string(c,"type"),"FILE_COMMIT");
+        const cJSON *op;
+        if(!relevant) cJSON_ArrayForEach(op,cJSON_GetObjectItemCaseSensitive(document,"operations"))
+            if(same(json_string(op,"operation_id"),operation)) relevant=1;
+        int equal=cJSON_Compare(document,body,1);cJSON_Delete(document);
+        if(!relevant) continue;
+        if(!equal && !operation) continue; /* Other publications of the same directory are expected. */
+        if(!equal || !json_semantic_equal(c,caption)) return fail(e,"intent publication disagrees with captured contents");
+        cJSON *id=cJSON_CreateString(json_string(record,"message_id"));
+        if(!id || !cJSON_AddItemToArray(matches,id)) {cJSON_Delete(id);return fail(e,"out of memory");}
+        count++;
+    }
+    return count;
+}
+void tgfs_intent_help(FILE *stream)
+{
+    fputs("usage: tgfs intent --state-dir DIRECTORY --capture DIRECTORY --token-file PATH [options]\n"
+          "Read-only reconciliation of put/mkdir/unlink intent with a newer completed capture.\n"
+          "  --state-dir DIRECTORY    Existing private directory containing intent.json.\n"
+          "  --capture DIRECTORY      Completed scan newer than source_boundary_id.\n"
+          "  --token-file PATH        Owner-only token file for the same bot.\n"
+          "  --proxy URL | --direct   Standard transport routing.\n"
+          "  --timeout-seconds N      1..300, default 60.\n"
+          "  -h, --help               Show help without network.\n"
+          "Prints JSON evidence, never publishes, edits, deletes, resumes or rewrites intent.\n"
+          "not_observed is not proof of absence; confirmed is not proof of current visibility.\n",stream);
+}
+int tgfs_intent_main(int argc,char **argv)
+{
+    const char *state=NULL,*capture=NULL,*token=NULL,*proxy=NULL,*timeout_text=NULL;
+    if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_intent_help(stdout);return 0;}
+    for(int i=2;i<argc;i++) {
+        const char **slot=NULL;
+        if(same(argv[i],"--direct")) {if(proxy) goto usage;proxy="";continue;}
+        if(same(argv[i],"--state-dir")) slot=&state;
+        else if(same(argv[i],"--capture")) slot=&capture;
+        else if(same(argv[i],"--token-file")) slot=&token;
+        else if(same(argv[i],"--proxy")) slot=&proxy;
+        else if(same(argv[i],"--timeout-seconds")) slot=&timeout_text;
+        if(!slot || *slot || i+1>=argc) goto usage;
+        *slot=argv[++i];
+    }
+    uint64_t timeout=60;
+    if(!state || !capture || !token || (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300))) goto usage;
+    tgfs_error e={0};tgfs_bot_error b;remote r={0};tgfs *fs=NULL;
+    cJSON *intent=NULL,*journal=NULL,*report=NULL;int rc=1,dir=-1;
+    struct stat st;
+    dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(dir<0 || fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {fail(&e,"state-dir must be private and owned by this user");goto done;}
+    if(fstatat(dir,"intent.json",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() || (st.st_mode&0077)) {
+        fail(&e,"intent.json must be an owner-only regular file");goto done;
+    }
+    intent=json_load_at(dir,"intent.json",&e);close(dir);dir=-1;if(!intent) goto done;
+    const char *kind=json_string(intent,"kind");
+    uint64_t source,boundary;
+    if((!same(kind,"put") && !same(kind,"mkdir") && !same(kind,"unlink")) ||
+        !uuid_valid(json_string(intent,"object_id")) || !uuid_valid(json_string(intent,"parent_id")) ||
+        !json_string(intent,"phase") || json_decimal(intent,"source_boundary_id",&source)) {fail(&e,"unsupported or invalid intent");goto done;}
+    dir=open(capture,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(dir<0) {fail(&e,"cannot open capture");goto done;}
+    journal=json_load_at(dir,"journal.json",&e);close(dir);dir=-1;if(!journal) goto done;
+    if(!same(json_string(intent,"storage_chat_id"),json_string(journal,"storage_chat_id")) ||
+        json_decimal(journal,"boundary_id",&boundary) || boundary<=source) {fail(&e,"capture must be newer and from the intent storage channel");goto done;}
+    if(tgfs_bot_open(token,(unsigned)timeout,&r.bot,&b) || tgfs_bot_set_proxy(r.bot,proxy,&b)) {api_failure(&e,&b);goto done;}
+    /* Existing parser validates the complete journal, origin/channel and merged metadata first. */
+    if(read_capture(&r,journal,NULL,NULL,&fs,&e)) goto done;
+    report=cJSON_CreateObject();cJSON *commit=report?cJSON_AddArrayToObject(report,"commit_ids"):NULL;
+    cJSON *child=report?cJSON_AddArrayToObject(report,"child_ids"):NULL;
+    cJSON *directory=report?cJSON_AddArrayToObject(report,"directory_ids"):NULL;
+    if(!commit || !child || !directory) {fail(&e,"out of memory");goto done;}
+    int commits=0,children=0,dirs=0;
+    if(same(kind,"put")) commits=intent_stage(&r,journal,cJSON_GetObjectItemCaseSensitive(intent,"commit_caption"),
+        cJSON_GetObjectItemCaseSensitive(intent,"commit_document"),json_string(intent,"operation_id"),commit,&e);
+    if(same(kind,"mkdir")) children=intent_stage(&r,journal,cJSON_GetObjectItemCaseSensitive(intent,"child_caption"),
+        cJSON_GetObjectItemCaseSensitive(intent,"child_document"),NULL,child,&e);
+    const char *op=json_string(intent,same(kind,"unlink")?"remove_operation_id":"add_operation_id");
+    if(op) dirs=intent_stage(&r,journal,cJSON_GetObjectItemCaseSensitive(intent,"directory_caption"),
+        cJSON_GetObjectItemCaseSensitive(intent,"directory_document"),op,directory,&e);
+    if(commits<0 || children<0 || dirs<0) goto done;
+    int confirmed=same(kind,"put") ? commits && (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(intent,"replace")) || dirs) :
+        same(kind,"mkdir") ? children && dirs : dirs;
+    if(!cJSON_AddStringToObject(report,"kind",kind) || !cJSON_AddStringToObject(report,"local_phase",json_string(intent,"phase")) ||
+        !cJSON_AddStringToObject(report,"publication",confirmed?"confirmed":"not_observed") ||
+        !cJSON_AddStringToObject(report,"scope","provided_capture_only") || !cJSON_AddBoolToObject(report,"resumed",0)) {
+        fail(&e,"out of memory");goto done;
+    }
+    char *raw=cJSON_PrintUnformatted(report);
+    if(!raw) {fail(&e,"out of memory");goto done;}
+    rc=puts(raw)<0?1:0;free(raw);
+done:
+    if(rc) fprintf(stderr,"FAIL intent: %s\n",e.message);
+    if(dir>=0) close(dir);
+    tgfs_close(fs);tgfs_bot_close(r.bot);cJSON_Delete(intent);cJSON_Delete(journal);cJSON_Delete(report);return rc;
+usage:
+    tgfs_intent_help(stderr);return 2;
 }

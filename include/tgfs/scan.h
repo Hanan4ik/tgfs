@@ -6,6 +6,8 @@ int tgfs_mount_main(int argc, char **argv);
 void tgfs_scan_help(FILE *stream);
 void tgfs_init_help(FILE *stream);
 int tgfs_init_main(int argc, char **argv);
+void tgfs_intent_help(FILE *stream);
+int tgfs_intent_main(int argc, char **argv);
 void tgfs_unlink_help(FILE *stream);
 int tgfs_unlink_main(int argc, char **argv);
 void tgfs_mkdir_help(FILE *stream);

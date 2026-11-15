@@ -152,3 +152,15 @@ intent и диагностика неизвестного ответа. Стар
 110 тестов (локально 106 passed/4 kernel skips), ASan/UBSan. Следующий шаг —
 unlink /documents/hello.txt на capture-009 → scan capture-010 → пустой ls,
 ENOENT нового cat и сохранённый cat прежнего capture.
+
+## Диагностика намерений (2026-11-15)
+
+Пользователь подтвердил живой unlink/capture-010. Добавлена read-only команда
+[intent](INTENT_CHECK.md): сверка put/mkdir/unlink по UUID и точному содержимому
+metadata в более новом capture, отчёт исходных ID/confirmed/not_observed.
+Ничего не публикует и не меняет локальное намерение. Это первый этап recovery,
+не автоматическое resume: CHUNK/staging/backlinks ещё не проверяются, отсутствие
+в capture не разрешает retry. 113 тестов (локально 109 passed/4 kernel skips),
+ASan/UBSan. Следующая пользовательская проверка — intent завершённого unlink
+с capture-010; новый scan не нужен. Дальше — проверка refs/staging и план
+безопасного продолжения с теми же UUID.
