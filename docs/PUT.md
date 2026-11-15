@@ -1,12 +1,16 @@
-# Публикация нового файла в корень TGFS
+# Публикация нового файла в TGFS
 
 Реализовано 2026-11-15: `tgfs put`. Команда создаёт новый объект файла,
-записывает CHUNK/FILE_COMMIT и публикует отдельный DIRECTORY ADD в корне.
-Это первый writer, не полный контракт записи FUSE. Создание подкаталогов,
+записывает CHUNK/FILE_COMMIT и публикует отдельный DIRECTORY ADD в выбранном
+каталоге (--parent, по умолчанию /). Создание каталогов и вложенные пути:
+[DIRECTORY_WRITE.md](DIRECTORY_WRITE.md). Это CLI writer; запись через FUSE,
 перезапись существующего объекта, rename/unlink и автоматическое recovery
 ещё не реализованы.
 
-## Первый живой опыт
+## Первый живой опыт (история, подтверждён пользователем)
+
+Ниже сохранён первоначальный запуск с capture-004. Для новой проверки
+используйте актуальные свободные номера и state-dir из DIRECTORY_WRITE.md.
 
 Обновить main, собрать и подготовить стабильный исходный файл:
 
@@ -81,8 +85,8 @@ capture-005), затем прочитать файл:
 5. Изменить captions собственных CHUNK: поставить file_commit_id и
    next_message на следующую свою часть/FILE_COMMIT. Смысловые поля и bytes
    не меняются. Каждое изменение проверяется по возвращённому Message.
-6. Ещё раз проверить закреп. Опубликовать DIRECTORY-document корня
-   (parent_id=null), содержащий одну ADD имени на новый object_id.
+6. Ещё раз проверить закреп. Опубликовать DIRECTORY-document целевого каталога
+   (parent_id=null только у корня), содержащий одну ADD имени на новый object_id.
 7. Поставить next_message собственного FILE_COMMIT на новую DIRECTORY.
    Сохранить phase=complete и вывести результат.
 
@@ -97,7 +101,7 @@ next_message или сохранение complete завершились оши�
 | Файл/поле | Назначение |
 | --- | --- |
 | data.bin | Локальная копия байтов, из которых считались хеши и отправлялись части |
-| intent.json | UUID, имя, root/storage, размеры/хеш, source_boundary_id, parts/refs, документы commit/ADD |
+| intent.json | UUID, имя, parent_path/parent_id/storage, размеры/хеш, source_boundary_id, parts/refs, документы commit/ADD |
 | phase | prepared, chunk_send_pending/chunk_sent, commit_send_pending, backlinks_pending, directory_send_pending, published_navigation_pending, complete |
 | *_response_uncertain | Ответ загрузки потерян или не прошёл проверку; операция могла выполниться |
 | file_commit_id / directory_message_id | Известные исходные ID ответов |
@@ -117,7 +121,7 @@ add_operation_id: файл мог уже появиться. При неизве
 
 ## Ограничения прототипа
 
-- Только создание нового файла непосредственно в корне, без overwrite.
+- Только создание нового файла в существующем каталоге (--parent, по умолчанию /), без overwrite.
   Проверка имени относится к выбранному capture. При устаревшем снимке
   конкурентные создания одинакового имени могут конфликтовать; ядро
   сохраняет обе операции и сообщает об ошибке, а не выбирает победителя.
@@ -147,7 +151,16 @@ backlinks/next_message, смена pin, потеря ответа, неверн�
 при edit без публикации ADD. Проверяется intent на диске до сетевых изменений
 и блокирование повторной отправки с тем же state-dir.
 Всего 72 теста; ASan/UBSan локально с detect_leaks=0 из-за ptrace.
-Живой put ещё не выполнен: токен остаётся у пользователя.
+Живой put/read корневых hello.txt/multipart.txt/empty.txt подтверждён пользователем;
+токен остаётся у него. Число 72 относится к первоначальному этапу.
 
 Ссылки: [формат операций](DIRECTORY_OPERATIONS.md), [чтение](REMOTE_READ.md),
 [рекомендации Telegram о частоте](https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this).
+
+## Каталоги (2026-11-15)
+
+Теперь поддержаны --parent /absolute/path и создание родителя через mkdir.
+Родитель должен быть виден в capture; после mkdir нужен scan. Подробный порядок,
+проверки и команды: [DIRECTORY_WRITE.md](DIRECTORY_WRITE.md). Живой put/read
+в корне и online/offline FUSE подтверждены пользователем; вложенный writer
+пока проверен автоматически. Ограничения размера, intent и retry сохраняются.
