@@ -48,4 +48,5 @@ int unlink_target(tgfs *fs, const char *path, const char *name, char object[37],
                   char grandparent[37], cJSON **observed, tgfs_error *e);
 int remote_unlink_target(struct tgfs_bot *bot, const cJSON *journal, const char *path, const char *name,
                          char object[37], char parent[37], char grandparent[37], cJSON **observed, tgfs_error *e);
+int repair_backlinks(struct tgfs_bot *bot, const cJSON *journal, const cJSON *intent, cJSON *report, int log_fd, tgfs_error *e);
 #endif

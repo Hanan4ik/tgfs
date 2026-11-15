@@ -6,7 +6,7 @@ CPPFLAGS += $(SQLITE_CFLAGS) $(patsubst -I%,-isystem%,$(FUSE_CFLAGS)) -D_FILE_OF
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror
 LDLIBS += -lcrypto -lcurl $(SQLITE_LIBS) $(FUSE_LIBS) -lm
-SOURCES = src/main.c src/core.c src/directory.c src/json.c src/bot_api.c src/probe.c src/scan.c src/init.c src/remote.c src/put.c src/cache.c src/mount.c src/fuse_backend.c third_party/cjson/cJSON.c
+SOURCES = src/main.c src/core.c src/directory.c src/json.c src/bot_api.c src/probe.c src/scan.c src/init.c src/remote.c src/repair.c src/put.c src/cache.c src/mount.c src/fuse_backend.c third_party/cjson/cJSON.c
 HEADERS = src/fuse_backend.h include/tgfs/remote.h src/cache.h include/tgfs/tgfs.h include/tgfs/bot_api.h src/internal.h include/tgfs/scan.h third_party/cjson/cJSON.h
 
 .PHONY: all test sanitize clean
