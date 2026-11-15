@@ -49,7 +49,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg=dict(message_id=mid,chat=dict(id=STORAGE,type='channel'),caption=caption,
                 document=dict(file_id=fid,file_name=filename,file_size=len(raw)))
             s.messages[mid]=msg;s.sent.append(kind)
-            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending'):
+            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT'):
                 self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
             if (s.mode=='response' and kind=='CHUNK') or (s.mode=='mkdir-response' and expected=='child_send_pending'):
                 msg=copy.deepcopy(msg);msg['document']['file_name']='wrong'
@@ -59,12 +59,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             chat=dict(id=int(p['chat_id']),type='channel')
             if int(p['chat_id'])==STORAGE:
                 chat['pinned_message']=copy.deepcopy(s.messages[1])
-                if s.mode=='pin' or (s.mode=='mkdir-pin' and s.sent):
+                if s.mode=='pin' or (s.mode=='mkdir-pin' and s.sent) or (s.mode=='replace-pin' and len(s.sent)>s.before_replace):
                     header=copy.deepcopy(SB);header['root_object_id']=str(uuid.uuid4())
                     chat['pinned_message']['text']=json.dumps(header)
             return self.reply(chat)
         if method=='editMessageCaption':
-            if s.mode in ('edit','mkdir-edit'):
+            if s.mode in ('edit','mkdir-edit','replace-edit'):
                 return self.reply(error=dict(ok=False,error_code=429,description=TOKEN,parameters=dict(retry_after=5)),status=429)
             msg=s.messages[p['message_id']];msg['caption']=p['caption']
             return self.reply(msg)
@@ -164,7 +164,7 @@ class Put(unittest.TestCase):
                         self.assertEqual(listing.stdout,b'hello.txt\nnotes.txt\n')
             finally:
                 s.shutdown();s.server_close();t.join()
-    def directories(self,mode='ok',mount=False):
+    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok'):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -258,7 +258,63 @@ class Put(unittest.TestCase):
                 write('put',final,'--file',str(source),'--name','bad.txt','--parent','/documents/sub/multi.txt',code=1)
                 write('put',final,'--file',str(source),'--name','bad.txt','--parent','/missing',code=1)
                 self.assertEqual(len(s.sent),before)
+                expected_data=b'abcdefghij\n'
+                if replace:
+                    original_cap=final;old_messages=copy.deepcopy(s.messages);previous=file
+                    for args in (['--parent','/documents/sub','--name','missing.txt','--replace'],
+                        ['--parent','/documents','--name','sub','--replace']):
+                        write('put',final,'--file',str(source),*args,code=1)
+                    write('put',final,'--file',str(source),'--parent','/documents/sub','--name','multi.txt','--replace','--replace',code=2)
+                    self.assertEqual(len(s.sent),before)
+                    s.mode=replace_mode;s.before_replace=len(s.sent)
+                    payloads=[b'replaced content\n',b'',b'12345678\n'] if replace_mode=='ok' else [b'replaced content\n']
+                    for data in payloads:
+                        source.write_bytes(data);s.input_data=data
+                        before=len(s.sent)
+                        _,updated=write('put',final,'--file',str(source),'--name','multi.txt','--parent','/documents/sub',
+                            '--replace','--chunk-bytes','4',code=0 if replace_mode=='ok' else 1)
+                        state=s.intent.parent
+                        self.assertEqual(updated['object_id'],file['object_id'])
+                        self.assertNotEqual(updated['version_id'],previous['version_id'])
+                        self.assertNotEqual(updated['operation_id'],previous['operation_id'])
+                        self.assertEqual(updated['base_commit_id'],previous['file_commit_id'])
+                        self.assertEqual(updated['base_version_id'],previous['version_id'])
+                        self.assertTrue(updated['replace']);self.assertNotIn('add_operation_id',updated)
+                        self.assertNotIn('DIRECTORY',s.sent[before:])
+                        if replace_mode!='ok':
+                            phase={'replace-lost-chunk':'chunk_response_uncertain','replace-lost-commit':'commit_response_uncertain',
+                                'replace-edit':'published_backlinks_pending','replace-pin':'chunk_sent'}[replace_mode]
+                            self.assertEqual(updated['phase'],phase)
+                            expected_data=data if replace_mode in ('replace-lost-commit','replace-edit') else expected_data
+                            s.mode='ok'
+                        else:
+                            self.assertEqual(updated['phase'],'complete');self.assertNotIn('directory_message_id',updated)
+                            self.assertEqual(len(updated['parts']),(len(data)+3)//4)
+                            commit=json.loads(s.messages[int(updated['file_commit_id'])]['caption'])
+                            self.assertIsNone(commit['next_message'])
+                            expected_data=data
+                        count=len(s.sent)
+                        write('put',original_cap,'--file',str(source),'--name','multi.txt','--parent','/documents/sub',
+                            '--replace',state=state,code=1)
+                        self.assertEqual(len(s.sent),count)
+                        final=scan()
+                        self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),expected_data)
+                        self.assertEqual(read(original_cap,'cat','/documents/sub/multi.txt'),b'abcdefghij\n')
+                        self.assertEqual(read(final,'ls','/documents/sub'),b'multi.txt\nempty.txt\n')
+                        previous=updated
+                    if replace_mode=='ok':
+                        # Concurrent writers based on one older capture publish normally; later canonical commit wins.
+                        for data in (b'A updated\n',b'B updated\n'):
+                            source.write_bytes(data);s.input_data=data
+                            _,updated=write('put',original_cap,'--file',str(source),'--name','multi.txt',
+                                '--parent','/documents/sub','--replace','--chunk-bytes','4')
+                            self.assertEqual(updated['object_id'],file['object_id'])
+                            self.assertEqual(updated['base_commit_id'],file['file_commit_id'])
+                        final=scan();expected_data=b'B updated\n'
+                        self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),expected_data)
+                    for mid,msg in old_messages.items(): self.assertEqual(s.messages[mid],msg)
                 # Parent documents stay append-only; only the new child caption was edited.
+
                 original=json.loads(s.messages[int(directory['child_message_id'])]['caption'])
                 self.assertEqual(original,child)
                 if mount:
@@ -270,12 +326,12 @@ class Put(unittest.TestCase):
                             end=time.monotonic()+15
                             while proc.poll() is None and not os.path.ismount(point) and time.monotonic()<end: time.sleep(.05)
                             self.assertTrue(os.path.ismount(point),log.read_text())
-                            self.assertEqual((point/'documents/sub/multi.txt').read_bytes(),b'abcdefghij\n')
+                            self.assertEqual((point/'documents/sub/multi.txt').read_bytes(),expected_data)
                             self.assertEqual((point/'documents/sub/empty.txt').stat().st_size,0)
                             self.assertEqual((point/'documents').stat().st_nlink,4)
                             self.assertEqual((point/'documents/sub').stat().st_nlink,2)
                             with (point/'documents/sub/multi.txt').open('rb',buffering=0) as f:
-                                self.assertEqual(os.pread(f.fileno(),5,2),b'cdefg')
+                                self.assertEqual(os.pread(f.fileno(),5,2),expected_data[2:7])
                             with self.assertRaises(OSError) as caught: (point/'documents/new').mkdir()
                             self.assertEqual(caught.exception.errno,errno.EROFS)
                         finally:
@@ -284,6 +340,12 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
+    def test_replace_contents_and_stale_writers(self): self.directories(replace=True)
+    def test_replace_failures(self):
+        for mode in ('replace-lost-chunk','replace-lost-commit','replace-edit','replace-pin'):
+            with self.subTest(mode=mode): self.directories(replace=True,replace_mode=mode)
+    @unittest.skipUnless(Path('/dev/fuse').exists() and shutil.which('fusermount3'),'kernel mount unavailable')
+    def test_replaced_capture_mount(self): self.directories(mount=True,replace=True)
     def test_nested_directory_publication(self): self.directories()
     def test_directory_failures(self):
         for mode in ('mkdir-lost-child','mkdir-lost-parent','mkdir-response','mkdir-pin','mkdir-edit'):

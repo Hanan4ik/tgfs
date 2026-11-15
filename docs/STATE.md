@@ -126,3 +126,17 @@ empty и EROFS. Read-only MVP #8 выполнен; общий Linux write-кон
 104 теста (локально 102 passed, 2 kernel skip), ASan/UBSan; живые вложенные
 mkdir/put ещё не проверены. Следующий шаг пользователя: mkdir /documents на
 capture-006 → scan capture-007 → put --parent /documents → scan capture-008.
+
+## Замена файла (2026-11-15)
+
+Пользователь подтвердил живые mkdir /documents и put/read /documents/hello.txt
+на capture-008. Добавлен [put --replace](FILE_REPLACE.md): прежний object_id,
+новые version_id/operation_id, FILE_COMMIT публикует содержимое без нового ADD.
+Проверяется существующий обычный файл и его parent; base refs сохраняются
+в intent для диагностики, а не CAS. Конкурентные версии из старого capture
+подчиняются принятому latest canonical commit. Старые сообщения остаются
+для прежних captures/mount; GC и write-FUSE не реализованы.
+107 тестов (локально 104 passed/3 kernel skips), ASan/UBSan. Следующий шаг —
+живая замена /documents/hello.txt → scan capture-009 и сравнение cat старого
+capture-008/нового capture-009. Назначение независимых captures пояснено
+в [CHANNEL_SCAN.md](CHANNEL_SCAN.md).
