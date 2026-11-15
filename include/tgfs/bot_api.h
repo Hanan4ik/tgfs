@@ -27,6 +27,7 @@ int tgfs_bot_open(const char *token_file, unsigned timeout_seconds,
 /* NULL: environment; empty: direct; explicit URL overrides NO_PROXY.
  * Supported schemes: http, https, socks5, socks5h. No URL credentials. */
 int tgfs_bot_set_proxy(tgfs_bot *bot, const char *url, tgfs_bot_error *error);
+int tgfs_bot_id(const tgfs_bot *bot, long long *id);
 void tgfs_bot_close(tgfs_bot *bot);
 
 /* Allowed JSON methods: getMe/getChat/getFile/sendMessage/forwardMessage/

@@ -102,3 +102,9 @@
 ## Публикация нового файла (2026-11-15)
 
 Добавлен [put](PUT.md): новый объект в корень, staging/UUID intent, CHUNK → FILE_COMMIT → backlinks → DIRECTORY ADD, навигация собственных записей и проверка ответов. Поддержаны пустой файл и multipart; проверяется имя в capture и закреп. Автоматического retry/resume/overwrite нет; stale capture может дать конфликт одинаковых имён. 72 локальных теста включают полный put→scan→read и независимые ADD; живой put ещё не выполнен. Пользователь подтвердил живое read пустого корня. Следующий этап — живой непустой файл (capture-005), постоянный индекс/cache и FUSE.
+
+## Живой цикл и постоянный кэш (2026-11-15)
+
+Пользователь подтвердил put→scan→read: hello.txt (11 байт), multipart.txt (3 части/11 байт), empty.txt (0 частей/0 байт), объединённый ls и пустой cat с кодом 0. capture-006: B=32, records=17, unavailable=11, cleanup_pending=0. Следующий свободный scan — capture-007.
+
+Добавлен [SQLite-индекс и кэш read](PERSISTENT_CACHE.md): сохраняет adapter/records и проверенные blobs, scopes по bot/channel/root/start и конкретному capture. Warm read переиспользует metadata/части, offline не обращается к API; refresh/no-cache/stats и LRU budget доступны явно. Intents put/init отделены от кэша. 88 тестов; живая проверка кэша ещё требуется. Следующий этап — read-only FUSE; готовый mount пока не заявляется.

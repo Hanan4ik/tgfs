@@ -87,7 +87,7 @@ class Remote(unittest.TestCase):
             server.calls=[];server.downloads=[];server.payloads=payloads;server.mode=mode
             t=threading.Thread(target=server.serve_forever,kwargs=dict(poll_interval=.01),daemon=True);t.start()
             try:
-                p=subprocess.run([BINARY,'read','--capture',str(root),'--token-file',str(token),command,path],
+                p=subprocess.run([BINARY,'read','--no-cache','--capture',str(root),'--token-file',str(token),command,path],
                     env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{server.server_port}'),
                     capture_output=True,timeout=10)
                 err=p.stderr.decode()

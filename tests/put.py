@@ -134,9 +134,9 @@ class Put(unittest.TestCase):
                     result=run(['scan','--token-file',str(token),'--storage-chat-id',str(STORAGE),
                         '--service-chat-id',str(SERVICE),'--output',str(scanned)])
                     self.assertEqual(result.returncode,0,result.stderr)
-                    listing=run(['read','--capture',str(scanned),'--token-file',str(token),'ls','/'])
+                    listing=run(['read','--no-cache','--capture',str(scanned),'--token-file',str(token),'ls','/'])
                     self.assertEqual(listing.returncode,0,listing.stderr);self.assertEqual(listing.stdout,b'hello.txt\n')
-                    result=run(['read','--capture',str(scanned),'--token-file',str(token),'cat','/hello.txt'])
+                    result=run(['read','--no-cache','--capture',str(scanned),'--token-file',str(token),'cat','/hello.txt'])
                     self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,data)
                     # A fresh capture detects the existing name before another upload.
                     args[args.index('--capture')+1]=str(scanned)
@@ -155,7 +155,7 @@ class Put(unittest.TestCase):
                         result=run(['scan','--token-file',str(token),'--storage-chat-id',str(STORAGE),
                             '--service-chat-id',str(SERVICE),'--output',str(fresh)])
                         self.assertEqual(result.returncode,0,result.stderr)
-                        listing=run(['read','--capture',str(fresh),'--token-file',str(token),'ls','/'])
+                        listing=run(['read','--no-cache','--capture',str(fresh),'--token-file',str(token),'ls','/'])
                         self.assertEqual(listing.returncode,0,listing.stderr)
                         self.assertEqual(listing.stdout,b'hello.txt\nnotes.txt\n')
             finally:

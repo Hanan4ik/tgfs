@@ -16,15 +16,15 @@ operation_id используется первое корректное сооб
 next_message не создаёт новую операцию. Входной порядок записей не важен.
 
 Это CLI и библиотечный интерфейс чтения, а не смонтированная файловая система.
-Snapshot ls/cat не обращаются к Telegram. Отдельно реализованы [Bot API транспорт и probe](BOT_API_TRANSPORT.md). Добавлен [сбор журнала и индекс записей](CHANNEL_SCAN.md). Удалённое чтение подключено через [read](REMOTE_READ.md). SQLite, записи TGFS, постоянного кэша скачиваний или FUSE пока нет. Для snapshot токен не нужен.
+Snapshot ls/cat не обращаются к Telegram. Отдельно реализованы [Bot API транспорт и probe](BOT_API_TRANSPORT.md). Добавлен [сбор журнала и индекс записей](CHANNEL_SCAN.md). Удалённое чтение подключено через [read](REMOTE_READ.md). SQLite-индекс и кэш добавлены в [read](PERSISTENT_CACHE.md); новый файл публикуется через put. FUSE пока отсутствует. Для snapshot токен не нужен.
 
 ## Сборка и запуск
 
-Зависимости: компилятор C11, Make, заголовки/библиотека OpenSSL libcrypto, libcurl >= 7.85.
+Зависимости: компилятор C11, Make, заголовки/библиотека OpenSSL libcrypto, libcurl >= 7.85, SQLite >= 3.31.
 Для тестов нужен Python 3 из стандартной библиотеки.
 
-Debian/Ubuntu: `sudo apt-get install build-essential libssl-dev libcurl4-openssl-dev python3`.
-Arch Linux: `sudo pacman -S --needed base-devel openssl curl python`.
+Debian/Ubuntu: `sudo apt-get install build-essential libssl-dev libcurl4-openssl-dev libsqlite3-dev python3`.
+Arch Linux: `sudo pacman -S --needed base-devel openssl curl sqlite python`.
 
 ```sh
 make
@@ -99,7 +99,7 @@ root_entries задаётся явно, чтобы не выбирать за п
 | tests/integration.py | Сквозные проверки запуска с временными снимками |
 
 Для первого этапа выбраны cJSON и OpenSSL: cJSON включён в дерево с точной
-версией и лицензией, SHA-256 считается через EVP. Для HTTP теперь используется libcurl; SQLite/FUSE зависимости ещё не выбраны. LICENSE TGFS сохранён без изменений.
+версией и лицензией, SHA-256 считается через EVP. Для HTTP теперь используется libcurl; Для производного индекса/кэша используется SQLite; FUSE ещё не подключён. LICENSE TGFS сохранён без изменений.
 
 Проверяются несколько частей, UTF-8 имена, пустые файлы/каталоги,
 незавершённая загрузка, конфликт повторов, повреждения размера/хеша,

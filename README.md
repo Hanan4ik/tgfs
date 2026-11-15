@@ -14,7 +14,7 @@ make
 make test
 ```
 
-Зависимости: компилятор C11, Make, OpenSSL libcrypto, libcurl >= 7.85; для тестов Python 3.
+Зависимости: компилятор C11, Make, OpenSSL libcrypto, libcurl >= 7.85, SQLite >= 3.31; для тестов Python 3.
 [Описание реализации и границ прототипа](docs/IMPLEMENTATION.md).
 
 [Транспорт и запуск проверки на тестовых каналах](docs/BOT_API_TRANSPORT.md).
@@ -32,6 +32,8 @@ make test
 [Чтение файлов из Telegram](docs/REMOTE_READ.md): `tgfs read --help`.
 
 [Публикация нового файла и живая проверка](docs/PUT.md): `tgfs put --help`.
+
+[Постоянный индекс, кэш и offline](docs/PERSISTENT_CACHE.md) — включены по умолчанию в read.
 
 ## Навигация
 
