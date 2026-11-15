@@ -108,3 +108,9 @@
 Пользователь подтвердил put→scan→read: hello.txt (11 байт), multipart.txt (3 части/11 байт), empty.txt (0 частей/0 байт), объединённый ls и пустой cat с кодом 0. capture-006: B=32, records=17, unavailable=11, cleanup_pending=0. Следующий свободный scan — capture-007.
 
 Добавлен [SQLite-индекс и кэш read](PERSISTENT_CACHE.md): сохраняет adapter/records и проверенные blobs, scopes по bot/channel/root/start и конкретному capture. Warm read переиспользует metadata/части, offline не обращается к API; refresh/no-cache/stats и LRU budget доступны явно. Intents put/init отделены от кэша. 88 тестов; живая проверка кэша ещё требуется. Следующий этап — read-only FUSE; готовый mount пока не заявляется.
+
+## Read-only FUSE (2026-11-15)
+
+Пользователь подтвердил постоянный cache: ls miss/downloads=6 → hit/downloads=0; multipart cat downloads=3 → offline hits=9/downloads=0.
+
+Реализован [mount](FUSE_READONLY.md) локального snapshot либо Telegram capture: фиксированный metadata view, file handles с FILE_COMMIT, stat/readdir/range reads, один RAM chunk и SQLite, typed path errno и EROFS для изменений. 101 тест: локально 100 успешных и 1 kernel mount skip (нет /dev/fuse); callbacks и remote session/offline проверены, ASan/UBSan проходят. Живой Telegram mount ещё не проверен. Следующий свободный scan — capture-007, mount использует capture-006. Полный write-FUSE/профили/детальный recovery остаются открытыми.

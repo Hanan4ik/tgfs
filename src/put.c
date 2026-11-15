@@ -356,7 +356,7 @@ int tgfs_put_main(int argc,char **argv)
         (chunk_text && (decimal(chunk_text,&chunk) || !chunk || chunk>TGFS_MAX_CHUNK)) ||
         (interval_text && (decimal(interval_text,&interval) || interval>10000))) goto usage;
     send_interval_ms=(unsigned)interval;last_send=(struct timespec){0};
-    tgfs_error e={{0}};tgfs_bot_error b;tgfs_bot *bot=NULL;cJSON *journal=NULL;int rc=1;
+    tgfs_error e={0};tgfs_bot_error b;tgfs_bot *bot=NULL;cJSON *journal=NULL;int rc=1;
     int dir=open(capture,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
     if(dir<0) {fail(&e,"cannot open capture");goto done;}
     journal=json_load_at(dir,"journal.json",&e);close(dir);if(!journal) goto done;

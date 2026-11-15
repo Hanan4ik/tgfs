@@ -24,7 +24,7 @@ static void help(FILE *stream)
           "  ls /absolute/path        List immediate directory entries.\n"
           "  cat /absolute/path       Read a file and verify part/file SHA-256.\n\n"
           "  -h, --help               Show all available commands and options.\n\n"
-          "Channel mounting/FUSE is not implemented.\n"
+          "mount provides a read-only captured view via FUSE; writes return EROFS.\n"
           "Exit codes: 0 success/help, 1 operation failed, 2 invalid arguments.\n\n", stream);
     tgfs_probe_help(stream);
     fputc('\n', stream);
@@ -33,6 +33,7 @@ static void help(FILE *stream)
     tgfs_init_help(stream);
     fputc('\n',stream);tgfs_read_help(stream);
     fputc('\n',stream);tgfs_put_help(stream);
+    fputc('\n',stream);tgfs_mount_help(stream);
 }
 
 int main(int argc, char **argv)
@@ -40,6 +41,7 @@ int main(int argc, char **argv)
     if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         help(stdout); return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "mount")) return tgfs_mount_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "put")) return tgfs_put_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "read")) return tgfs_read_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "init")) return tgfs_init_main(argc, argv);
@@ -50,7 +52,7 @@ int main(int argc, char **argv)
         help(stderr);
         return 2;
     }
-    tgfs_error error = {{0}};
+    tgfs_error error = {0};
     tgfs *fs = NULL;
     if (tgfs_open_snapshot(argv[2], &fs, &error)) {
         fprintf(stderr, "tgfs: %s\n", error.message); return 1;

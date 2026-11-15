@@ -8,6 +8,7 @@
 #define TGFS_MAX_CHUNK 20971520U
 #define TGFS_MAX_RECORDS 65536
 
+int fail_code(tgfs_error *e, int code, const char *format, ...);
 int fail(tgfs_error *e, const char *format, ...);
 cJSON *json_load_at(int dirfd, const char *file, tgfs_error *e);
 cJSON *json_parse_bytes(const unsigned char *raw, size_t length, tgfs_error *e);

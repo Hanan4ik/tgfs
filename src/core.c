@@ -1,5 +1,6 @@
 #include "internal.h"
 #include <fcntl.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <openssl/evp.h>
 #include <stdlib.h>
@@ -23,6 +24,9 @@ struct tgfs {
     cJSON *directory_views;
     message *messages;
     size_t count;
+    unsigned char *last_chunk;
+    uint64_t last_chunk_id;
+    size_t last_chunk_size;
 };
 
 static int same(const char *a, const char *b) { return a && b && !strcmp(a, b); }
@@ -244,6 +248,7 @@ void tgfs_close(tgfs *fs)
     if (!fs) return;
     if (fs->messages)
         for (size_t i = 0; i < fs->count; i++) cJSON_Delete(fs->messages[i].body);
+    free(fs->last_chunk);
     free(fs->messages);
     cJSON_Delete(fs->directory_views);
     cJSON_Delete(fs->snapshot);
@@ -265,7 +270,7 @@ static const cJSON *directory_entries(tgfs *fs, const char *id, tgfs_error *e)
     }
     if (!found) {
         if(same(id,fs->root_id)) return fs->root_entries;
-        fail(e, "path component is not an available directory"); return NULL;
+        fail_code(e, ENOTDIR, "path component is not an available directory"); return NULL;
     }
     return cJSON_GetObjectItemCaseSensitive(found->body, "entries");
 }
@@ -273,21 +278,21 @@ static const cJSON *directory_entries(tgfs *fs, const char *id, tgfs_error *e)
 static const char *resolve(tgfs *fs, const char *path, tgfs_error *e)
 {
     if (!path || path[0] != '/' || strlen(path) > 4096) {
-        fail(e, "expected an absolute TGFS path of at most 4096 bytes"); return NULL;
+        fail_code(e, path && strlen(path)>4096 ? ENAMETOOLONG : EINVAL, "expected an absolute TGFS path of at most 4096 bytes"); return NULL;
     }
     char *copy = strdup(path);
     if (!copy) { fail(e, "out of memory"); return NULL; }
     const char *id = fs->root_id;
     char *save = NULL;
     for (char *part = strtok_r(copy, "/", &save); part; part = strtok_r(NULL, "/", &save)) {
-        if (!name_valid(part)) { fail(e, "unsupported path component"); id = NULL; break; }
+        if (!name_valid(part)) { fail_code(e, EINVAL, "unsupported path component"); id = NULL; break; }
         const cJSON *entries = directory_entries(fs, id, e);
         if (!entries) { id = NULL; break; }
         const cJSON *entry;
         const char *child = NULL;
         cJSON_ArrayForEach(entry, entries)
             if (same(part, json_string(entry, "name"))) { child = json_string(entry, "object_id"); break; }
-        if (!child) { fail(e, "path does not exist: %s", part); id = NULL; break; }
+        if (!child) { fail_code(e, ENOENT, "path does not exist: %s", part); id = NULL; break; }
         id = child;
     }
     if (id && path[strlen(path) - 1] == '/' && !directory_entries(fs, id, e)) id = NULL;
@@ -366,11 +371,149 @@ static int chunk_matches(tgfs *fs, message *chunk, message *commit, const cJSON 
     return 0;
 }
 
+typedef struct { message *chunk;const cJSON *metadata;uint64_t offset,size; } file_part;
+struct tgfs_file {
+    tgfs *fs;
+    message *commit;
+    file_part *parts;
+    size_t count;
+    tgfs_attr attr;
+    EVP_MD_CTX *sequential;
+    uint64_t verified_until;
+    int hash_failed;
+};
+
+int tgfs_object_attr(tgfs *fs,const char *id,tgfs_attr *attr,tgfs_error *e)
+{
+    if(!fs || !id || !attr) return fail_code(e,EINVAL,"missing attribute arguments");
+    memset(attr,0,sizeof(*attr));
+    attr->directory=directory_known(fs,id);
+    if(same(id,fs->root_id)) attr->inode=1;
+    else for(size_t i=0;i<fs->count;i++) if(same(fs->messages[i].object_id,id)) {attr->inode=i+2;break;}
+    if(!attr->inode) return fail(e,"entry refers to an unavailable object");
+    attr->links=1;
+    if(attr->directory) {
+        const cJSON *entries=directory_entries(fs,id,e),*entry;
+        if(!entries) return -1;
+        attr->links=2;
+        cJSON_ArrayForEach(entry,entries) if(directory_known(fs,json_string(entry,"object_id"))) attr->links++;
+        return 0;
+    }
+    message *commit=selected_commit(fs,id,e);
+    if(!commit) return -1;
+    if(json_decimal(commit->caption,"file_size",&attr->size) || attr->size>INT64_MAX)
+        return fail_code(e,EOVERFLOW,"file size cannot be represented by POSIX offsets");
+    return 0;
+}
+int tgfs_getattr(tgfs *fs,const char *path,tgfs_attr *attr,tgfs_error *e)
+{
+    const char *id=resolve(fs,path,e);
+    return id ? tgfs_object_attr(fs,id,attr,e) : -1;
+}
+int tgfs_file_open(tgfs *fs,const char *path,tgfs_file **out,tgfs_error *e)
+{
+    if(!out) return fail_code(e,EINVAL,"missing file output");
+    *out=NULL;
+    const char *id=resolve(fs,path,e);if(!id) return -1;
+    if(directory_known(fs,id)) return fail_code(e,EISDIR,"cannot open a directory as a file");
+    tgfs_file *file=calloc(1,sizeof(*file));
+    if(!file) return fail_code(e,ENOMEM,"out of memory opening file");
+    file->fs=fs;file->commit=selected_commit(fs,id,e);
+    if(!file->commit || tgfs_object_attr(fs,id,&file->attr,e)) goto invalid;
+    const cJSON *parts=cJSON_GetObjectItemCaseSensitive(file->commit->body,"parts");
+    file->count=(size_t)cJSON_GetArraySize(parts);
+    file->parts=calloc(file->count ? file->count : 1,sizeof(*file->parts));
+    if(!file->parts) {fail_code(e,ENOMEM,"out of memory opening parts");goto invalid;}
+    const cJSON *p;size_t i=0;
+    cJSON_ArrayForEach(p,parts) {
+        uint64_t mid;
+        if(json_decimal(p,"message_id",&mid)) {fail(e,"invalid part ID");goto invalid;}
+        message *chunk=message_find(fs,mid);
+        if(!chunk) {fail(e,"missing CHUNK message %" PRIu64,mid);goto invalid;}
+        if(chunk_matches(fs,chunk,file->commit,p,i,e)) goto invalid;
+        file->parts[i].chunk=chunk;file->parts[i].metadata=p;
+        if(json_decimal(p,"offset",&file->parts[i].offset) || json_decimal(p,"part_size",&file->parts[i].size)) {
+            fail(e,"invalid file range");goto invalid;
+        }
+        i++;
+    }
+    if(!file->attr.size) {
+        char hash[65];
+        if(digest("",0,hash) || !same(hash,json_string(file->commit->caption,"file_sha256"))) {
+            fail(e,"empty-file SHA-256 mismatch");goto invalid;
+        }
+    }
+    *out=file;return 0;
+invalid:
+    tgfs_file_close(file);return -1;
+}
+void tgfs_file_close(tgfs_file *file)
+{
+    if(file) {free(file->parts);EVP_MD_CTX_free(file->sequential);free(file);}
+}
+void tgfs_file_attr(const tgfs_file *file,tgfs_attr *attr) {*attr=file->attr;}
+static int part_bytes(tgfs_file *file,file_part *part,tgfs_error *e)
+{
+    tgfs *fs=file->fs;
+    if(fs->last_chunk && fs->last_chunk_id==part->chunk->id) return 0;
+    size_t length=0;
+    unsigned char *bytes=fs->loader ? fs->loader(part->chunk->id,&length,fs->loader_context,e) :
+        bytes_load_at(fs->dirfd,part->chunk->document,TGFS_MAX_CHUNK,&length,e);
+    if(!bytes) return -1;
+    char hash[65];
+    if(length!=part->size || digest(bytes,length,hash) || !same(hash,json_string(part->metadata,"part_sha256"))) {
+        free(bytes);return fail(e,"CHUNK size or SHA-256 mismatch");
+    }
+    free(fs->last_chunk);fs->last_chunk=bytes;fs->last_chunk_size=length;fs->last_chunk_id=part->chunk->id;return 0;
+}
+int tgfs_file_read(tgfs_file *file,uint64_t offset,void *buffer,size_t capacity,size_t *length,tgfs_error *e)
+{
+    if(!file || !length || (!buffer && capacity)) return fail_code(e,EINVAL,"invalid read arguments");
+    *length=0;
+    if(file->hash_failed) return fail(e,"file SHA-256 previously failed");
+    if(offset>=file->attr.size || !capacity) return 0;
+    size_t wanted=capacity;
+    if((uint64_t)wanted>file->attr.size-offset) wanted=(size_t)(file->attr.size-offset);
+    size_t lo=0,hi=file->count;
+    while(lo<hi) {
+        size_t mid=lo+(hi-lo)/2;
+        if(file->parts[mid].offset+file->parts[mid].size<=offset) lo=mid+1;else hi=mid;
+    }
+    size_t copied=0;
+    for(size_t i=lo;i<file->count && copied<wanted;i++) {
+        file_part *p=&file->parts[i];
+        if(part_bytes(file,p,e)) return -1;
+        uint64_t current=offset+copied;
+        size_t within=(size_t)(current-p->offset),take=(size_t)p->size-within;
+        if(take>wanted-copied) take=wanted-copied;
+        memcpy((unsigned char *)buffer+copied,file->fs->last_chunk+within,take);copied+=take;
+    }
+    if(copied!=wanted) return fail(e,"file range is not covered by parts");
+    if(offset==0) {
+        EVP_MD_CTX_free(file->sequential);file->sequential=EVP_MD_CTX_new();file->verified_until=0;
+        if(!file->sequential || !EVP_DigestInit_ex(file->sequential,EVP_sha256(),NULL)) return fail(e,"cannot initialize sequential hash");
+    }
+    if(file->sequential && offset==file->verified_until) {
+        if(!EVP_DigestUpdate(file->sequential,buffer,copied)) return fail(e,"cannot hash read range");
+        file->verified_until+=copied;
+        if(file->verified_until==file->attr.size) {
+            unsigned char bytes[32];unsigned n;char hash[65];
+            if(!EVP_DigestFinal_ex(file->sequential,bytes,&n) || n!=32) return fail(e,"cannot finalize file hash");
+            EVP_MD_CTX_free(file->sequential);file->sequential=NULL;
+            for(size_t i=0;i<32;i++) snprintf(hash+i*2,3,"%02x",bytes[i]);
+            if(!same(hash,json_string(file->commit->caption,"file_sha256"))) {
+                file->hash_failed=1;return fail(e,"whole-file SHA-256 mismatch");
+            }
+        }
+    } else {EVP_MD_CTX_free(file->sequential);file->sequential=NULL;}
+    *length=copied;return 0;
+}
+
 int tgfs_cat(tgfs *fs, const char *path, FILE *output, tgfs_error *e)
 {
     const char *id = resolve(fs, path, e);
     if (!id) return -1;
-    if (directory_known(fs, id)) return fail(e, "cannot read a directory as a file");
+    if (directory_known(fs, id)) return fail_code(e, EISDIR, "cannot read a directory as a file");
     message *commit = selected_commit(fs, id, e);
     if (!commit) return -1;
     const cJSON *parts = cJSON_GetObjectItemCaseSensitive(commit->body, "parts");

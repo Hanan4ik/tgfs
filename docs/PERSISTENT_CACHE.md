@@ -145,7 +145,9 @@ FUSE handles. Массовый импорт остаётся ограничен 
 REMOVE и чтение старого дерева, bot/root namespaces, повреждение CHUNK/metadata/
 индекса/SQLite, схема и permissions/symlinks, XDG/HOME, лимит blobs и параллельное
 открытие. Всего 88 тестов; ASan/UBSan локально с detect_leaks=0 из-за ptrace.
-Живой кэш пока не проверен пользователем. Следующий этап — read-only FUSE.
+Пользователь подтвердил warm/offline cache: повторный ls downloads=0, multipart cat скачал 3 части, offline cat hits=9/downloads=0. Добавлен [read-only FUSE](FUSE_READONLY.md).
 
 Основание SQLite API: [sqlite3_open_v2](https://www.sqlite.org/c3ref/open.html),
 [транзакции](https://www.sqlite.org/lang_transaction.html).
+
+При работающем mount metadata и часть находятся в памяти сессии, SQLite используется для остальных частей. Перед ручным удалением базы кэша завершите использующие её процессы/отмонтируйте FS.
