@@ -98,7 +98,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 
 class Put(unittest.TestCase):
-    def exercise(self,data=b'hello\n',mode='ok',readback=True,recover=False,recovery_mode='ok'):
+    def exercise(self,data=b'hello\n',mode='ok',readback=True,recover=False,recovery_mode='ok',finalize_case=None):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -162,6 +162,36 @@ class Put(unittest.TestCase):
                         result=run(['read','--no-cache','--capture',str(fresh),'--token-file',str(token),'cat','/hello.txt'])
                         self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,data)
                         self.assertEqual(len(s.sent),count)
+                        if finalize_case:
+                            finalize_command=command.copy();finalize_command[finalize_command.index('--resume-directory')]='--finalize'
+                            original_intent=s.intent.read_bytes()
+                            if finalize_case=='conflict':
+                                cid=int(json.loads(original_intent)['file_commit_id']);bad=json.loads(s.messages[cid]['caption'])
+                                bad['next_message']='99999';s.messages[cid]['caption']=json.dumps(bad)
+                            if finalize_case=='chunk':
+                                part_id=int(json.loads(original_intent)['parts'][0]['message_id']);bad=json.loads(s.messages[part_id]['caption'])
+                                bad['part_sha256']='0'*64;s.messages[part_id]['caption']=json.dumps(bad)
+                            if finalize_case=='local':
+                                temp=state/'intent.finalize.tmp';temp.write_text('preserve');temp.chmod(0o600)
+                            s.mode='repair-lost-edit' if finalize_case=='lost' else 'ok'
+                            calls=len(s.calls);result=run(finalize_command)
+                            self.assertEqual(result.returncode,0 if finalize_case=='ok' else 1,result.stderr)
+                            s.mode='ok'
+                            if finalize_case in ('conflict','local','chunk'):
+                                self.assertEqual(s.intent.read_bytes(),original_intent)
+                                if finalize_case in ('conflict','chunk'): self.assertNotIn('editMessageCaption',s.calls[calls:])
+                                if finalize_case=='local': self.assertEqual(temp.read_text(),'preserve')
+                                return
+                            if finalize_case=='lost':
+                                self.assertEqual(s.intent.read_bytes(),original_intent)
+                                result=run(finalize_command);self.assertEqual(result.returncode,0,result.stderr)
+                            completed=json.loads(s.intent.read_text());self.assertEqual(completed['phase'],'complete')
+                            self.assertEqual(s.intent.stat().st_mode&0o777,0o600)
+                            self.assertTrue(json.loads(result.stdout)['finalized'])
+                            persisted=s.intent.read_bytes();calls=len(s.calls)
+                            again=run(finalize_command);self.assertEqual(again.returncode,0,again.stderr)
+                            self.assertFalse(json.loads(again.stdout)['intent_updated']);self.assertNotIn('editMessageCaption',s.calls[calls:])
+                            self.assertEqual(s.intent.read_bytes(),persisted)
                         saved=s.intent;s.intent=root/'unlink-recovered'/'intent.json'
                         deleted=run(['unlink','--capture',str(fresh),'--path','/hello.txt','--state-dir',str(s.intent.parent),
                             '--token-file',str(token),'--send-interval-ms','0'])
@@ -171,6 +201,9 @@ class Put(unittest.TestCase):
                         self.assertEqual(result.returncode,0,result.stderr)
                         self.assertEqual(json.loads(result.stdout)['directory_resume'],'already_observed')
                         self.assertEqual(len(s.sent),count) # Never resurrect an observed ADD after REMOVE.
+                        if finalize_case:
+                            calls=len(s.calls);result=run(finalize_command[:]) # old capture still valid; current messages must be verified
+                            self.assertEqual(result.returncode,0,result.stderr);self.assertNotIn('sendDocument',s.calls[calls:])
                         return
                     if mode=='lost': self.assertIn(b'outcome_unknown=1',p.stderr)
                     if mode in ('lost','response','edit'):
@@ -559,6 +592,10 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
+    def test_finalize_put(self):
+        for mode in ('ok','lost','conflict','local','chunk'):
+            with self.subTest(mode=mode): self.exercise(mode='edit',recover=True,finalize_case=mode)
+    def test_finalize_empty(self): self.exercise(b'',mode='create-pin-after-commit',recover=True,finalize_case='ok')
     def test_resume_directory(self):
         for case in ('ok','lost','reject','phase','conflict','log'):
             with self.subTest(case=case): self.exercise(mode='edit',recover=True,recovery_mode=case)

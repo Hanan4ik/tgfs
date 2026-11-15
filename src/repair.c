@@ -6,6 +6,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 static int same(const char *a,const char *b) {return a && b && !strcmp(a,b);}
 static int log_event(int fd,const char *event,const char *id,tgfs_error *e)
@@ -249,5 +250,108 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
     cJSON_ReplaceItemInObjectCaseSensitive(report,"publication",cJSON_CreateString("confirmed"));
     cJSON_ReplaceItemInObjectCaseSensitive(report,"resumed",cJSON_CreateBool(1));
     cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("capture_after_directory_publication"));
+    return 0;
+}
+
+static int finish_local_intent(const char *state,const cJSON *intent,const char *commit_id,const char *directory_id,int logfd,tgfs_error *e)
+{
+    int dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);struct stat st;
+    if(dir<0) return fail(e,"cannot reopen intent directory");
+    cJSON *current=NULL,*finished=NULL;char *raw=NULL;int fd=-1,rc=-1;
+    if(fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {fail(e,"intent directory changed permissions");goto done;}
+    current=json_load_at(dir,"intent.json",e);
+    if(!current || !cJSON_Compare(current,intent,1)) {fail(e,"intent changed during finalization");goto done;}
+    if(same(json_string(intent,"phase"),"complete")) {
+        if(!same(json_string(intent,"file_commit_id"),commit_id) || !same(json_string(intent,"directory_message_id"),directory_id)) fail(e,"complete intent stored IDs differ from canonical publications");
+        else if(fsync(dir)) fail(e,"cannot sync intent directory");else rc=0;
+        goto done;
+    }
+    finished=cJSON_Duplicate(intent,1);if(!finished) {fail(e,"out of memory");goto done;}
+    cJSON_DeleteItemFromObjectCaseSensitive(finished,"phase");
+    cJSON_DeleteItemFromObjectCaseSensitive(finished,"file_commit_id");
+    cJSON_DeleteItemFromObjectCaseSensitive(finished,"directory_message_id");
+    if(!cJSON_AddStringToObject(finished,"phase","complete") || !cJSON_AddStringToObject(finished,"file_commit_id",commit_id) ||
+        !cJSON_AddStringToObject(finished,"directory_message_id",directory_id)) {fail(e,"out of memory");goto done;}
+    raw=cJSON_PrintUnformatted(finished);if(!raw) {fail(e,"out of memory");goto done;}
+    fd=openat(dir,"intent.finalize.tmp",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
+    if(fd<0) {fail(e,"cannot create intent.finalize.tmp; preserve any existing recovery file");goto done;}
+    size_t offset=0,length=strlen(raw);
+    while(offset<length) {ssize_t n=write(fd,raw+offset,length-offset);if(n<0 && errno==EINTR) continue;if(n<=0) {fail(e,"cannot write finalized intent");goto done;}offset+=(size_t)n;}
+    if(fsync(fd)) {fail(e,"cannot persist finalized intent");goto done;}
+    if(close(fd)) {fd=-1;fail(e,"cannot close finalized intent");goto done;}fd=-1;
+    if(log_event(logfd,"local_complete_pending",commit_id,e)) goto done;
+    if(renameat(dir,"intent.finalize.tmp",dir,"intent.json") || fsync(dir)) {fail(e,"cannot publish finalized intent; local outcome may be unknown");goto done;}
+    if(log_event(logfd,"local_complete_confirmed",commit_id,e)) goto done;
+    rc=1;
+done:
+    if(fd>=0) close(fd);
+    close(dir);free(raw);cJSON_Delete(current);cJSON_Delete(finished);return rc;
+}
+int finalize_put(tgfs_bot *bot,const char *state,const cJSON *journal,const cJSON *intent,cJSON *report,int logfd,tgfs_error *e)
+{
+    const cJSON *commits=cJSON_GetObjectItemCaseSensitive(report,"commit_ids"),*directories=cJSON_GetObjectItemCaseSensitive(report,"directory_ids");
+    if(!same(json_string(intent,"kind"),"put") || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(intent,"replace")) ||
+        !cJSON_GetArraySize(commits) || !cJSON_GetArraySize(directories) || !same(json_string(report,"staging"),"verified"))
+        return fail(e,"finalize requires a verified create with confirmed FILE_COMMIT and ADD");
+    const char *bad[]={"unobserved_part_indexes","ambiguous_part_indexes","unobserved_known_ids"};
+    for(size_t i=0;i<3;i++) if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,bad[i]))) return fail(e,"finalize blocked by missing or ambiguous parts");
+    const char *commit_id=cJSON_GetArrayItem(commits,0)->valuestring,*directory_id=cJSON_GetArrayItem(directories,0)->valuestring;
+    uint64_t cid,did;decimal(commit_id,&cid);decimal(directory_id,&did);
+    if(did<=cid) return fail(e,"ADD precedes canonical FILE_COMMIT");
+    /* Force live validation of all canonical parts, including those correct in the capture. */
+    cJSON *original=cJSON_Duplicate(cJSON_GetObjectItemCaseSensitive(report,"backlink_repairs"),1),*all=cJSON_CreateArray();
+    if(!original || !all) {cJSON_Delete(original);cJSON_Delete(all);return fail(e,"out of memory");}
+    const cJSON *parts=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(intent,"commit_document"),"parts"),*part;
+    cJSON_ArrayForEach(part,parts) {
+        const char *next=part->next?json_string(part->next,"message_id"):commit_id;cJSON *fix=cJSON_CreateObject();
+        if(!fix || !cJSON_AddStringToObject(fix,"message_id",json_string(part,"message_id")) ||
+            !cJSON_AddStringToObject(fix,"file_commit_id",commit_id) || !cJSON_AddStringToObject(fix,"next_message",next) || !cJSON_AddItemToArray(all,fix)) {
+            cJSON_Delete(fix);cJSON_Delete(all);cJSON_Delete(original);return fail(e,"out of memory");
+        }
+    }
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"backlink_repairs",all);
+    int checked=repair_backlinks(bot,journal,intent,report,logfd,e);
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"backlink_repairs",original);
+    if(checked) return -1;
+    const cJSON *cr=record_find(journal,commit_id),*dr=record_find(journal,directory_id);
+    cJSON *commit=fresh_caption(bot,journal,cr,logfd,e);if(!commit) return -1;
+    cJSON *directory=fresh_caption(bot,journal,dr,logfd,e);if(!directory) {cJSON_Delete(commit);return -1;}
+    int same_metadata=json_semantic_equal(commit,cJSON_GetObjectItemCaseSensitive(cr,"record")) &&
+        json_semantic_equal(directory,cJSON_GetObjectItemCaseSensitive(dr,"record"));cJSON_Delete(directory);
+    if(!same_metadata) {cJSON_Delete(commit);return fail(e,"fresh commit or ADD metadata changed");}
+    const char *next=json_string(commit,"next_message");
+    if(!cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(commit,"next_message")) && !same(next,directory_id)) {
+        cJSON_Delete(commit);return fail(e,"commit navigation conflicts with confirmed ADD");
+    }
+    cJSON *p=params(json_string(journal,"storage_chat_id")),*out=NULL;
+    if(call(bot,"getChat",p,&out,0,e)) {cJSON_Delete(commit);return -1;}
+    const cJSON *pin=cJSON_GetObjectItemCaseSensitive(out,"pinned_message");const char *text=json_string(pin,"text");
+    cJSON *header=text?json_parse_bytes((const unsigned char *)text,strlen(text),e):NULL;
+    uint64_t start;long long pinned,expected_channel,actual_channel,pin_channel;
+    int valid=header && !tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&expected_channel) &&
+        !tgfs_bot_integer(out,"id",&actual_channel) && actual_channel==expected_channel && same(json_string(out,"type"),"channel") &&
+        !tgfs_bot_integer(cJSON_GetObjectItemCaseSensitive(pin,"chat"),"id",&pin_channel) && pin_channel==expected_channel && !json_decimal(cJSON_GetObjectItemCaseSensitive(journal,"superblock"),"start_id",&start) &&
+        !tgfs_bot_integer(pin,"message_id",&pinned) && pinned==(long long)start && json_semantic_equal(header,cJSON_GetObjectItemCaseSensitive(journal,"superblock"));
+    cJSON_Delete(header);cJSON_Delete(out);if(!valid) {cJSON_Delete(commit);return fail(e,"pinned SUPERBLOCK differs from capture");}
+    int repaired=!same(next,directory_id);
+    if(repaired) {
+        cJSON_DeleteItemFromObjectCaseSensitive(commit,"next_message");
+        if(!cJSON_AddStringToObject(commit,"next_message",directory_id)) {cJSON_Delete(commit);return fail(e,"out of memory");}
+        char *raw=cJSON_PrintUnformatted(commit);p=params(json_string(journal,"storage_chat_id"));out=NULL;
+        if(!raw || !p || !cJSON_AddNumberToObject(p,"message_id",(double)cid) || !cJSON_AddStringToObject(p,"caption",raw)) {
+            free(raw);cJSON_Delete(p);cJSON_Delete(commit);return fail(e,"out of memory");
+        }
+        if(log_event(logfd,"commit_navigation_pending",commit_id,e)) {free(raw);cJSON_Delete(p);cJSON_Delete(commit);return -1;}
+        int rc=call(bot,"editMessageCaption",p,&out,1,e);
+        if(!rc && (message_matches(out,cr,json_string(journal,"storage_chat_id"),commit_id,e) || !same(json_string(out,"caption"),raw))) rc=fail(e,"commit edit response mismatch; outcome may be unknown");
+        free(raw);cJSON_Delete(out);if(rc || log_event(logfd,"commit_navigation_confirmed",commit_id,e)) {cJSON_Delete(commit);return -1;}
+    }
+    cJSON_Delete(commit);
+    int updated=finish_local_intent(state,intent,commit_id,directory_id,logfd,e);if(updated<0) return -1;
+    if(!cJSON_AddBoolToObject(report,"finalized",1) || !cJSON_AddBoolToObject(report,"intent_updated",updated) ||
+        !cJSON_AddBoolToObject(report,"commit_navigation_repaired",repaired)) return fail(e,"out of memory");
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"scope",cJSON_CreateString("capture_plus_live_verification"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"local_phase",cJSON_CreateString("complete"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("intent_complete"));
     return 0;
 }

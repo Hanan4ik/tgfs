@@ -45,6 +45,8 @@ make test
 
 [Восстановление публикации имени](docs/RESUME_DIRECTORY.md): `tgfs intent --resume-directory`.
 
+[Завершение подтверждённого put](docs/FINALIZE_PUT.md): `tgfs intent --finalize`.
+
 [Постоянный индекс, кэш и offline](docs/PERSISTENT_CACHE.md) — включены по умолчанию в read.
 
 [Монтирование через FUSE](docs/FUSE_READONLY.md): `tgfs mount --help`.
