@@ -175,3 +175,14 @@ SHA/bytes, metadata и refs; сообщает ненаблюдённые/нео�
 Следующий живой тест — intent replace-documents-hello-001 на capture-010.
 Далее — ограниченный ремонт metadata и безопасное продолжение; полный resume,
 GC и write-FUSE пока не реализованы.
+
+## Ограниченный ремонт backlinks (2026-11-15)
+
+Пользователь подтвердил put intent: commit41/CHUNK40, staging verified, проблем
+нет. Добавлен явный [--repair-backlinks](BACKLINK_REPAIR.md): свежая проверка
+канала/commit/parts через служебные копии, flock/журнал до мутаций, проверяемый
+edit только двух навигационных полей. Уже исправленные части пропускаются,
+новые публикации не создаются, local_phase не меняется. 114 тестов с lost-edit,
+повтором, origin/cleanup/pin/metadata конфликтами и lock. Следующий живой тест
+на прежнем state/capture-010 — no-op, искусственно ломать captions не нужно.
+Полное resume, ремонт commit/directory и автоматический cleanup лога открыты.

@@ -70,6 +70,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if s.mode in ('edit','mkdir-edit','replace-edit'):
                 return self.reply(error=dict(ok=False,error_code=429,description=TOKEN,parameters=dict(retry_after=5)),status=429)
             msg=s.messages[p['message_id']];msg['caption']=p['caption']
+            if s.mode=='repair-lost-edit':
+                self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
             return self.reply(msg)
         if method=='sendMessage':
             mid=s.next;s.next+=1
@@ -80,10 +82,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg=copy.deepcopy(s.messages[p['message_id']]);msg['message_id']=s.copy_id;s.copy_id+=1
             msg['chat']=dict(id=SERVICE,type='channel')
             msg['forward_origin']=dict(type='channel',chat=dict(id=STORAGE,type='channel'),message_id=p['message_id'])
+            if s.mode=='repair-origin': msg['forward_origin']['message_id']+=1
             return self.reply(msg)
         if method=='getFile':
             fid=p['file_id'];return self.reply(dict(file_id=fid,file_size=len(s.files[fid]),file_path='documents/'+fid))
         if method=='deleteMessage':
+            if s.mode=='repair-cleanup': return self.reply(error=dict(ok=False,error_code=429,description='cleanup rejected'),status=429)
             assert int(p['chat_id'])==SERVICE
             return self.reply(True)
         raise AssertionError(method)
@@ -167,7 +171,7 @@ class Put(unittest.TestCase):
                         self.assertEqual(listing.stdout,b'hello.txt\nnotes.txt\n')
             finally:
                 s.shutdown();s.server_close();t.join()
-    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok',diagnose=False):
+    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok',diagnose=False,repair_case=None):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -316,6 +320,29 @@ class Put(unittest.TestCase):
                             if replace_mode=='replace-edit': self.assertTrue(evidence['backlink_repairs'])
                             if replace_mode=='replace-lost-chunk': self.assertTrue(evidence['unobserved_part_indexes'])
                             if replace_mode=='replace-lost-commit': self.assertEqual(len(evidence['verified_chunk_ids']),len(updated['parts']))
+                        if repair_case:
+                            before_intent=(state/'intent.json').read_bytes();before_sent=len(s.sent)
+                            command=['intent','--repair-backlinks','--state-dir',str(state),'--capture',str(final),'--token-file',str(token)]
+                            first_id=int(updated['parts'][0]['message_id']);original_caption=s.messages[first_id]['caption']
+                            if repair_case=='changed':
+                                changed=json.loads(original_caption);changed['part_sha256']='0'*64;s.messages[first_id]['caption']=json.dumps(changed)
+                            s.mode={'lost':'repair-lost-edit','origin':'repair-origin','cleanup':'repair-cleanup','pin':'pin'}.get(repair_case,'ok')
+                            calls=len(s.calls)
+                            result=run(command,code=0 if repair_case=='ok' else 1)
+                            if repair_case not in ('ok','lost'): self.assertNotIn('editMessageCaption',s.calls[calls:])
+                            s.mode='ok'
+                            if repair_case=='changed': s.messages[first_id]['caption']=original_caption
+                            if repair_case!='ok': result=run(command)
+                            fixed=json.loads(result.stdout);self.assertTrue(fixed['repair_applied'])
+                            self.assertEqual(len(s.sent),before_sent);self.assertEqual((state/'intent.json').read_bytes(),before_intent)
+                            calls=len(s.calls);again=json.loads(run(command).stdout)
+                            self.assertFalse(again['repaired_chunk_ids']);self.assertNotIn('editMessageCaption',s.calls[calls:])
+                            self.assertEqual(len(again['repair_skipped_ids']),len(updated['parts']))
+                            log=(state/'backlink-repair.log').read_text();self.assertIn('edit_pending',log);self.assertIn('service_copy_known',log)
+                            import fcntl
+                            with (state/'backlink-repair.log').open('a') as held:
+                                fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB);run(command,code=1)
+                            checked=scan();self.assertEqual(check_intent(state,checked,'confirmed')['backlink_repairs'],[])
                         self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),expected_data)
                         self.assertEqual(read(original_cap,'cat','/documents/sub/multi.txt'),b'abcdefghij\n')
                         self.assertEqual(read(final,'ls','/documents/sub'),b'multi.txt\nempty.txt\n')
@@ -439,6 +466,12 @@ class Put(unittest.TestCase):
                     duplicated=root/'duplicated';duplicated.mkdir();(duplicated/'journal.json').write_text(json.dumps(duplicate_journal))
                     evidence=check_intent(state_file.parent,duplicated,'confirmed')
                     self.assertEqual(evidence['ambiguous_part_indexes'],[0]);self.assertEqual(evidence['next_step'],'resolve_duplicate_parts')
+                    start=len(s.calls)
+                    run(['intent','--repair-backlinks','--state-dir',str(state_file.parent),'--capture',str(duplicated),'--token-file',str(token)],code=1)
+                    self.assertNotIn('editMessageCaption',s.calls[start:])
+                    noop=json.loads(run(['intent','--repair-backlinks','--state-dir',str(state_file.parent),'--capture',str(final),'--token-file',str(token)]).stdout)
+                    self.assertEqual(noop['repaired_chunk_ids'],[])
+
                     data_path=state_file.parent/'data.bin';original_data=data_path.read_bytes();data_path.write_bytes(b'bad')
                     result=run(['intent','--state-dir',str(state_file.parent),'--capture',str(final),'--token-file',str(token)],code=1)
                     self.assertIn(b'staging',result.stderr);data_path.write_bytes(original_data)
@@ -477,6 +510,9 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
+    def test_backlink_repair(self):
+        for mode in ('ok','lost','changed','origin','cleanup','pin'):
+            with self.subTest(mode=mode): self.directories(replace=True,replace_mode='replace-edit',diagnose=True,repair_case=mode)
     def test_intent_complete_and_validation(self): self.directories(diagnose=True)
     def test_intent_lost_commit(self):
         for mode in ('replace-lost-commit','replace-lost-chunk','replace-edit'):
