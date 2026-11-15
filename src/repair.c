@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 static int same(const char *a,const char *b) {return a && b && !strcmp(a,b);}
 static int log_event(int fd,const char *event,const char *id,tgfs_error *e)
@@ -152,4 +153,101 @@ done:
         }
     }
     return rc;
+}
+
+/* A durable pending record is a send barrier, even after a lost response or crash. */
+static int directory_attempted(int fd,tgfs_error *e)
+{
+    struct stat st;
+    if(fstat(fd,&st) || st.st_size>TGFS_MAX_JSON) return fail(e,"recovery log too large or unreadable");
+    if(lseek(fd,0,SEEK_SET)<0) return fail(e,"cannot read recovery log");
+    FILE *stream=fdopen(dup(fd),"r");if(!stream) return fail(e,"cannot inspect recovery log");
+    char *line=NULL;size_t capacity=0,total=0;ssize_t n;int found=0;
+    while((n=getline(&line,&capacity,stream))>=0) {
+        total+=(size_t)n;
+        if(total>TGFS_MAX_JSON) {fail(e,"recovery log too large");found=-1;break;}
+        cJSON *entry=json_parse_bytes((const unsigned char *)line,(size_t)n,e);
+        if(!entry) {found=-1;break;}
+        if(same(json_string(entry,"event"),"directory_send_pending")) found=1;
+        cJSON_Delete(entry);
+    }
+    if(ferror(stream)) {fail(e,"cannot read recovery log");found=-1;}
+    free(line);fclose(stream);return found;
+}
+int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *intent,cJSON *report,int fd,tgfs_error *e)
+{
+    if(!same(json_string(intent,"kind"),"put") || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(intent,"replace")) ||
+        !cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"commit_ids")) || !same(json_string(report,"staging"),"verified"))
+        return fail(e,"directory resume requires a verified new-file put with confirmed FILE_COMMIT");
+    const char *blocked[]={"unobserved_part_indexes","ambiguous_part_indexes","unobserved_known_ids"};
+    for(size_t i=0;i<3;i++) if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,blocked[i]))) return fail(e,"directory resume blocked by missing or ambiguous parts");
+    if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"directory_ids")))
+        return cJSON_AddStringToObject(report,"directory_resume","already_observed")?0:fail(e,"out of memory");
+    const char *phase=json_string(intent,"phase");
+    if(!same(phase,"backlinks_pending") && !same(phase,"commit_send_pending") && !same(phase,"commit_response_uncertain"))
+        return fail(e,"ADD may already have been attempted; directory resume is blocked");
+    int attempted=directory_attempted(fd,e);if(attempted<0) return -1;
+    if(attempted) return fail(e,"recovery log contains a previous ADD attempt; use a newer capture, never resend blindly");
+    const char *path=json_string(intent,"parent_path"),*name=json_string(intent,"name"),*operation=json_string(intent,"add_operation_id");
+    if(!path || !uuid_valid(operation)) return fail(e,"missing saved directory destination");
+    char parent[37],grandparent[37];
+    if(directory_target(fs,path,name,parent,grandparent,e)) return -1;
+    const cJSON *body=cJSON_GetObjectItemCaseSensitive(intent,"directory_document"),*caption=cJSON_GetObjectItemCaseSensitive(intent,"directory_caption");
+    const cJSON *ops=cJSON_GetObjectItemCaseSensitive(body,"operations"),*add=cJSON_GetArrayItem(ops,0);
+    if(directory_operations_valid(body,e)) return -1;
+    size_t format;
+    if(json_count(caption,"format_version",&format) || format!=1 || !cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(caption,"next_message")) ||
+        cJSON_GetArraySize(ops)!=1 || !same(json_string(add,"action"),"ADD") || !same(json_string(add,"name"),name) ||
+        !same(json_string(add,"operation_id"),operation) || !same(json_string(add,"object_id"),json_string(intent,"object_id")) ||
+        !same(parent,json_string(intent,"parent_id")) || !same(json_string(caption,"object_id"),parent) ||
+        !same(json_string(caption,"type"),"DIRECTORY") || !same(json_string(caption,"magic"),"TGFS") ||
+        (grandparent[0]?!same(json_string(caption,"parent_id"),grandparent):!cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(caption,"parent_id"))))
+        return fail(e,"saved ADD/caption destination disagrees with intent and captured parent");
+    if(repair_backlinks(bot,journal,intent,report,fd,e)) return -1;
+    const char *commit_id=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(report,"commit_ids"),0)->valuestring;
+    const cJSON *record=record_find(journal,commit_id);
+    cJSON *fresh=fresh_caption(bot,journal,record,fd,e);if(!fresh) return -1;
+    int good=json_semantic_equal(fresh,cJSON_GetObjectItemCaseSensitive(record,"record"));cJSON_Delete(fresh);
+    if(!good) return fail(e,"fresh FILE_COMMIT differs from capture");
+    /* Validate the pin again immediately before publication. */
+    cJSON *p=params(json_string(journal,"storage_chat_id")),*out=NULL;
+    if(call(bot,"getChat",p,&out,0,e)) return -1;
+    const cJSON *pin=cJSON_GetObjectItemCaseSensitive(out,"pinned_message");const char *raw=json_string(pin,"text");
+    cJSON *header=raw?json_parse_bytes((const unsigned char *)raw,strlen(raw),e):NULL;
+    uint64_t start;long long mid,expected_channel,actual_channel,pin_channel;
+    good=header && !tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&expected_channel) &&
+        !tgfs_bot_integer(out,"id",&actual_channel) && actual_channel==expected_channel && same(json_string(out,"type"),"channel") &&
+        !tgfs_bot_integer(cJSON_GetObjectItemCaseSensitive(pin,"chat"),"id",&pin_channel) && pin_channel==expected_channel && !json_decimal(cJSON_GetObjectItemCaseSensitive(journal,"superblock"),"start_id",&start) &&
+        !tgfs_bot_integer(pin,"message_id",&mid) && mid==(long long)start && json_semantic_equal(header,cJSON_GetObjectItemCaseSensitive(journal,"superblock"));
+    cJSON_Delete(header);cJSON_Delete(out);if(!good) return fail(e,"pinned SUPERBLOCK differs from capture");
+    char *text=cJSON_PrintUnformatted(caption),*document=cJSON_PrintUnformatted(body);
+    if(!text || !document) {free(text);free(document);return fail(e,"out of memory");}
+    if(log_event(fd,"directory_send_pending",operation,e)) {free(text);free(document);return -1;}
+#ifndef TGFS_TESTING
+    struct timespec pause={1,100000000};
+    while(nanosleep(&pause,&pause)) if(errno!=EINTR) {free(text);free(document);return fail(e,"recovery pacing failed");}
+#endif
+    tgfs_bot_error b;out=NULL;
+    int rc=tgfs_bot_send_document(bot,json_string(journal,"storage_chat_id"),"directory.json",document,strlen(document),text,&out,&b);
+    if(rc) fail(e,"%s [http=%ld api=%d outcome_unknown=%d]",b.message,b.http_status,b.api_code,b.outcome_unknown);
+    long long channel,returned_channel,returned_size;mid=0;
+    const cJSON *chat=cJSON_GetObjectItemCaseSensitive(out,"chat"),*doc=cJSON_GetObjectItemCaseSensitive(out,"document");
+    uint64_t boundary;json_decimal(journal,"boundary_id",&boundary);
+    if(!rc && (tgfs_bot_integer(out,"message_id",&mid) || mid<=(long long)boundary ||
+        tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&channel) || tgfs_bot_integer(chat,"id",&returned_channel) || channel!=returned_channel ||
+        !same(json_string(chat,"type"),"channel") || !same(json_string(out,"caption"),text) ||
+        !same(json_string(doc,"file_name"),"directory.json") || !json_string(doc,"file_id") ||
+        tgfs_bot_integer(doc,"file_size",&returned_size) || returned_size!=(long long)strlen(document))) rc=fail(e,"resumed ADD response mismatch; outcome may be unknown");
+    free(text);free(document);cJSON_Delete(out);
+    if(rc) return -1;
+    char id[32];snprintf(id,sizeof(id),"%lld",mid);
+    if(log_event(fd,"directory_publication_confirmed",id,e)) return -1;
+    cJSON *value=cJSON_CreateString(id);
+    if(!value || !cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(report,"directory_ids"),value)) {cJSON_Delete(value);return fail(e,"out of memory");}
+    if(!cJSON_AddStringToObject(report,"directory_resume","published")) return fail(e,"out of memory");
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"scope",cJSON_CreateString("capture_plus_recovery_response"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"publication",cJSON_CreateString("confirmed"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"resumed",cJSON_CreateBool(1));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("capture_after_directory_publication"));
+    return 0;
 }
