@@ -215,7 +215,8 @@ int cache_index_get(tgfs_cache *c,const char *key,cJSON **snapshot,tgfs_error *e
             }
             return 1;
         }
-        memset(e,0,sizeof(*e));rc=0;
+        if(e) memset(e,0,sizeof(*e));
+        rc=0;
     }
     if(!rc && drop(c,"DELETE FROM captures WHERE key=?",key,e)) return -1;
     return rc;

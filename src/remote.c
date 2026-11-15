@@ -2,6 +2,8 @@
 #include "tgfs/bot_api.h"
 #include "internal.h"
 #include "cache.h"
+#include "tgfs/remote.h"
+#include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -179,7 +181,7 @@ static int check_entry(const char *name,const char *object,void *arg)
     if(same(name,check->name)) check->found=1;
     return 0;
 }
-static int read_capture(remote *r,const cJSON *journal,const char *command,const char *path,const char *new_name,tgfs_error *e)
+static int read_capture(remote *r,const cJSON *journal,const char *command,const char *path,const char *new_name,tgfs **opened,tgfs_error *e)
 {
     const cJSON *sb=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
     uint64_t start,boundary;
@@ -274,6 +276,7 @@ static int read_capture(remote *r,const cJSON *journal,const char *command,const
     free(raw);
     if(written || tgfs_open_snapshot_loader(temp,load_chunk,r,&fs,e)) goto done;
     if(r->cache && !r->index_hit && cache_index_put(r->cache,r->capture_key,snapshot,journal,e)) goto done;
+    if(opened) {*opened=fs;fs=NULL;rc=0;goto done;}
     if(new_name) {
         name_check check={.name=new_name};
         rc=tgfs_list(fs,"/",check_entry,&check,e);
@@ -283,10 +286,43 @@ static int read_capture(remote *r,const cJSON *journal,const char *command,const
 done:
     tgfs_close(fs);cJSON_Delete(snapshot);cJSON_Delete(messages);clean(dir,temp);return rc;
 }
+struct tgfs_remote_session { remote r; cJSON *journal; tgfs *fs; };
+int tgfs_remote_open(const tgfs_remote_options *o,tgfs_remote_session **out,tgfs_error *e)
+{
+    if(!out) return fail_code(e,EINVAL,"missing remote session output");
+    *out=NULL;
+    if(!o || !o->capture || !o->token_file || (o->offline && (o->no_cache || o->refresh)))
+        return fail_code(e,EINVAL,"invalid remote session options");
+    tgfs_remote_session *s=calloc(1,sizeof(*s));
+    if(!s) return fail_code(e,ENOMEM,"out of memory");
+    s->r.offline=o->offline;s->r.refresh=o->refresh;
+    int dir=open(o->capture,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(dir<0) {fail(e,"cannot open capture directory");goto invalid;}
+    s->journal=json_load_at(dir,"journal.json",e);close(dir);
+    if(!s->journal) goto invalid;
+    tgfs_bot_error b;
+    if(tgfs_bot_open(o->token_file,o->timeout,&s->r.bot,&b) || tgfs_bot_set_proxy(s->r.bot,o->proxy,&b)) {
+        api_failure(e,&b);goto invalid;
+    }
+    if(!o->no_cache && cache_open(o->cache_dir,o->cache_limit,&s->r.cache,e)) goto invalid;
+    if(read_capture(&s->r,s->journal,NULL,NULL,NULL,&s->fs,e)) goto invalid;
+    *out=s;return 0;
+invalid:
+    tgfs_remote_close(s);return -1;
+}
+tgfs *tgfs_remote_fs(tgfs_remote_session *s) {return s->fs;}
+void tgfs_remote_report(tgfs_remote_session *s,FILE *stream)
+{
+    fprintf(stream,"cache: index=%s hits=%u downloads=%u\n",s->r.index_hit?"hit":"miss",s->r.hits,s->r.downloads);
+}
+void tgfs_remote_close(tgfs_remote_session *s)
+{
+    if(s) {tgfs_close(s->fs);cache_close(s->r.cache);tgfs_bot_close(s->r.bot);cJSON_Delete(s->journal);free(s);}
+}
 int remote_check_root_name(tgfs_bot *bot,const cJSON *journal,const char *name,tgfs_error *e)
 {
     remote r={.bot=bot};
-    return read_capture(&r,journal,"ls","/",name,e);
+    return read_capture(&r,journal,"ls","/",name,NULL,e);
 }
 void tgfs_read_help(FILE *stream)
 {
@@ -333,7 +369,7 @@ int tgfs_read_main(int argc,char **argv)
         (limit_text && (decimal(limit_text,&limit_mib) || !limit_mib || limit_mib>4096 || limit_mib>SIZE_MAX/(1024U*1024U)))) goto usage;
     if(!capture || !token || argv[argc-1][0]!='/' ||
         (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300))) goto usage;
-    tgfs_error e={{0}};tgfs_bot_error b;
+    tgfs_error e={0};tgfs_bot_error b;
     remote r={.offline=offline,.refresh=refresh};cJSON *journal=NULL;
     int dir=open(capture,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC),rc=1;
     if(dir<0) {fail(&e,"cannot open capture directory");goto done;}
@@ -343,7 +379,7 @@ int tgfs_read_main(int argc,char **argv)
         api_failure(&e,&b);goto done;
     }
     if(!no_cache && cache_open(cache_dir,(size_t)limit_mib*1024U*1024U,&r.cache,&e)) goto done;
-    rc=read_capture(&r,journal,argv[argc-2],argv[argc-1],NULL,&e) ? 1 : 0;
+    rc=read_capture(&r,journal,argv[argc-2],argv[argc-1],NULL,NULL,&e) ? 1 : 0;
 done:
     if(rc) fprintf(stderr,"FAIL read: %s\n",e.message);
     if(stats) fprintf(stderr,"cache: index=%s hits=%u downloads=%u\n",r.index_hit?"hit":"miss",r.hits,r.downloads);

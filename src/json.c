@@ -12,10 +12,20 @@
 int fail(tgfs_error *e, const char *format, ...)
 {
     if (e) {
+        e->code=EIO;
         va_list ap;
         va_start(ap, format);
         vsnprintf(e->message, sizeof(e->message), format, ap);
         va_end(ap);
+    }
+    return -1;
+}
+
+int fail_code(tgfs_error *e,int code,const char *format,...)
+{
+    if(e) {
+        e->code=code;
+        va_list ap;va_start(ap,format);vsnprintf(e->message,sizeof(e->message),format,ap);va_end(ap);
     }
     return -1;
 }

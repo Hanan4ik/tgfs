@@ -16,15 +16,15 @@ operation_id используется первое корректное сооб
 next_message не создаёт новую операцию. Входной порядок записей не важен.
 
 Это CLI и библиотечный интерфейс чтения, а не смонтированная файловая система.
-Snapshot ls/cat не обращаются к Telegram. Отдельно реализованы [Bot API транспорт и probe](BOT_API_TRANSPORT.md). Добавлен [сбор журнала и индекс записей](CHANNEL_SCAN.md). Удалённое чтение подключено через [read](REMOTE_READ.md). SQLite-индекс и кэш добавлены в [read](PERSISTENT_CACHE.md); новый файл публикуется через put. FUSE пока отсутствует. Для snapshot токен не нужен.
+Snapshot ls/cat не обращаются к Telegram. Отдельно реализованы [Bot API транспорт и probe](BOT_API_TRANSPORT.md). Добавлен [сбор журнала и индекс записей](CHANNEL_SCAN.md). Удалённое чтение подключено через [read](REMOTE_READ.md). SQLite-индекс и кэш добавлены в [read](PERSISTENT_CACHE.md); новый файл публикуется через put. Добавлен [read-only FUSE mount](FUSE_READONLY.md). Для snapshot токен не нужен.
 
 ## Сборка и запуск
 
-Зависимости: компилятор C11, Make, заголовки/библиотека OpenSSL libcrypto, libcurl >= 7.85, SQLite >= 3.31.
+Зависимости: компилятор C11, Make, заголовки/библиотека OpenSSL libcrypto, libcurl >= 7.85, SQLite >= 3.31, libfuse3 и pkg-config.
 Для тестов нужен Python 3 из стандартной библиотеки.
 
-Debian/Ubuntu: `sudo apt-get install build-essential libssl-dev libcurl4-openssl-dev libsqlite3-dev python3`.
-Arch Linux: `sudo pacman -S --needed base-devel openssl curl sqlite python`.
+Debian/Ubuntu: `sudo apt-get install build-essential libssl-dev libcurl4-openssl-dev libsqlite3-dev libfuse3-dev fuse3 pkg-config python3`.
+Arch Linux: `sudo pacman -S --needed base-devel openssl curl sqlite fuse3 pkgconf python`.
 
 ```sh
 make
