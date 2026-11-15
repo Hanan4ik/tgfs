@@ -49,9 +49,9 @@ DIRECTORY REMOVE в directory_ids. Числовые ID возвращаются 
 
 publication=confirmed означает лишь, что соответствующие публикации найдены
 и совпали **в данном capture**. Это не подтверждение актуального имени/версии:
-позже файл могли заменить или удалить. Это также не проверка целостности байтов
-CHUNK, data.bin или завершённости backlinks/next_message. Эти проверки и
-восстановительные действия — следующий этап.
+позже файл могли заменить или удалить. Само поле publication не является проверкой целостности bytes.
+Обновление ниже добавляет отдельную проверку staging/CHUNK и предложений
+backlinks для put; восстановительные действия пока не выполняются.
 
 publication=not_observed означает, что требуемое сочетание публикаций не
 подтверждено в capture. Capture ограничен маркером и может содержать пропуски;
@@ -65,8 +65,8 @@ publication=not_observed означает, что требуемое сочет�
 Команда не перечисляет автоматически все state-dir и не называет intent
 безопасным для повторной отправки. Не исправляет local_phase=complete,
 не обновляет refs и не удаляет intent после подтверждения. Секреты в отчёт
-не включаются. Persistent cache не используется; metadata могут скачиваться
-повторно, CHUNK не скачиваются.
+не включаются. Persistent cache не используется; metadata могут скачиваться повторно. В обновлении ниже CHUNK для put
+также скачиваются для проверки; для mkdir/unlink — нет.
 
 Следующий этап: сверить staging/CHUNK и сохранённые refs, сформировать точный
 план недостающих действий, затем реализовать ограниченное идемпотентное
@@ -78,3 +78,60 @@ publication=not_observed означает, что требуемое сочет�
 устаревший capture и права. Проверяется неизменность intent и отсутствие
 изменяющих API методов. Всего 113 тестов; локально 109 passed и 4 kernel skips
 (нет /dev/fuse), ASan/UBSan с detect_leaks=0 из-за ptrace.
+
+## Проверка staging/CHUNK и диагностический план (2026-11-15)
+
+Пользователь подтвердил первый intent report: unlink complete, REMOVE source ID43,
+publication=confirmed. Теперь для put команда дополнительно проверяет data.bin:
+owner-only обычный файл, размер и SHA-256 относительно intent. Commit caption,
+число частей и локальные refs должны согласовываться с этим staging.
+
+В capture ищутся все CHUNK нужного object_id/version_id. Для каждого проверяются
+parent_id, номер/имя, offset/размер/число частей, SHA части и файла. Документ
+скачивается и сравнивается побайтно с соответствующим диапазоном staging.
+Повреждение staging, bytes, metadata или конфликтующий ненулевой backlink дают
+ошибку (код1), а не разрешение продолжить. Кэш не используется.
+
+Дополнительные поля JSON:
+
+| Поле | Значение |
+| --- | --- |
+| staging | verified для put; not_applicable для mkdir/unlink |
+| verified_chunk_ids | ID частей, проверенных по bytes и staging |
+| unobserved_part_indexes | Номера частей, не найденных в capture |
+| ambiguous_part_indexes | Номера, для которых найдено несколько сообщений |
+| unobserved_known_ids | Сохранённые refs/refs подтверждённого commit, не найденные среди проверенных частей |
+| backlink_repairs | Предлагаемые message_id/file_commit_id/next_message для частей подтверждённого канонического commit |
+| can_resume | Всегда false: автоматическое продолжение не реализовано |
+| next_step | Диагностическая категория, не команда записи |
+
+next_step принимает resolve_duplicate_parts, capture_or_upload_outcome_review,
+commit_publication_review, backlink_repair_review, directory_publication_review
+или verified_in_capture. Для mkdir/unlink — metadata_review_only: этот этап
+не проверяет их навигацию. Массивы пусты, если соответствующих наблюдений нет.
+
+Ненайденная часть не объявляется неотправленной: запрос мог выполниться после
+маркера либо сообщение могло оказаться в пропуске. Наличие всех частей также
+не разрешает повторить FILE_COMMIT без сверки исхода его отправки.
+backlink_repairs — только evidence для будущего ограниченного ремонта. Ни один
+editMessageCaption сейчас не выполняется. Полная навигация FILE_COMMIT/DIRECTORY,
+проверка всех crash-phases и безопасный resume остаются следующими задачами.
+
+Для живой проверки, с прежним tgfs_net:
+
+```bash
+./build/tgfs intent "${tgfs_net[@]}" \
+  --state-dir "$HOME/.local/state/tgfs/replace-documents-hello-001" \
+  --capture ./capture-010
+```
+
+Ожидаются staging=verified, проверенные ID CHUNK, пустые массивы проблем и
+next_step=verified_in_capture. publication=confirmed относится к прежней
+публикации замены: имя уже удалено, но её сообщения всё ещё существуют.
+Для mkdir/unlink не требуется data.bin. Ничего заново отправлять не нужно.
+
+Тесты дополнены проверкой повреждённого staging и скачанных bytes, частично
+отправленной версии, потерянного commit, незаполненных backlinks и двух
+сообщений одной части. Количество тестовых методов прежнее — 113; расширены
+сквозные сценарии. Это не проверка реального Telegram: живой результат ещё
+ожидается от пользователя.

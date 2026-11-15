@@ -425,6 +425,125 @@ static int intent_stage(remote *r,const cJSON *journal,const cJSON *caption,cons
     }
     return count;
 }
+static int report_id(cJSON *array,const char *id,tgfs_error *e)
+{
+    cJSON *v=cJSON_CreateString(id);
+    if(!v || !cJSON_AddItemToArray(array,v)) {cJSON_Delete(v);return fail(e,"out of memory");}
+    return 0;
+}
+static int intent_data_plan(remote *r,const char *state,const cJSON *intent,const cJSON *journal,cJSON *report,tgfs_error *e)
+{
+    cJSON *verified=cJSON_AddArrayToObject(report,"verified_chunk_ids");
+    cJSON *missing=cJSON_AddArrayToObject(report,"unobserved_part_indexes");
+    cJSON *ambiguous=cJSON_AddArrayToObject(report,"ambiguous_part_indexes");
+    cJSON *unknown=cJSON_AddArrayToObject(report,"unobserved_known_ids");
+    cJSON *repairs=cJSON_AddArrayToObject(report,"backlink_repairs");
+    if(!verified || !missing || !ambiguous || !unknown || !repairs || !cJSON_AddBoolToObject(report,"can_resume",0)) return fail(e,"out of memory");
+    if(!same(json_string(intent,"kind"),"put")) {
+        if(!cJSON_AddStringToObject(report,"staging","not_applicable") ||
+            !cJSON_AddStringToObject(report,"next_step","metadata_review_only")) return fail(e,"out of memory");
+        return 0;
+    }
+    uint64_t size,chunk;
+    const cJSON *chunk_value=cJSON_GetObjectItemCaseSensitive(intent,"chunk_bytes");
+    if(json_decimal(intent,"file_size",&size) || size>64U*1024U*1024U || !cJSON_IsNumber(chunk_value) ||
+        chunk_value->valuedouble<1 || chunk_value->valuedouble>TGFS_MAX_CHUNK ||
+        chunk_value->valuedouble!=(double)(uint64_t)chunk_value->valuedouble ||
+        !uuid_valid(json_string(intent,"version_id")) || !hash_valid(json_string(intent,"file_sha256")) ||
+        !name_valid(json_string(intent,"name"))) return fail(e,"invalid put staging metadata");
+    chunk=(uint64_t)chunk_value->valuedouble;
+    size_t count=(size_t)((size+chunk-1)/chunk);
+    if(count>4096 || !cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(intent,"parts")) ||
+        (size_t)cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(intent,"parts"))>count) return fail(e,"invalid staging parts");
+    const cJSON *cc=cJSON_GetObjectItemCaseSensitive(intent,"commit_caption");size_t declared;
+    if(!same(json_string(cc,"file_size"),json_string(intent,"file_size")) ||
+        !same(json_string(cc,"file_sha256"),json_string(intent,"file_sha256")) ||
+        !same(json_string(cc,"object_id"),json_string(intent,"object_id")) ||
+        !same(json_string(cc,"parent_id"),json_string(intent,"parent_id")) ||
+        !same(json_string(cc,"version_id"),json_string(intent,"version_id")) ||
+        json_count(cc,"part_count",&declared) || declared!=count) return fail(e,"intent commit disagrees with staging metadata");
+    int dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);struct stat st;
+    if(dir<0) return fail(e,"cannot reopen staging directory");
+    if(fstatat(dir,"data.bin",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() || (st.st_mode&0077)) {
+        close(dir);return fail(e,"data.bin must be an owner-only regular file");
+    }
+    size_t length=0;unsigned char *data=bytes_load_at(dir,"data.bin",64U*1024U*1024U,&length,e);close(dir);
+    if(!data) return -1;
+    int rc=-1;char hash[65];unsigned *seen=calloc(count?count:1,sizeof(*seen));
+    if(!seen) {fail(e,"out of memory");goto done;}
+    if(length!=size || cache_hash(data,length,hash,e) || !same(hash,json_string(intent,"file_sha256"))) {fail(e,"staging size or SHA-256 mismatch");goto done;}
+    const cJSON *commit_ids=cJSON_GetObjectItemCaseSensitive(report,"commit_ids");
+    const cJSON *first=cJSON_GetArrayItem(commit_ids,0);const char *canonical=cJSON_IsString(first)?first->valuestring:NULL;
+    const cJSON *parts=cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(intent,"commit_document"),"parts");
+    const cJSON *record;
+    cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(journal,"records")) {
+        const cJSON *c=cJSON_GetObjectItemCaseSensitive(record,"record");
+        if(!same(json_string(c,"type"),"CHUNK") || !same(json_string(c,"object_id"),json_string(intent,"object_id")) ||
+            !same(json_string(c,"version_id"),json_string(intent,"version_id"))) continue;
+        uint64_t offset,part_size;size_t part_count;
+        if(json_decimal(c,"offset",&offset) || json_decimal(c,"part_size",&part_size) || offset>=size || offset%chunk ||
+            json_count(c,"part_count",&part_count) || part_count!=count || part_size!=(size-offset<chunk?size-offset:chunk) ||
+            !same(json_string(c,"parent_id"),json_string(intent,"parent_id")) ||
+            !same(json_string(c,"file_sha256"),json_string(intent,"file_sha256")) ||
+            !same(json_string(c,"file_size"),json_string(intent,"file_size"))) {fail(e,"captured CHUNK disagrees with staging metadata");goto done;}
+        size_t index=(size_t)(offset/chunk);char filename[300];snprintf(filename,sizeof(filename),"%s.%zu",json_string(intent,"name"),index);
+        if(!same(filename,json_string(cJSON_GetObjectItemCaseSensitive(record,"document"),"file_name"))) {fail(e,"captured CHUNK filename disagrees with staging");goto done;}
+        size_t n=0;unsigned char *bytes=network_download(r,record,TGFS_MAX_CHUNK,&n,e);
+        if(!bytes) goto done;
+        int good=n==part_size && chunk_digest(bytes,n,record,e) && !memcmp(bytes,data+(size_t)offset,n);free(bytes);
+        if(!good) {fail(e,"captured CHUNK bytes or SHA-256 disagree with staging");goto done;}
+        if(report_id(verified,json_string(record,"message_id"),e)) goto done;
+        seen[index]++;
+        if(canonical) {
+            const cJSON *part=cJSON_GetArrayItem(parts,(int)index);
+            if(same(json_string(part,"message_id"),json_string(record,"message_id"))) {
+                const char *next=index+1<count?json_string(cJSON_GetArrayItem(parts,(int)index+1),"message_id"):canonical;
+                const cJSON *back=cJSON_GetObjectItemCaseSensitive(c,"file_commit_id");
+                if(!back || (!cJSON_IsNull(back) && !same(json_string(c,"file_commit_id"),canonical))) {fail(e,"CHUNK backlink conflicts with canonical FILE_COMMIT");goto done;}
+                if(!same(json_string(c,"file_commit_id"),canonical) || !same(json_string(c,"next_message"),next)) {
+                    cJSON *fix=cJSON_CreateObject();
+                    if(!fix || !cJSON_AddStringToObject(fix,"message_id",json_string(record,"message_id")) ||
+                        !cJSON_AddStringToObject(fix,"file_commit_id",canonical) || !cJSON_AddStringToObject(fix,"next_message",next) ||
+                        !cJSON_AddItemToArray(repairs,fix)) {cJSON_Delete(fix);fail(e,"out of memory");goto done;}
+                }
+            }
+        }
+    }
+    for(size_t i=0;i<count;i++) if(seen[i]!=1) {
+        cJSON *v=cJSON_CreateNumber((double)i);
+        if(!v || !cJSON_AddItemToArray(seen[i]?ambiguous:missing,v)) {cJSON_Delete(v);fail(e,"out of memory");goto done;}
+    }
+    const cJSON *part;
+    cJSON_ArrayForEach(part,cJSON_GetObjectItemCaseSensitive(intent,"parts")) {
+        int found=0;const cJSON *id;
+        cJSON_ArrayForEach(id,verified) if(same(id->valuestring,json_string(part,"message_id"))) found=1;
+        uint64_t offset,n;
+        if(json_decimal(part,"offset",&offset) || json_decimal(part,"part_size",&n) || offset>=size || offset%chunk ||
+            n!=(size-offset<chunk?size-offset:chunk) || cache_hash(data+(size_t)offset,(size_t)n,hash,e) ||
+            !same(hash,json_string(part,"part_sha256"))) {fail(e,"local part ref disagrees with staging");goto done;}
+        if(found) cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(journal,"records"))
+            if(same(json_string(record,"message_id"),json_string(part,"message_id"))) {
+                const cJSON *c=cJSON_GetObjectItemCaseSensitive(record,"record");
+                if(!same(json_string(c,"offset"),json_string(part,"offset")) || !same(json_string(c,"part_sha256"),hash)) {
+                    fail(e,"known part ID disagrees with captured range");goto done;
+                }
+            }
+        if(!found && report_id(unknown,json_string(part,"message_id"),e)) goto done;
+    }
+    if(canonical) cJSON_ArrayForEach(part,parts) {
+        int found=0;const cJSON *id;
+        cJSON_ArrayForEach(id,verified) if(same(id->valuestring,json_string(part,"message_id"))) found=1;
+        if(!found && report_id(unknown,json_string(part,"message_id"),e)) goto done;
+    }
+    const char *step=cJSON_GetArraySize(ambiguous)?"resolve_duplicate_parts":
+        cJSON_GetArraySize(missing)||cJSON_GetArraySize(unknown)?"capture_or_upload_outcome_review":
+        !canonical?"commit_publication_review":cJSON_GetArraySize(repairs)?"backlink_repair_review":
+        !same(json_string(report,"publication"),"confirmed")?"directory_publication_review":"verified_in_capture";
+    if(!cJSON_AddStringToObject(report,"staging","verified") || !cJSON_AddStringToObject(report,"next_step",step)) {fail(e,"out of memory");goto done;}
+    rc=0;
+done:
+    free(seen);free(data);return rc;
+}
 void tgfs_intent_help(FILE *stream)
 {
     fputs("usage: tgfs intent --state-dir DIRECTORY --capture DIRECTORY --token-file PATH [options]\n"
@@ -497,6 +616,7 @@ int tgfs_intent_main(int argc,char **argv)
         !cJSON_AddStringToObject(report,"scope","provided_capture_only") || !cJSON_AddBoolToObject(report,"resumed",0)) {
         fail(&e,"out of memory");goto done;
     }
+    if(intent_data_plan(&r,state,intent,journal,report,&e)) goto done;
     char *raw=cJSON_PrintUnformatted(report);
     if(!raw) {fail(&e,"out of memory");goto done;}
     rc=puts(raw)<0?1:0;free(raw);

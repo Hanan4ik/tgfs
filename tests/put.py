@@ -205,6 +205,8 @@ class Put(unittest.TestCase):
                 before=(state/'intent.json').read_bytes();start=len(s.calls)
                 result=run(['intent','--state-dir',str(state),'--capture',str(cap),'--token-file',str(token)])
                 report=json.loads(result.stdout);self.assertEqual(report['publication'],expected)
+                self.assertFalse(report['can_resume'])
+                if report['kind']=='put': self.assertEqual(report['staging'],'verified')
                 self.assertFalse(report['resumed']);self.assertEqual((state/'intent.json').read_bytes(),before)
                 self.assertTrue(set(s.calls[start:])<={'getChat','getFile'})
                 return report
@@ -309,7 +311,11 @@ class Put(unittest.TestCase):
                             '--replace',state=state,code=1)
                         self.assertEqual(len(s.sent),count)
                         final=scan()
-                        if diagnose: check_intent(state,final,'confirmed' if replace_mode in ('ok','replace-lost-commit','replace-edit') else 'not_observed')
+                        if diagnose:
+                            evidence=check_intent(state,final,'confirmed' if replace_mode in ('ok','replace-lost-commit','replace-edit') else 'not_observed')
+                            if replace_mode=='replace-edit': self.assertTrue(evidence['backlink_repairs'])
+                            if replace_mode=='replace-lost-chunk': self.assertTrue(evidence['unobserved_part_indexes'])
+                            if replace_mode=='replace-lost-commit': self.assertEqual(len(evidence['verified_chunk_ids']),len(updated['parts']))
                         self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),expected_data)
                         self.assertEqual(read(original_cap,'cat','/documents/sub/multi.txt'),b'abcdefghij\n')
                         self.assertEqual(read(final,'ls','/documents/sub'),b'multi.txt\nempty.txt\n')
@@ -426,6 +432,20 @@ class Put(unittest.TestCase):
                     state_file.chmod(0o644)
                     run(['intent','--state-dir',str(state_file.parent),'--capture',str(final),'--token-file',str(token)],code=1)
                     state_file.chmod(0o600)
+                    duplicate_journal=json.loads((final/'journal.json').read_text())
+                    record=copy.deepcopy(next(r for r in duplicate_journal['records'] if r['message_id']==file['parts'][0]['message_id']))
+                    record['message_id']=duplicate_journal['boundary_id'];record['record']['next_message']=None;record['record']['file_commit_id']=None
+                    duplicate_journal['records'].append(record);duplicate_journal['boundary_id']=str(int(duplicate_journal['boundary_id'])+2)
+                    duplicated=root/'duplicated';duplicated.mkdir();(duplicated/'journal.json').write_text(json.dumps(duplicate_journal))
+                    evidence=check_intent(state_file.parent,duplicated,'confirmed')
+                    self.assertEqual(evidence['ambiguous_part_indexes'],[0]);self.assertEqual(evidence['next_step'],'resolve_duplicate_parts')
+                    data_path=state_file.parent/'data.bin';original_data=data_path.read_bytes();data_path.write_bytes(b'bad')
+                    result=run(['intent','--state-dir',str(state_file.parent),'--capture',str(final),'--token-file',str(token)],code=1)
+                    self.assertIn(b'staging',result.stderr);data_path.write_bytes(original_data)
+                    fid='file_'+file['parts'][0]['message_id'];original_chunk=s.files[fid];s.files[fid]=b'X'*len(original_chunk)
+                    result=run(['intent','--state-dir',str(state_file.parent),'--capture',str(final),'--token-file',str(token)],code=1)
+                    self.assertIn(b'CHUNK',result.stderr);s.files[fid]=original_chunk
+
                 # Parent documents stay append-only; only the new child caption was edited.
 
                 original=json.loads(s.messages[int(directory['child_message_id'])]['caption'])
