@@ -18,6 +18,7 @@ static void help(FILE *stream)
           "       tgfs scan --token-file PATH --storage-chat-id ID --service-chat-id ID --output DIRECTORY [options]\n"
           "       tgfs read --capture DIRECTORY --token-file PATH [options] {ls|cat} /absolute/path\n"
           "       tgfs put --capture DIRECTORY --file PATH --name NAME --state-dir DIRECTORY --token-file PATH [options]\n"
+          "       tgfs mkdir --capture DIRECTORY --path /absolute/path --state-dir DIRECTORY --token-file PATH [options]\n"
           "       tgfs init --new-volume --token-file PATH --storage-chat-id ID --state-dir DIRECTORY [options]\n"
           "       tgfs mount --mountpoint DIRECTORY {--snapshot DIRECTORY | --capture DIRECTORY --token-file PATH} [options]\n"
           "       tgfs --help\n\n"
@@ -36,6 +37,7 @@ static void help(FILE *stream)
     fputc('\n',stream);tgfs_read_help(stream);
     fputc('\n',stream);tgfs_put_help(stream);
     fputc('\n',stream);tgfs_mount_help(stream);
+    fputc('\n',stream);tgfs_mkdir_help(stream);
 }
 
 int main(int argc, char **argv)
@@ -43,6 +45,7 @@ int main(int argc, char **argv)
     if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         help(stdout); return 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "mkdir")) return tgfs_mkdir_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "mount")) return tgfs_mount_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "put")) return tgfs_put_main(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "read")) return tgfs_read_main(argc, argv);

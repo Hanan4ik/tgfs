@@ -300,6 +300,26 @@ static const char *resolve(tgfs *fs, const char *path, tgfs_error *e)
     return id;
 }
 
+/* Resolve a captured directory once; publication keeps these UUIDs even if Telegram IDs change. */
+int directory_target(tgfs *fs,const char *path,const char *name,char object[37],char parent[37],tgfs_error *e)
+{
+    const char *id=resolve(fs,path,e);if(!id) return -1;
+    const cJSON *entries=directory_entries(fs,id,e),*entry;
+    if(!entries) return -1;
+    cJSON_ArrayForEach(entry,entries)
+        if(same(name,json_string(entry,"name"))) return fail_code(e,EEXIST,"name already exists in captured directory");
+    memcpy(object,id,37);parent[0]=0;
+    if(!same(id,fs->root_id)) {
+        for(size_t i=0;i<fs->count;i++) if(same(fs->messages[i].type,"DIRECTORY") && same(fs->messages[i].object_id,id)) {
+            const char *pid=json_string(fs->messages[i].caption,"parent_id");
+            if(!uuid_valid(pid)) return fail(e,"invalid directory parent");
+            memcpy(parent,pid,37);return 0;
+        }
+        return fail(e,"missing directory metadata");
+    }
+    return 0;
+}
+
 int tgfs_list(tgfs *fs, const char *path, tgfs_entry_fn emit, void *arg, tgfs_error *e)
 {
     const char *id = resolve(fs, path, e);

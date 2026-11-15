@@ -7,6 +7,9 @@ import json
 import os
 from pathlib import Path
 import socket
+import time
+import shutil
+import errno
 import subprocess
 import sys
 import tempfile
@@ -38,16 +41,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             record=json.loads(caption);kind=record['type']
             intent=json.loads(s.intent.read_text())
             expected={'CHUNK':'chunk_send_pending','FILE_COMMIT':'commit_send_pending','DIRECTORY':'directory_send_pending'}[kind]
+            if intent.get('kind')=='mkdir' and record['object_id']==intent['object_id']: expected='child_send_pending'
             assert intent['phase']==expected
-            assert (s.intent.parent/'data.bin').read_bytes()==s.input_data
+            if intent.get('kind')!='mkdir': assert (s.intent.parent/'data.bin').read_bytes()==s.input_data
             mid=s.next;s.next+=1
             fid='file_'+str(mid);s.files[fid]=raw
             msg=dict(message_id=mid,chat=dict(id=STORAGE,type='channel'),caption=caption,
                 document=dict(file_id=fid,file_name=filename,file_size=len(raw)))
             s.messages[mid]=msg;s.sent.append(kind)
-            if s.mode=='lost' and kind=='CHUNK':
+            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending'):
                 self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
-            if s.mode=='response' and kind=='CHUNK':
+            if (s.mode=='response' and kind=='CHUNK') or (s.mode=='mkdir-response' and expected=='child_send_pending'):
                 msg=copy.deepcopy(msg);msg['document']['file_name']='wrong'
             return self.reply(msg)
         p=json.loads(data)
@@ -55,12 +59,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             chat=dict(id=int(p['chat_id']),type='channel')
             if int(p['chat_id'])==STORAGE:
                 chat['pinned_message']=copy.deepcopy(s.messages[1])
-                if s.mode=='pin':
+                if s.mode=='pin' or (s.mode=='mkdir-pin' and s.sent):
                     header=copy.deepcopy(SB);header['root_object_id']=str(uuid.uuid4())
                     chat['pinned_message']['text']=json.dumps(header)
             return self.reply(chat)
         if method=='editMessageCaption':
-            if s.mode=='edit':
+            if s.mode in ('edit','mkdir-edit'):
                 return self.reply(error=dict(ok=False,error_code=429,description=TOKEN,parameters=dict(retry_after=5)),status=429)
             msg=s.messages[p['message_id']];msg['caption']=p['caption']
             return self.reply(msg)
@@ -160,6 +164,132 @@ class Put(unittest.TestCase):
                         self.assertEqual(listing.stdout,b'hello.txt\nnotes.txt\n')
             finally:
                 s.shutdown();s.server_close();t.join()
+    def directories(self,mode='ok',mount=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);capture=root/'capture';capture.mkdir()
+            journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
+                storage_chat_id=str(STORAGE),service_chat_id=str(SERVICE),superblock=SB,boundary_id='2',records=[])
+            (capture/'journal.json').write_text(json.dumps(journal))
+            token=root/'token';token.write_text(TOKEN);token.chmod(0o600)
+            source=root/'source';source.write_bytes(b'abcdefghij\n')
+            s=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+            s.mode=mode;s.calls=[];s.sent=[];s.files={};s.next=3;s.copy_id=1001;s.input_data=source.read_bytes()
+            s.messages={1:dict(message_id=1,chat=dict(id=STORAGE,type='channel'),text=json.dumps(SB)),
+                2:dict(message_id=2,chat=dict(id=STORAGE,type='channel'),text=json.dumps(dict(magic='TGFS',format_version=1,type='SCAN_MARKER',next_message=None)))}
+            t=threading.Thread(target=s.serve_forever,kwargs=dict(poll_interval=.01),daemon=True);t.start()
+            env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{s.server_port}')
+            serial=0
+            def run(args,code=0):
+                result=subprocess.run([BINARY,*args],env=env,capture_output=True,timeout=15)
+                self.assertEqual(result.returncode,code,result.stderr)
+                self.assertNotIn(TOKEN,result.stderr.decode());self.assertNotIn(b'AddressSanitizer',result.stderr)
+                self.assertNotIn(b'runtime error:',result.stderr);return result
+            def write(command,cap,*args,code=0,state=None):
+                nonlocal serial
+                serial+=1;s.intent=(state or root/f'state-{serial}')/'intent.json'
+                result=run([command,'--capture',str(cap),'--state-dir',str(s.intent.parent),'--token-file',str(token),
+                    '--send-interval-ms','0',*args],code)
+                return result,json.loads(s.intent.read_text()) if s.intent.exists() else None
+            def scan():
+                nonlocal serial
+                serial+=1;out=root/f'capture-{serial}'
+                run(['scan','--token-file',str(token),'--storage-chat-id',str(STORAGE),
+                    '--service-chat-id',str(SERVICE),'--output',str(out)])
+                return out
+            def read(cap,action,path):
+                return run(['read','--no-cache','--capture',str(cap),'--token-file',str(token),action,path]).stdout
+            try:
+                run(['mkdir','--help']);self.assertEqual(s.calls,[])
+                result,directory=write('mkdir',capture,'--path','/documents',code=0 if mode=='ok' else 1)
+                if mode!='ok':
+                    self.assertIsNotNone(directory)
+                    expected={'mkdir-lost-child':'child_response_uncertain','mkdir-response':'child_response_uncertain',
+                        'mkdir-lost-parent':'directory_response_uncertain','mkdir-pin':'child_sent',
+                        'mkdir-edit':'published_navigation_pending'}[mode]
+                    self.assertEqual(directory['phase'],expected)
+                    self.assertEqual(len(s.sent),1 if mode in ('mkdir-lost-child','mkdir-response','mkdir-pin') else 2)
+                    before=len(s.sent);saved=s.intent.parent
+                    write('mkdir',capture,'--path','/documents',state=saved,code=1)
+                    self.assertEqual(len(s.sent),before)
+                    if mode in ('mkdir-lost-parent','mkdir-edit'):
+                        s.mode='ok';fresh=scan();self.assertEqual(read(fresh,'ls','/'),b'documents\n')
+                        self.assertEqual(read(fresh,'ls','/documents'),b'')
+                    return
+                self.assertEqual(directory['phase'],'complete');self.assertEqual(uuid.UUID(directory['object_id']).version,4)
+                self.assertEqual(s.sent,['DIRECTORY','DIRECTORY'])
+                child=json.loads(s.messages[int(directory['child_message_id'])]['caption'])
+                self.assertEqual(child['parent_id'],ROOT);self.assertEqual(child['next_message'],directory['directory_message_id'])
+                self.assertEqual(json.loads(s.files['file_'+directory['child_message_id']]),{'operations':[]})
+                # A stale capture cannot address a directory it has never observed.
+                before=len(s.sent)
+                write('put',capture,'--file',str(source),'--name','too-early.txt','--parent','/documents',code=1)
+                self.assertEqual(len(s.sent),before)
+                cap=scan();self.assertEqual(read(cap,'ls','/'),b'documents\n');self.assertEqual(read(cap,'ls','/documents'),b'')
+                write('mkdir',cap,'--path','/documents',code=1)
+                write('mkdir',cap,'--path','/missing/sub',code=1)
+                write('mkdir',cap,'--path','/documents/../bad',code=1)
+                for path in ('/','relative','/documents/.','/documents/..'):
+                    write('mkdir',cap,'--path',path,code=2)
+                self.assertEqual(len(s.sent),before)
+                _,sub=write('mkdir',cap,'--path','/documents/sub/')
+                fresh=scan()
+                self.assertEqual(read(fresh,'ls','/documents'),b'sub\n')
+                _,file=write('put',fresh,'--file',str(source),'--name','multi.txt','--parent','/documents/sub','--chunk-bytes','4')
+                # ADDs independently based on the same capture must merge in this nested parent.
+                source.write_bytes(b'');s.input_data=b''
+                _,empty=write('put',fresh,'--file',str(source),'--name','empty.txt','--parent','/documents/sub')
+                _,sibling=write('mkdir',fresh,'--path','/documents/other')
+                self.assertEqual(file['parent_id'],sub['object_id']);self.assertEqual(empty['parent_id'],sub['object_id'])
+                for msg in s.messages.values():
+                    if 'caption' not in msg: continue
+                    c=json.loads(msg['caption'])
+                    if c.get('object_id')==file['object_id']: self.assertEqual(c['parent_id'],sub['object_id'])
+                published=json.loads(s.messages[int(file['directory_message_id'])]['caption'])
+                self.assertEqual(published['object_id'],sub['object_id']);self.assertEqual(published['parent_id'],directory['object_id'])
+                final=scan()
+                self.assertEqual(read(final,'ls','/documents'),b'sub\nother\n')
+                self.assertEqual(read(final,'ls','/documents/sub'),b'multi.txt\nempty.txt\n')
+                self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),b'abcdefghij\n')
+                self.assertEqual(read(final,'cat','/documents/sub/empty.txt'),b'')
+                before=len(s.sent)
+                write('put',final,'--file',str(source),'--name','multi.txt','--parent','/documents/sub',code=1)
+                write('mkdir',final,'--path','/documents/sub/multi.txt',code=1)
+                write('mkdir',final,'--path','/documents/sub/multi.txt/child',code=1)
+                write('put',final,'--file',str(source),'--name','bad.txt','--parent','/documents/sub/multi.txt',code=1)
+                write('put',final,'--file',str(source),'--name','bad.txt','--parent','/missing',code=1)
+                self.assertEqual(len(s.sent),before)
+                # Parent documents stay append-only; only the new child caption was edited.
+                original=json.loads(s.messages[int(directory['child_message_id'])]['caption'])
+                self.assertEqual(original,child)
+                if mount:
+                    point=root/'mnt';point.mkdir();log=root/'mount.log'
+                    with log.open('wb') as stream:
+                        proc=subprocess.Popen([BINARY,'mount','--capture',str(final),'--token-file',str(token),
+                            '--mountpoint',str(point),'--no-cache'],env=env,stdout=stream,stderr=stream)
+                        try:
+                            end=time.monotonic()+15
+                            while proc.poll() is None and not os.path.ismount(point) and time.monotonic()<end: time.sleep(.05)
+                            self.assertTrue(os.path.ismount(point),log.read_text())
+                            self.assertEqual((point/'documents/sub/multi.txt').read_bytes(),b'abcdefghij\n')
+                            self.assertEqual((point/'documents/sub/empty.txt').stat().st_size,0)
+                            self.assertEqual((point/'documents').stat().st_nlink,4)
+                            self.assertEqual((point/'documents/sub').stat().st_nlink,2)
+                            with (point/'documents/sub/multi.txt').open('rb',buffering=0) as f:
+                                self.assertEqual(os.pread(f.fileno(),5,2),b'cdefg')
+                            with self.assertRaises(OSError) as caught: (point/'documents/new').mkdir()
+                            self.assertEqual(caught.exception.errno,errno.EROFS)
+                        finally:
+                            if os.path.ismount(point): subprocess.run(['fusermount3','-u',str(point)],check=True,timeout=10)
+                            proc.wait(timeout=10);self.assertEqual(proc.returncode,0,log.read_text())
+                            self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
+            finally:
+                s.shutdown();s.server_close();t.join()
+    def test_nested_directory_publication(self): self.directories()
+    def test_directory_failures(self):
+        for mode in ('mkdir-lost-child','mkdir-lost-parent','mkdir-response','mkdir-pin','mkdir-edit'):
+            with self.subTest(mode=mode): self.directories(mode)
+    @unittest.skipUnless(Path('/dev/fuse').exists() and shutil.which('fusermount3'),'kernel mount unavailable')
+    def test_nested_telegram_capture_mount(self): self.directories(mount=True)
     def test_roundtrip_multipart(self): self.exercise()
     def test_roundtrip_empty(self): self.exercise(b'')
     def test_roundtrip_one_chunk(self): self.exercise(b'hi')

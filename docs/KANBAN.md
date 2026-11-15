@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | [#6 Bot API эксперимент](https://github.com/Hanan4ik/tgfs/issues/6) | — | [#3 FUSE и контракт MVP](https://github.com/Hanan4ik/tgfs/issues/3) | [#1 Выбран Bot API](https://github.com/Hanan4ik/tgfs/issues/1) |
 | [#7 Сбои записи FUSE](https://github.com/Hanan4ik/tgfs/issues/7) | [#4 Профили и mount](https://github.com/Hanan4ik/tgfs/issues/4) | [#2 Каталог и восстановление](https://github.com/Hanan4ik/tgfs/issues/2) | Начальная документация и задачи |
-| — | [#5 Части и целостность](https://github.com/Hanan4ik/tgfs/issues/5) | [#8 Ядро чтения: в реализации](https://github.com/Hanan4ik/tgfs/issues/8) | — |
+| — | [#5 Части и целостность](https://github.com/Hanan4ik/tgfs/issues/5) | — | [#8 Read-only MVP: проверен online/offline](https://github.com/Hanan4ik/tgfs/issues/8) |
 | [#9 Очистка физических дубликатов](https://github.com/Hanan4ik/tgfs/issues/9) | — | — | — |
 | [#10 Классификация ошибок и несостыковок](https://github.com/Hanan4ik/tgfs/issues/10) | — | — | — |
 
@@ -72,3 +72,15 @@
 Пользователь подтвердил постоянный cache: ls miss/downloads=6 → hit/downloads=0; multipart cat downloads=3 → offline hits=9/downloads=0.
 
 Реализован [mount](FUSE_READONLY.md) локального snapshot либо Telegram capture: фиксированный metadata view, file handles с FILE_COMMIT, stat/readdir/range reads, один RAM chunk и SQLite, typed path errno и EROFS для изменений. 101 тест: локально 100 успешных и 1 kernel mount skip (нет /dev/fuse); callbacks и remote session/offline проверены, ASan/UBSan проходят. Живой Telegram mount ещё не проверен. Следующий свободный scan — capture-007, mount использует capture-006. Полный write-FUSE/профили/детальный recovery остаются открытыми.
+
+## Каталоги и вложенная публикация (2026-11-15)
+
+Пользователь подтвердил живой online/offline FUSE capture-006, ls/cat/stat,
+empty и EROFS. Read-only MVP #8 выполнен; общий Linux write-контракт #3 открыт.
+Добавлены [mkdir и put --parent](DIRECTORY_WRITE.md): пустой DIRECTORY → ADD
+родителя, разрешение UUID по capture, правильные parent_id дочерних и
+родительских документов, приватный intent и навигация только своих записей.
+Нет coordinator, mkdir -p, overwrite, resume или write-FUSE.
+104 теста (локально 102 passed, 2 kernel skip), ASan/UBSan; живые вложенные
+mkdir/put ещё не проверены. Следующий шаг пользователя: mkdir /documents на
+capture-006 → scan capture-007 → put --parent /documents → scan capture-008.

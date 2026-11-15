@@ -174,14 +174,7 @@ static void clean(int dir,const char *path)
     }
     close(dir);rmdir(path);
 }
-typedef struct { const char *name; int found; } name_check;
-static int check_entry(const char *name,const char *object,void *arg)
-{
-    (void)object;name_check *check=arg;
-    if(same(name,check->name)) check->found=1;
-    return 0;
-}
-static int read_capture(remote *r,const cJSON *journal,const char *command,const char *path,const char *new_name,tgfs **opened,tgfs_error *e)
+static int read_capture(remote *r,const cJSON *journal,const char *command,const char *path,tgfs **opened,tgfs_error *e)
 {
     const cJSON *sb=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
     uint64_t start,boundary;
@@ -277,12 +270,8 @@ static int read_capture(remote *r,const cJSON *journal,const char *command,const
     if(written || tgfs_open_snapshot_loader(temp,load_chunk,r,&fs,e)) goto done;
     if(r->cache && !r->index_hit && cache_index_put(r->cache,r->capture_key,snapshot,journal,e)) goto done;
     if(opened) {*opened=fs;fs=NULL;rc=0;goto done;}
-    if(new_name) {
-        name_check check={.name=new_name};
-        rc=tgfs_list(fs,"/",check_entry,&check,e);
-        if(!rc && check.found) rc=fail(e,"name already exists in captured root");
-    } else rc=same(command,"ls") ? tgfs_list(fs,path,emit,stdout,e) : tgfs_cat(fs,path,stdout,e);
-    if(!new_name && !rc && fflush(stdout)) rc=fail(e,"cannot flush output");
+    rc=same(command,"ls") ? tgfs_list(fs,path,emit,stdout,e) : tgfs_cat(fs,path,stdout,e);
+    if(!rc && fflush(stdout)) rc=fail(e,"cannot flush output");
 done:
     tgfs_close(fs);cJSON_Delete(snapshot);cJSON_Delete(messages);clean(dir,temp);return rc;
 }
@@ -305,7 +294,7 @@ int tgfs_remote_open(const tgfs_remote_options *o,tgfs_remote_session **out,tgfs
         api_failure(e,&b);goto invalid;
     }
     if(!o->no_cache && cache_open(o->cache_dir,o->cache_limit,&s->r.cache,e)) goto invalid;
-    if(read_capture(&s->r,s->journal,NULL,NULL,NULL,&s->fs,e)) goto invalid;
+    if(read_capture(&s->r,s->journal,NULL,NULL,&s->fs,e)) goto invalid;
     *out=s;return 0;
 invalid:
     tgfs_remote_close(s);return -1;
@@ -319,10 +308,13 @@ void tgfs_remote_close(tgfs_remote_session *s)
 {
     if(s) {tgfs_close(s->fs);cache_close(s->r.cache);tgfs_bot_close(s->r.bot);cJSON_Delete(s->journal);free(s);}
 }
-int remote_check_root_name(tgfs_bot *bot,const cJSON *journal,const char *name,tgfs_error *e)
+int remote_directory_target(tgfs_bot *bot,const cJSON *journal,const char *path,const char *name,
+                            char object[37],char parent[37],tgfs_error *e)
 {
-    remote r={.bot=bot};
-    return read_capture(&r,journal,"ls","/",name,NULL,e);
+    remote r={.bot=bot};tgfs *fs=NULL;
+    int rc=read_capture(&r,journal,NULL,NULL,&fs,e);
+    if(!rc) rc=directory_target(fs,path,name,object,parent,e);
+    tgfs_close(fs);return rc;
 }
 void tgfs_read_help(FILE *stream)
 {
@@ -379,7 +371,7 @@ int tgfs_read_main(int argc,char **argv)
         api_failure(&e,&b);goto done;
     }
     if(!no_cache && cache_open(cache_dir,(size_t)limit_mib*1024U*1024U,&r.cache,&e)) goto done;
-    rc=read_capture(&r,journal,argv[argc-2],argv[argc-1],NULL,NULL,&e) ? 1 : 0;
+    rc=read_capture(&r,journal,argv[argc-2],argv[argc-1],NULL,&e) ? 1 : 0;
 done:
     if(rc) fprintf(stderr,"FAIL read: %s\n",e.message);
     if(stats) fprintf(stderr,"cache: index=%s hits=%u downloads=%u\n",r.index_hit?"hit":"miss",r.hits,r.downloads);

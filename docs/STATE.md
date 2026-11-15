@@ -114,3 +114,15 @@
 Пользователь подтвердил постоянный cache: ls miss/downloads=6 → hit/downloads=0; multipart cat downloads=3 → offline hits=9/downloads=0.
 
 Реализован [mount](FUSE_READONLY.md) локального snapshot либо Telegram capture: фиксированный metadata view, file handles с FILE_COMMIT, stat/readdir/range reads, один RAM chunk и SQLite, typed path errno и EROFS для изменений. 101 тест: локально 100 успешных и 1 kernel mount skip (нет /dev/fuse); callbacks и remote session/offline проверены, ASan/UBSan проходят. Живой Telegram mount ещё не проверен. Следующий свободный scan — capture-007, mount использует capture-006. Полный write-FUSE/профили/детальный recovery остаются открытыми.
+
+## Каталоги и вложенная публикация (2026-11-15)
+
+Пользователь подтвердил живой online/offline FUSE capture-006, ls/cat/stat,
+empty и EROFS. Read-only MVP #8 выполнен; общий Linux write-контракт #3 открыт.
+Добавлены [mkdir и put --parent](DIRECTORY_WRITE.md): пустой DIRECTORY → ADD
+родителя, разрешение UUID по capture, правильные parent_id дочерних и
+родительских документов, приватный intent и навигация только своих записей.
+Нет coordinator, mkdir -p, overwrite, resume или write-FUSE.
+104 теста (локально 102 passed, 2 kernel skip), ASan/UBSan; живые вложенные
+mkdir/put ещё не проверены. Следующий шаг пользователя: mkdir /documents на
+capture-006 → scan capture-007 → put --parent /documents → scan capture-008.

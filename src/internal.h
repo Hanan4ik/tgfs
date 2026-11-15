@@ -33,6 +33,8 @@ cJSON *directory_merge(const tgfs_directory_batch *batches, size_t count, tgfs_e
 int directory_operations_valid(const cJSON *body, tgfs_error *e);
 
 struct tgfs_bot;
-int remote_check_root_name(struct tgfs_bot *bot, const cJSON *journal, const char *name, tgfs_error *e);
+int directory_target(tgfs *fs, const char *path, const char *name, char object[37], char parent[37], tgfs_error *e);
+int remote_directory_target(struct tgfs_bot *bot, const cJSON *journal, const char *path,
+                            const char *name, char object[37], char parent[37], tgfs_error *e);
 
 #endif
