@@ -42,4 +42,10 @@ int replacement_target(tgfs *fs, const char *path, const char *name, char object
 int remote_replacement_target(struct tgfs_bot *bot, const cJSON *journal, const char *path,
                               const char *name, char object[37], char parent[37], char version[37],
                               uint64_t *commit_id, tgfs_error *e);
+cJSON *directory_observed_adds(const tgfs_directory_batch *batches, size_t count, const char *directory,
+                               const char *name, const char *object, tgfs_error *e);
+int unlink_target(tgfs *fs, const char *path, const char *name, char object[37], char parent[37],
+                  char grandparent[37], cJSON **observed, tgfs_error *e);
+int remote_unlink_target(struct tgfs_bot *bot, const cJSON *journal, const char *path, const char *name,
+                         char object[37], char parent[37], char grandparent[37], cJSON **observed, tgfs_error *e);
 #endif
