@@ -18,6 +18,8 @@ static void help(FILE *stream)
           "       tgfs scan --token-file PATH --storage-chat-id ID --service-chat-id ID --output DIRECTORY [options]\n"
           "       tgfs read --capture DIRECTORY --token-file PATH [options] {ls|cat} /absolute/path\n"
           "       tgfs put --capture DIRECTORY --file PATH --name NAME --state-dir DIRECTORY --token-file PATH [options]\n"
+          "       tgfs init --new-volume --token-file PATH --storage-chat-id ID --state-dir DIRECTORY [options]\n"
+          "       tgfs mount --mountpoint DIRECTORY {--snapshot DIRECTORY | --capture DIRECTORY --token-file PATH} [options]\n"
           "       tgfs --help\n\n"
           "Snapshot commands (local data, no Telegram connection):\n"
           "  --snapshot DIRECTORY     Read snapshot.json and documents from DIRECTORY.\n"

@@ -160,7 +160,8 @@ Test-only подстановка контекста не компилирует�
 среде /dev/fuse отсутствует: этот тест пропущен с явной причиной; успешный живой
 mount здесь не заявляется. Остальные тесты и ASan/UBSan прошли с detect_leaks=0
 из-за ptrace. Всего 101 тест (локально 100 успешных, 1 kernel skip).
-CI также запускает kernel test условно по доступности устройства.
+CI Ubuntu 24.04 выполнил все 101 тест без пропусков, включая настоящий
+kernel mount/unmount, в обычной сборке и ASan/UBSan.
 
 Первый живой mount Telegram должен подтвердить пользователь на своём Linux.
 Основание API: [libfuse operations](https://libfuse.github.io/doxygen/structfuse__operations.html).
