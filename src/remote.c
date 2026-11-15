@@ -324,6 +324,14 @@ int remote_replacement_target(tgfs_bot *bot,const cJSON *journal,const char *pat
     if(!rc) rc=replacement_target(fs,path,name,object,parent,version,commit_id,e);
     tgfs_close(fs);return rc;
 }
+int remote_unlink_target(tgfs_bot *bot,const cJSON *journal,const char *path,const char *name,
+                         char object[37],char parent[37],char grandparent[37],cJSON **observed,tgfs_error *e)
+{
+    remote r={.bot=bot};tgfs *fs=NULL;*observed=NULL;
+    int rc=read_capture(&r,journal,NULL,NULL,&fs,e);
+    if(!rc) rc=unlink_target(fs,path,name,object,parent,grandparent,observed,e);
+    tgfs_close(fs);return rc;
+}
 void tgfs_read_help(FILE *stream)
 {
     fputs("usage: tgfs read --capture DIRECTORY --token-file PATH [options] {ls|cat} /absolute/path\n"

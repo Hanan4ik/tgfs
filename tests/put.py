@@ -43,15 +43,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             expected={'CHUNK':'chunk_send_pending','FILE_COMMIT':'commit_send_pending','DIRECTORY':'directory_send_pending'}[kind]
             if intent.get('kind')=='mkdir' and record['object_id']==intent['object_id']: expected='child_send_pending'
             assert intent['phase']==expected
-            if intent.get('kind')!='mkdir': assert (s.intent.parent/'data.bin').read_bytes()==s.input_data
+            if intent.get('kind') not in ('mkdir','unlink'): assert (s.intent.parent/'data.bin').read_bytes()==s.input_data
+            if s.mode=='unlink-apierror' and intent.get('kind')=='unlink':
+                return self.reply(error=dict(ok=False,error_code=429,description=TOKEN,parameters=dict(retry_after=5)),status=429)
             mid=s.next;s.next+=1
             fid='file_'+str(mid);s.files[fid]=raw
             msg=dict(message_id=mid,chat=dict(id=STORAGE,type='channel'),caption=caption,
                 document=dict(file_id=fid,file_name=filename,file_size=len(raw)))
             s.messages[mid]=msg;s.sent.append(kind)
-            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT'):
+            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT') or (s.mode=='unlink-lost' and intent.get('kind')=='unlink'):
                 self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
-            if (s.mode=='response' and kind=='CHUNK') or (s.mode=='mkdir-response' and expected=='child_send_pending'):
+            if (s.mode=='response' and kind=='CHUNK') or (s.mode=='mkdir-response' and expected=='child_send_pending') or (s.mode=='unlink-response' and intent.get('kind')=='unlink'):
                 msg=copy.deepcopy(msg);msg['document']['file_name']='wrong'
             return self.reply(msg)
         p=json.loads(data)
@@ -59,7 +61,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             chat=dict(id=int(p['chat_id']),type='channel')
             if int(p['chat_id'])==STORAGE:
                 chat['pinned_message']=copy.deepcopy(s.messages[1])
-                if s.mode=='pin' or (s.mode=='mkdir-pin' and s.sent) or (s.mode=='replace-pin' and len(s.sent)>s.before_replace):
+                if s.mode=='unlink-pin': s.unlink_pin_reads+=1
+                if (s.mode=='unlink-pin' and s.unlink_pin_reads>=3) or s.mode=='pin' or (s.mode=='mkdir-pin' and s.sent) or (s.mode=='replace-pin' and len(s.sent)>s.before_replace):
                     header=copy.deepcopy(SB);header['root_object_id']=str(uuid.uuid4())
                     chat['pinned_message']['text']=json.dumps(header)
             return self.reply(chat)
@@ -164,7 +167,7 @@ class Put(unittest.TestCase):
                         self.assertEqual(listing.stdout,b'hello.txt\nnotes.txt\n')
             finally:
                 s.shutdown();s.server_close();t.join()
-    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok'):
+    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok'):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -313,6 +316,94 @@ class Put(unittest.TestCase):
                         final=scan();expected_data=b'B updated\n'
                         self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),expected_data)
                     for mid,msg in old_messages.items(): self.assertEqual(s.messages[mid],msg)
+                file_exists=True
+                if unlink:
+                    run(['unlink','--help']);before=len(s.sent)
+                    for path,code in (('/missing',1),('/documents/sub',1),('/documents/sub/multi.txt/child',1),
+                        ('/missing/file',1),('/documents/../bad',1),('/',2),('relative',2),('/documents/sub/multi.txt/',2)):
+                        write('unlink',final,'--path',path,code=code)
+                    self.assertEqual(len(s.sent),before)
+                    if unlink_mode=='legacy':
+                        journal=json.loads((final/'journal.json').read_text());records=[]
+                        for record in journal['records']:
+                            if record['record'].get('object_id')==sub['object_id'] and record['record']['type']=='DIRECTORY':
+                                if record['message_id']!=empty['directory_message_id']: continue
+                                raw=json.dumps(dict(entries=[dict(name='multi.txt',object_id=file['object_id']),
+                                    dict(name='empty.txt',object_id=empty['object_id'])])).encode()
+                                s.files[record['document']['file_id']]=raw;record['document']['file_size']=len(raw)
+                            records.append(record)
+                        journal['records']=records;legacy=root/'legacy';legacy.mkdir()
+                        (legacy/'journal.json').write_text(json.dumps(journal))
+                        result,_=write('unlink',legacy,'--path','/documents/sub/multi.txt',code=1)
+                        self.assertIn(b'legacy entries',result.stderr);self.assertEqual(len(s.sent),before);return
+                    def inject_ops(ops):
+                        mid=s.next;s.next+=1;fid='file_'+str(mid)
+                        raw=json.dumps(dict(operations=ops)).encode();s.files[fid]=raw
+                        c=dict(magic='TGFS',format_version=1,type='DIRECTORY',object_id=sub['object_id'],
+                            parent_id=directory['object_id'],next_message=None)
+                        s.messages[mid]=dict(message_id=mid,chat=dict(id=STORAGE,type='channel'),caption=json.dumps(c),
+                            document=dict(file_id=fid,file_name='directory.json',file_size=len(raw)))
+                    original_add=json.loads(s.files['file_'+file['directory_message_id']])['operations'][0]
+                    removed=str(uuid.uuid4());active=str(uuid.uuid4())
+                    inject_ops([dict(operation_id=removed,action='ADD',name='multi.txt',object_id=file['object_id']),
+                        dict(operation_id=str(uuid.uuid4()),action='REMOVE',name='multi.txt',observed_adds=[removed]),
+                        dict(operation_id=active,action='ADD',name='multi.txt',object_id=file['object_id']),copy.deepcopy(original_add)])
+                    before_capture=scan();old_messages=copy.deepcopy(s.messages)
+                    if unlink_mode=='concurrent':
+                        # A second machine publishes the same name using a capture from before the first ADD.
+                        source.write_bytes(b'concurrent generation\n');s.input_data=source.read_bytes()
+                        _,other=write('put',fresh,'--file',str(source),'--name','multi.txt','--parent','/documents/sub')
+                        self.assertNotEqual(other['object_id'],file['object_id']);expected_data=s.input_data
+                    s.mode=unlink_mode if unlink_mode.startswith('unlink-') else 'ok';s.unlink_pin_reads=0
+                    before=len(s.sent)
+                    result,removed_intent=write('unlink',before_capture,'--path','/documents/sub/multi.txt',
+                        code=1 if unlink_mode.startswith('unlink-') else 0)
+                    self.assertIsNotNone(removed_intent);saved=s.intent.parent
+                    self.assertFalse((saved/'data.bin').exists())
+                    self.assertEqual(removed_intent['object_id'],file['object_id'])
+                    self.assertEqual(set(removed_intent['observed_adds']),{original_add['operation_id'],active})
+                    self.assertEqual(len(removed_intent['observed_adds']),2)
+                    self.assertNotIn(removed,removed_intent['observed_adds'])
+                    phase='prepared' if unlink_mode=='unlink-pin' else ('directory_response_uncertain' if unlink_mode.startswith('unlink-') else 'complete')
+                    self.assertEqual(removed_intent['phase'],phase)
+                    if unlink_mode not in ('unlink-pin','unlink-apierror'):
+                        self.assertEqual(s.sent[before:],['DIRECTORY'])
+                        msg=s.messages[int(removed_intent.get('directory_message_id',max(s.messages)))]
+                        if unlink_mode=='unlink-lost': self.assertNotIn('directory_message_id',removed_intent)
+                        c=json.loads(msg['caption']);self.assertEqual(c['object_id'],sub['object_id'])
+                        self.assertEqual(c['parent_id'],directory['object_id']);self.assertIsNone(c['next_message'])
+                        op=json.loads(s.files[msg['document']['file_id']])['operations'][0]
+                        self.assertEqual(op,dict(operation_id=removed_intent['remove_operation_id'],action='REMOVE',
+                            name='multi.txt',observed_adds=removed_intent['observed_adds']))
+                    else: self.assertEqual(len(s.sent),before)
+                    s.mode='ok';count=len(s.sent)
+                    write('unlink',before_capture,'--path','/documents/sub/multi.txt',state=saved,code=1)
+                    self.assertEqual(len(s.sent),count)
+                    inject_ops([copy.deepcopy(original_add)]) # Retry of the old ADD cannot resurrect the name.
+                    final=scan()
+                    file_exists=unlink_mode in ('unlink-pin','unlink-apierror','concurrent')
+                    listing=read(final,'ls','/documents/sub')
+                    self.assertEqual(b'multi.txt\n' in listing,file_exists)
+                    self.assertIn(b'empty.txt\n',listing)
+                    if file_exists: self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),expected_data)
+                    else:
+                        result=run(['read','--no-cache','--capture',str(final),'--token-file',str(token),
+                            'cat','/documents/sub/multi.txt'],code=1)
+                        self.assertIn(b'does not exist',result.stderr)
+                    self.assertEqual(read(before_capture,'cat','/documents/sub/multi.txt'),b'abcdefghij\n')
+                    for mid,msg in old_messages.items(): self.assertEqual(s.messages[mid],msg)
+                    if unlink_mode=='recreate':
+                        source.write_bytes(b'new generation\n');s.input_data=source.read_bytes()
+                        _,new=write('put',final,'--file',str(source),'--parent','/documents/sub','--name','multi.txt')
+                        self.assertNotEqual(new['object_id'],file['object_id'])
+                        write('unlink',before_capture,'--path','/documents/sub/multi.txt')
+                        final=scan();self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),s.input_data)
+                        # Empty file and root directory mutations use the same observed-remove contract.
+                        write('unlink',final,'--path','/documents/sub/empty.txt')
+                        write('put',final,'--file',str(source),'--name','root.txt')
+                        cap=scan();write('unlink',cap,'--path','/root.txt')
+                        final=scan();self.assertEqual(read(final,'ls','/'),b'documents\n')
+                        self.assertEqual(read(final,'ls','/documents/sub'),b'multi.txt\n')
                 # Parent documents stay append-only; only the new child caption was edited.
 
                 original=json.loads(s.messages[int(directory['child_message_id'])]['caption'])
@@ -326,12 +417,16 @@ class Put(unittest.TestCase):
                             end=time.monotonic()+15
                             while proc.poll() is None and not os.path.ismount(point) and time.monotonic()<end: time.sleep(.05)
                             self.assertTrue(os.path.ismount(point),log.read_text())
-                            self.assertEqual((point/'documents/sub/multi.txt').read_bytes(),expected_data)
+                            if file_exists: self.assertEqual((point/'documents/sub/multi.txt').read_bytes(),expected_data)
+                            else:
+                                with self.assertRaises(FileNotFoundError): (point/'documents/sub/multi.txt').read_bytes()
+                                self.assertNotIn('multi.txt',[p.name for p in (point/'documents/sub').iterdir()])
                             self.assertEqual((point/'documents/sub/empty.txt').stat().st_size,0)
                             self.assertEqual((point/'documents').stat().st_nlink,4)
                             self.assertEqual((point/'documents/sub').stat().st_nlink,2)
-                            with (point/'documents/sub/multi.txt').open('rb',buffering=0) as f:
-                                self.assertEqual(os.pread(f.fileno(),5,2),expected_data[2:7])
+                            if file_exists:
+                                with (point/'documents/sub/multi.txt').open('rb',buffering=0) as f:
+                                    self.assertEqual(os.pread(f.fileno(),5,2),expected_data[2:7])
                             with self.assertRaises(OSError) as caught: (point/'documents/new').mkdir()
                             self.assertEqual(caught.exception.errno,errno.EROFS)
                         finally:
@@ -340,6 +435,14 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
+    def test_unlink_and_observed_adds(self):
+        for mode in ('ok','recreate','concurrent','legacy'):
+            with self.subTest(mode=mode): self.directories(unlink=True,unlink_mode=mode)
+    def test_unlink_failures(self):
+        for mode in ('unlink-lost','unlink-response','unlink-apierror','unlink-pin'):
+            with self.subTest(mode=mode): self.directories(unlink=True,unlink_mode=mode)
+    @unittest.skipUnless(Path('/dev/fuse').exists() and shutil.which('fusermount3'),'kernel mount unavailable')
+    def test_unlinked_capture_mount(self): self.directories(unlink=True,mount=True)
     def test_replace_contents_and_stale_writers(self): self.directories(replace=True)
     def test_replace_failures(self):
         for mode in ('replace-lost-chunk','replace-lost-commit','replace-edit','replace-pin'):

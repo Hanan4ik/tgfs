@@ -39,7 +39,8 @@ int directory_operations_valid(const cJSON *body, tgfs_error *e)
     return 0;
 }
 
-cJSON *directory_merge(const tgfs_directory_batch *batches,size_t count,tgfs_error *e)
+static cJSON *merge_select(const tgfs_directory_batch *batches,size_t count,const char *directory,
+                           const char *name,const char *target,cJSON *observed,tgfs_error *e)
 {
     operation *ops=calloc(TGFS_MAX_RECORDS,sizeof(*ops));
     cJSON *views=cJSON_CreateObject();
@@ -89,6 +90,12 @@ cJSON *directory_merge(const tgfs_directory_batch *batches,size_t count,tgfs_err
         if(op->removed || !same(op->action,"ADD")) continue;
         cJSON *entries=cJSON_GetObjectItemCaseSensitive(views,op->directory);
         const char *object=json_string(op->value,"object_id");
+        if(observed && same(op->directory,directory) && same(op->name,name) && same(object,target)) {
+            cJSON *ref=cJSON_CreateString(op->operation_id);
+            if(!ref || !cJSON_AddItemToArray(observed,ref)) {
+                cJSON_Delete(ref);fail(e,"out of memory collecting observed ADDs");goto invalid;
+            }
+        }
         const cJSON *entry;
         cJSON_ArrayForEach(entry,entries) if(same(json_string(entry,"name"),op->name)) break;
         if(entry) {
@@ -106,4 +113,20 @@ cJSON *directory_merge(const tgfs_directory_batch *batches,size_t count,tgfs_err
     free(ops);return views;
 invalid:
     free(ops);cJSON_Delete(views);return NULL;
+}
+
+cJSON *directory_merge(const tgfs_directory_batch *batches,size_t count,tgfs_error *e)
+{
+    return merge_select(batches,count,NULL,NULL,NULL,NULL,e);
+}
+cJSON *directory_observed_adds(const tgfs_directory_batch *batches,size_t count,const char *directory,
+                               const char *name,const char *object,tgfs_error *e)
+{
+    cJSON *refs=cJSON_CreateArray();
+    if(!refs) {fail(e,"out of memory");return NULL;}
+    cJSON *views=merge_select(batches,count,directory,name,object,refs,e);
+    if(!views) {cJSON_Delete(refs);return NULL;}
+    cJSON_Delete(views);
+    if(!cJSON_GetArraySize(refs)) {cJSON_Delete(refs);fail(e,"unlink requires live DIRECTORY ADD IDs; legacy entries are unsupported");return NULL;}
+    return refs;
 }

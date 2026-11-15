@@ -37,6 +37,8 @@ make test
 
 [Замена содержимого файла](docs/FILE_REPLACE.md): `tgfs put --replace`.
 
+[Удаление имени файла](docs/UNLINK.md): `tgfs unlink --help`.
+
 [Постоянный индекс, кэш и offline](docs/PERSISTENT_CACHE.md) — включены по умолчанию в read.
 
 [Монтирование через FUSE](docs/FUSE_READONLY.md): `tgfs mount --help`.

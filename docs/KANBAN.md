@@ -98,3 +98,15 @@ capture-006 → scan capture-007 → put --parent /documents → scan capture-00
 живая замена /documents/hello.txt → scan capture-009 и сравнение cat старого
 capture-008/нового capture-009. Назначение независимых captures пояснено
 в [CHANNEL_SCAN.md](CHANNEL_SCAN.md).
+
+## Логическое удаление имени файла (2026-11-15)
+
+Пользователь подтвердил живую замену /documents/hello.txt, capture-009 и
+сравнение с capture-008. Добавлен [unlink](UNLINK.md): разрешение обычного файла,
+сбор всех живых наблюдённых ADD тем же merge, один DIRECTORY REMOVE, приватный
+intent и диагностика неизвестного ответа. Старые captures/сообщения сохраняются;
+устаревший REMOVE не гасит новый независимый ADD. Legacy entries без ADD UUID
+не мигрируются, каталоги отвергаются; rmdir/rename/GC/resume/write-FUSE открыты.
+110 тестов (локально 106 passed/4 kernel skips), ASan/UBSan. Следующий шаг —
+unlink /documents/hello.txt на capture-009 → scan capture-010 → пустой ls,
+ENOENT нового cat и сохранённый cat прежнего capture.

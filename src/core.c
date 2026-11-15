@@ -320,6 +320,34 @@ int directory_target(tgfs *fs,const char *path,const char *name,char object[37],
     return 0;
 }
 
+int unlink_target(tgfs *fs,const char *path,const char *name,char object[37],char parent[37],
+                  char grandparent[37],cJSON **observed,tgfs_error *e)
+{
+    *observed=NULL;
+    const char *id=resolve(fs,path,e);if(!id) return -1;
+    const cJSON *entries=directory_entries(fs,id,e),*entry;
+    if(!entries) return -1;
+    cJSON_ArrayForEach(entry,entries) if(same(name,json_string(entry,"name"))) break;
+    if(!entry) return fail_code(e,ENOENT,"unlink target does not exist in capture");
+    const char *child=json_string(entry,"object_id");tgfs_attr attr;
+    if(tgfs_object_attr(fs,child,&attr,e)) return -1;
+    if(attr.directory) return fail_code(e,EISDIR,"unlink target is a directory; rmdir is not implemented");
+    memcpy(object,child,37);memcpy(parent,id,37);grandparent[0]=0;
+    tgfs_directory_batch *batches=calloc(fs->count?fs->count:1,sizeof(*batches));
+    if(!batches) return fail(e,"out of memory");
+    size_t count=0;
+    for(size_t i=0;i<fs->count;i++) {
+        message *m=&fs->messages[i];if(!same(m->type,"DIRECTORY")) continue;
+        if(same(m->object_id,id)) {
+            if(!cJSON_HasObjectItem(m->body,"operations")) {free(batches);return fail(e,"unlink requires DIRECTORY operations; legacy entries are unsupported");}
+            if(!same(id,fs->root_id)) memcpy(grandparent,json_string(m->caption,"parent_id"),37);
+        }
+        batches[count++]=(tgfs_directory_batch){m->id,m->object_id,m->body};
+    }
+    *observed=directory_observed_adds(batches,count,id,name,child,e);free(batches);
+    return *observed?0:-1;
+}
+
 int tgfs_list(tgfs *fs, const char *path, tgfs_entry_fn emit, void *arg, tgfs_error *e)
 {
     const char *id = resolve(fs, path, e);

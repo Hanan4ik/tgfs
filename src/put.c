@@ -459,6 +459,61 @@ done:
     if(dir>=0) close(dir);
     free(split);cJSON_Delete(intent);cJSON_Delete(child);cJSON_Delete(empty);cJSON_Delete(parent_caption);cJSON_Delete(body);return rc;
 }
+static int unlink_file(tgfs_bot *bot,const cJSON *journal,const char *path,const char *state,tgfs_error *e)
+{
+    int rc=-1,dir=-1;char *split=strdup(path);
+    cJSON *observed=NULL,*intent=NULL,*caption=NULL,*body=NULL;
+    long long channel,directory_id=0;size_t document_size=0;uint64_t boundary;
+    if(!split) return fail(e,"out of memory");
+    char *slash=strrchr(split,'/');const char *name=slash+1,*parent_path="/";
+    if(slash!=split) {*slash=0;parent_path=split;}
+    char object[37],parent[37],grandparent[37],operation[37];
+    const char *chat=json_string(journal,"storage_chat_id");
+    if(remote_unlink_target(bot,journal,parent_path,name,object,parent,grandparent,&observed,e) ||
+        tgfs_bot_channel_id(chat,&channel) || check_pin(bot,journal,e)) goto done;
+    if(json_decimal(journal,"boundary_id",&boundary) || uuid_new(operation)) {fail(e,"cannot prepare unlink");goto done;}
+    dir=stage_open(state,e);if(dir<0) goto done;
+    intent=cJSON_CreateObject();caption=envelope("DIRECTORY",parent);body=cJSON_CreateObject();
+    cJSON *ops=body?cJSON_AddArrayToObject(body,"operations"):NULL;
+    cJSON *entry=ops?cJSON_CreateObject():NULL;
+    if(!entry || !cJSON_AddItemToArray(ops,entry)) {cJSON_Delete(entry);fail(e,"out of memory");goto done;}
+    if(!cJSON_AddStringToObject(entry,"operation_id",operation) || !cJSON_AddStringToObject(entry,"action","REMOVE") ||
+        !cJSON_AddStringToObject(entry,"name",name) || !cJSON_AddItemToObject(entry,"observed_adds",cJSON_Duplicate(observed,1)) ||
+        !intent || !caption || caption_parent(caption,grandparent) ||
+        !cJSON_AddStringToObject(intent,"kind","unlink") || !cJSON_AddStringToObject(intent,"path",path) ||
+        !cJSON_AddStringToObject(intent,"storage_chat_id",chat) || !cJSON_AddStringToObject(intent,"parent_id",parent) ||
+        !cJSON_AddStringToObject(intent,"object_id",object) || !cJSON_AddStringToObject(intent,"remove_operation_id",operation) ||
+        !cJSON_AddStringToObject(intent,"source_boundary_id",json_string(journal,"boundary_id")) ||
+        !cJSON_AddItemToObject(intent,"observed_adds",cJSON_Duplicate(observed,1)) ||
+        !cJSON_AddItemToObject(intent,"directory_caption",cJSON_Duplicate(caption,1)) ||
+        !cJSON_AddItemToObject(intent,"directory_document",cJSON_Duplicate(body,1))) {fail(e,"cannot allocate unlink intent");goto done;}
+    if(persist(dir,intent,"prepared",e) || check_pin(bot,journal,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
+    int sent=upload_json(bot,chat,channel,"directory.json",body,caption,&directory_id,&document_size,e);
+    if(!sent && (uint64_t)directory_id<=boundary) sent=fail(e,"non-increasing DIRECTORY ID");
+    if(directory_id>0 && add_id(intent,"directory_message_id",directory_id)) {fail(e,"out of memory");goto done;}
+    if(sent) {tgfs_error saved=*e;persist(dir,intent,"directory_response_uncertain",e);*e=saved;goto done;}
+    if(persist(dir,intent,"complete",e)) goto done;
+    printf("OK unlink path=%s object_id=%s directory_id=%lld operation_id=%s\n",path,object,directory_id,operation);rc=0;
+done:
+    if(rc && intent) fprintf(stderr,"unlink state: phase=%s directory_id=%lld\n",
+        json_string(intent,"phase")?json_string(intent,"phase"):"preparing",directory_id);
+    if(dir>=0) close(dir);
+    free(split);cJSON_Delete(observed);cJSON_Delete(intent);cJSON_Delete(caption);cJSON_Delete(body);return rc;
+}
+void tgfs_unlink_help(FILE *stream)
+{
+    fputs("usage: tgfs unlink --capture DIRECTORY --path /absolute/file --state-dir NEW_DIRECTORY --token-file PATH [options]\n"
+          "Remove a file name by publishing DIRECTORY REMOVE for captured live ADD IDs.\n"
+          "  --capture DIRECTORY      Completed journal with DIRECTORY operations.\n"
+          "  --path /absolute/file    Existing regular file; no trailing slash.\n"
+          "  --state-dir DIRECTORY    New private intent directory; preserve on failure.\n"
+          "  --token-file PATH        Owner-only token file for the bot used by scan.\n"
+          "  --proxy URL | --direct   Same transport routing as put.\n"
+          "  --timeout-seconds N      1..300, default 60.\n"
+          "  --send-interval-ms N     0..10000, default 1100.\n"
+          "  -h, --help               Show help without network.\n"
+          "No physical deletion, rmdir, legacy entries conversion, resume or blind retry.\n",stream);
+}
 void tgfs_mkdir_help(FILE *stream)
 {
     fputs("usage: tgfs mkdir --capture DIRECTORY --path /absolute/path --state-dir NEW_DIRECTORY --token-file PATH [options]\n"
@@ -473,10 +528,12 @@ void tgfs_mkdir_help(FILE *stream)
           "  -h, --help               Show help without network.\n"
           "No overwrite, resume or blind retries. Scan again before using the new directory as parent.\n",stream);
 }
-int tgfs_mkdir_main(int argc,char **argv)
+static int path_write_main(int argc,char **argv,int removing)
 {
+    void (*usage_help)(FILE *)=removing?tgfs_unlink_help:tgfs_mkdir_help;
+    const char *command=removing?"unlink":"mkdir";
     const char *capture=NULL,*path=NULL,*state=NULL,*token=NULL,*proxy=NULL,*timeout_text=NULL,*interval_text=NULL;
-    if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_mkdir_help(stdout);return 0;}
+    if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {usage_help(stdout);return 0;}
     for(int i=2;i<argc;i++) {
         const char **slot=NULL;
         if(same(argv[i],"--direct")) {if(proxy) goto usage;proxy="";continue;}
@@ -494,8 +551,8 @@ int tgfs_mkdir_main(int argc,char **argv)
     if(!capture || !path || path[0]!='/' || strlen(path)>4096 || !state || !*state || !token ||
         (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300)) ||
         (interval_text && (decimal(interval_text,&interval) || interval>10000))) goto usage;
-    char *check=strdup(path);if(!check) {fputs("FAIL mkdir: out of memory\n",stderr);return 1;}
-    size_t n=strlen(check);while(n>1 && check[n-1]=='/') check[--n]=0;
+    char *check=strdup(path);if(!check) {fprintf(stderr,"FAIL %s: out of memory\n",command);return 1;}
+    size_t n=strlen(check);while(!removing && n>1 && check[n-1]=='/') check[--n]=0;
     const char *name=strrchr(check,'/')+1;
     int valid=name_valid(name) && strlen(name)<=255 && !strchr(name,'\r') && !strchr(name,'\n');free(check);
     if(!valid) goto usage;
@@ -505,10 +562,13 @@ int tgfs_mkdir_main(int argc,char **argv)
     if(dir<0) {fail(&e,"cannot open capture");goto done;}
     journal=json_load_at(dir,"journal.json",&e);close(dir);if(!journal) goto done;
     if(tgfs_bot_open(token,(unsigned)timeout,&bot,&b) || tgfs_bot_set_proxy(bot,proxy,&b)) {api_fail(&e,&b);goto done;}
-    rc=make_directory(bot,journal,path,state,&e) ? 1 : 0;
+    rc=(removing?unlink_file(bot,journal,path,state,&e):make_directory(bot,journal,path,state,&e)) ? 1 : 0;
 done:
-    if(rc) fprintf(stderr,"FAIL mkdir: %s; preserve state directory\n",e.message);
+    if(rc) fprintf(stderr,"FAIL %s: %s; preserve state directory\n",command,e.message);
     cJSON_Delete(journal);tgfs_bot_close(bot);return rc;
 usage:
-    tgfs_mkdir_help(stderr);return 2;
+    usage_help(stderr);return 2;
 }
+
+int tgfs_mkdir_main(int argc,char **argv) {return path_write_main(argc,argv,0);}
+int tgfs_unlink_main(int argc,char **argv) {return path_write_main(argc,argv,1);}
