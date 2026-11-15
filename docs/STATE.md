@@ -197,3 +197,14 @@ edit только двух навигационных полей. Уже исп�
 116 тестов: lost response/reject/pending phase/conflict/empty/repeat/REMOVE.
 Следующий живой тест — put-documents-hello-001 на capture-010: already_observed,
 без воскрешения имени. Полное resume/навигация/cleanup остаются открытыми.
+
+## Завершение подтверждённого создания (2026-11-15)
+
+Пользователь подтвердил resume-directory: commit37/CHUNK36/DIRECTORY38,
+already_observed, без повторной публикации. Добавлен
+[--finalize](FINALIZE_PUT.md): fresh проверка всех частей и commit/ADD, ремонт
+только null commit.next_message, затем atomic temp/fsync/rename/fsync phase=complete.
+Конфликтный указатель/изменённый intent/temp блокируют завершение. 118 тестов
+с lost edit/repeat/empty/conflict/live drift/temp/REMOVE. Следующий живой тест —
+тот же create state/capture-010: finalized=true, intent_updated=false.
+Полное resume и завершение остальных типов намерений остаются открытыми.

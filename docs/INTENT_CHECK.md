@@ -149,3 +149,9 @@ next_step=verified_in_capture. publication=confirmed относится к пр�
 нового файла с подтверждённым commit, без замены/переотправки данных.
 Неизвестный исход ADD блокируется фазой и durable pending в recovery-log.
 Без явных флагов intent по-прежнему read-only.
+
+## Завершение создания
+
+Добавлен отдельный [--finalize](FINALIZE_PUT.md): живые проверки всех частей,
+ремонт FILE_COMMIT → подтверждённый ADD и атомарная фиксация local complete.
+Это не универсальный resume; флаги изменяющих режимов взаимоисключающие.

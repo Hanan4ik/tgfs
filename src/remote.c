@@ -549,6 +549,7 @@ void tgfs_intent_help(FILE *stream)
 {
     fputs("usage: tgfs intent --state-dir DIRECTORY --capture DIRECTORY --token-file PATH [options]\n"
           "Reconcile put/mkdir/unlink intent with a newer completed capture; default is read-only.\n"
+          "  --finalize               Verify create/ADD, repair commit navigation, persist complete.\n"
           "  --resume-directory       Resume never-attempted ADD for a verified new-file put.\n"
           "  --repair-backlinks       Explicitly repair verified CHUNK navigation; logs/locks state-dir.\n"
           "  --state-dir DIRECTORY    Existing private directory containing intent.json.\n"
@@ -562,11 +563,12 @@ void tgfs_intent_help(FILE *stream)
 }
 int tgfs_intent_main(int argc,char **argv)
 {
-    int repair=0,resume=0,log_fd=-1;
+    int repair=0,resume=0,finalize=0,log_fd=-1;
     const char *state=NULL,*capture=NULL,*token=NULL,*proxy=NULL,*timeout_text=NULL;
     if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_intent_help(stdout);return 0;}
     for(int i=2;i<argc;i++) {
         const char **slot=NULL;
+        if(same(argv[i],"--finalize")) {if(finalize) goto usage;finalize=1;continue;}
         if(same(argv[i],"--resume-directory")) {if(resume) goto usage;resume=1;continue;}
         if(same(argv[i],"--repair-backlinks")) {if(repair) goto usage;repair=1;continue;}
         if(same(argv[i],"--direct")) {if(proxy) goto usage;proxy="";continue;}
@@ -579,7 +581,7 @@ int tgfs_intent_main(int argc,char **argv)
         *slot=argv[++i];
     }
     uint64_t timeout=60;
-    if((repair && resume) || !state || !capture || !token || (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300))) goto usage;
+    if((repair+resume+finalize>1) || !state || !capture || !token || (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300))) goto usage;
     tgfs_error e={0};tgfs_bot_error b;remote r={0};tgfs *fs=NULL;
     cJSON *intent=NULL,*journal=NULL,*report=NULL;int rc=1,dir=-1;
     struct stat st;
@@ -588,7 +590,7 @@ int tgfs_intent_main(int argc,char **argv)
     if(fstatat(dir,"intent.json",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() || (st.st_mode&0077)) {
         fail(&e,"intent.json must be an owner-only regular file");goto done;
     }
-    if(repair || resume) {
+    if(repair || resume || finalize) {
         log_fd=openat(dir,"backlink-repair.log",O_RDWR|O_CREAT|O_APPEND|O_NOFOLLOW|O_CLOEXEC,0600);
         if(log_fd<0 || fstat(log_fd,&st) || !S_ISREG(st.st_mode) || st.st_nlink!=1 || st.st_uid!=geteuid() || (st.st_mode&0077) || flock(log_fd,LOCK_EX|LOCK_NB)) {
             fail(&e,"cannot exclusively lock private backlink-repair.log");goto done;
@@ -632,6 +634,7 @@ int tgfs_intent_main(int argc,char **argv)
     if(intent_data_plan(&r,state,intent,journal,report,&e)) goto done;
     if(repair && repair_backlinks(r.bot,journal,intent,report,log_fd,&e)) goto done;
     if(resume && resume_directory(r.bot,fs,journal,intent,report,log_fd,&e)) goto done;
+    if(finalize && finalize_put(r.bot,state,journal,intent,report,log_fd,&e)) goto done;
     char *raw=cJSON_PrintUnformatted(report);
     if(!raw) {fail(&e,"out of memory");goto done;}
     rc=puts(raw)<0?1:0;free(raw);
