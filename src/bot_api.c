@@ -141,6 +141,18 @@ int tgfs_bot_set_proxy(tgfs_bot *b, const char *url, tgfs_bot_error *e)
     return 0;
 }
 
+int tgfs_bot_id(const tgfs_bot *bot,long long *id)
+{
+    if(!bot || !id) return -1;
+    const char *colon=strchr(bot->token,':');
+    char text[32];
+    if(!colon || (size_t)(colon-bot->token)>=sizeof(text)) return -1;
+    memcpy(text,bot->token,(size_t)(colon-bot->token));text[colon-bot->token]=0;
+    uint64_t value;
+    if(decimal(text,&value) || !value || value>4503599627370495ULL) return -1;
+    *id=(long long)value;return 0;
+}
+
 void tgfs_bot_close(tgfs_bot *b)
 {
     if (!b) return;

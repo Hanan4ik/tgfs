@@ -1,10 +1,11 @@
 CC ?= cc
-CPPFLAGS += -Iinclude -Ithird_party/cjson -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
+SQLITE_LIBS ?= -lsqlite3
+CPPFLAGS += $(SQLITE_CFLAGS) -Iinclude -Ithird_party/cjson -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror
-LDLIBS += -lcrypto -lcurl -lm
-SOURCES = src/main.c src/core.c src/directory.c src/json.c src/bot_api.c src/probe.c src/scan.c src/init.c src/remote.c src/put.c third_party/cjson/cJSON.c
-HEADERS = include/tgfs/tgfs.h include/tgfs/bot_api.h src/internal.h include/tgfs/scan.h third_party/cjson/cJSON.h
+LDLIBS += -lcrypto -lcurl $(SQLITE_LIBS) -lm
+SOURCES = src/main.c src/core.c src/directory.c src/json.c src/bot_api.c src/probe.c src/scan.c src/init.c src/remote.c src/put.c src/cache.c third_party/cjson/cJSON.c
+HEADERS = src/cache.h include/tgfs/tgfs.h include/tgfs/bot_api.h src/internal.h include/tgfs/scan.h third_party/cjson/cJSON.h
 
 .PHONY: all test sanitize clean
 all: build/tgfs
@@ -24,6 +25,7 @@ test: build/tgfs build/tgfs-test
 	python3 tests/init.py ./build/tgfs-test
 	python3 tests/remote.py ./build/tgfs-test
 	python3 tests/put.py ./build/tgfs-test
+	python3 tests/cache.py ./build/tgfs-test
 
 sanitize:
 	$(MAKE) clean
