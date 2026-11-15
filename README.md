@@ -43,6 +43,8 @@ make test
 
 [Ограниченный ремонт backlinks](docs/BACKLINK_REPAIR.md): `tgfs intent --repair-backlinks`.
 
+[Восстановление публикации имени](docs/RESUME_DIRECTORY.md): `tgfs intent --resume-directory`.
+
 [Постоянный индекс, кэш и offline](docs/PERSISTENT_CACHE.md) — включены по умолчанию в read.
 
 [Монтирование через FUSE](docs/FUSE_READONLY.md): `tgfs mount --help`.

@@ -186,3 +186,14 @@ edit только двух навигационных полей. Уже исп�
 повтором, origin/cleanup/pin/metadata конфликтами и lock. Следующий живой тест
 на прежнем state/capture-010 — no-op, искусственно ломать captions не нужно.
 Полное resume, ремонт commit/directory и автоматический cleanup лога открыты.
+
+## Восстановление публикации имени (2026-11-15)
+
+Пользователь подтвердил no-op ремонта put intent. Добавлен
+[--resume-directory](RESUME_DIRECTORY.md): только create с проверенным commit
+и фазой до первой попытки ADD. Есть persistent send barrier и повторная
+сверка fresh commit/pin; известный ADD (включая позднее удалённый) не публикуется
+заново. UUID исходные, новых CHUNK/FILE_COMMIT нет, intent phase не переписывается.
+116 тестов: lost response/reject/pending phase/conflict/empty/repeat/REMOVE.
+Следующий живой тест — put-documents-hello-001 на capture-010: already_observed,
+без воскрешения имени. Полное resume/навигация/cleanup остаются открытыми.

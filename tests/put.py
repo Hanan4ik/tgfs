@@ -42,16 +42,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             intent=json.loads(s.intent.read_text())
             expected={'CHUNK':'chunk_send_pending','FILE_COMMIT':'commit_send_pending','DIRECTORY':'directory_send_pending'}[kind]
             if intent.get('kind')=='mkdir' and record['object_id']==intent['object_id']: expected='child_send_pending'
-            assert intent['phase']==expected
+            if intent['phase']!=expected and kind=='DIRECTORY':
+                assert 'directory_send_pending' in (s.intent.parent/'backlink-repair.log').read_text()
+            else: assert intent['phase']==expected
             if intent.get('kind') not in ('mkdir','unlink'): assert (s.intent.parent/'data.bin').read_bytes()==s.input_data
-            if s.mode=='unlink-apierror' and intent.get('kind')=='unlink':
+            if (s.mode=='unlink-apierror' and intent.get('kind')=='unlink') or s.mode=='resume-apierror':
                 return self.reply(error=dict(ok=False,error_code=429,description=TOKEN,parameters=dict(retry_after=5)),status=429)
             mid=s.next;s.next+=1
             fid='file_'+str(mid);s.files[fid]=raw
             msg=dict(message_id=mid,chat=dict(id=STORAGE,type='channel'),caption=caption,
                 document=dict(file_id=fid,file_name=filename,file_size=len(raw)))
             s.messages[mid]=msg;s.sent.append(kind)
-            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT') or (s.mode=='unlink-lost' and intent.get('kind')=='unlink'):
+            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT') or (s.mode=='unlink-lost' and intent.get('kind')=='unlink') or s.mode=='resume-lost':
                 self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
             if (s.mode=='response' and kind=='CHUNK') or (s.mode=='mkdir-response' and expected=='child_send_pending') or (s.mode=='unlink-response' and intent.get('kind')=='unlink'):
                 msg=copy.deepcopy(msg);msg['document']['file_name']='wrong'
@@ -62,7 +64,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if int(p['chat_id'])==STORAGE:
                 chat['pinned_message']=copy.deepcopy(s.messages[1])
                 if s.mode=='unlink-pin': s.unlink_pin_reads+=1
-                if (s.mode=='unlink-pin' and s.unlink_pin_reads>=3) or s.mode=='pin' or (s.mode=='mkdir-pin' and s.sent) or (s.mode=='replace-pin' and len(s.sent)>s.before_replace):
+                if (s.mode=='create-pin-after-commit' and 'FILE_COMMIT' in s.sent) or (s.mode=='unlink-pin' and s.unlink_pin_reads>=3) or s.mode=='pin' or (s.mode=='mkdir-pin' and s.sent) or (s.mode=='replace-pin' and len(s.sent)>s.before_replace):
                     header=copy.deepcopy(SB);header['root_object_id']=str(uuid.uuid4())
                     chat['pinned_message']['text']=json.dumps(header)
             return self.reply(chat)
@@ -96,7 +98,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 
 class Put(unittest.TestCase):
-    def exercise(self,data=b'hello\n',mode='ok',readback=True):
+    def exercise(self,data=b'hello\n',mode='ok',readback=True,recover=False,recovery_mode='ok'):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -123,6 +125,53 @@ class Put(unittest.TestCase):
                 if mode!='ok':
                     self.assertEqual(p.returncode,1,p.stderr)
                     self.assertNotIn('DIRECTORY',s.sent)
+                    if recover:
+                        s.mode='ok'
+                        def scan_to(name):
+                            out=root/name
+                            result=run(['scan','--token-file',str(token),'--storage-chat-id',str(STORAGE),'--service-chat-id',str(SERVICE),'--output',str(out)])
+                            self.assertEqual(result.returncode,0,result.stderr);return out
+                        cap=scan_to('recovery-capture');before_intent=s.intent.read_bytes();before=list(s.sent)
+                        if recovery_mode=='log':
+                            log=state/'backlink-repair.log';log.write_text('{broken');log.chmod(0o600)
+                        if recovery_mode=='phase':
+                            value=json.loads(before_intent);value['phase']='directory_send_pending';s.intent.write_text(json.dumps(value))
+                        if recovery_mode=='conflict':
+                            saved=s.intent;s.intent=root/'other-state'/'intent.json'
+                            other=args.copy();other[other.index('--state-dir')+1]=str(s.intent.parent)
+                            result=run(other);self.assertEqual(result.returncode,0,result.stderr)
+                            s.intent=saved;cap=scan_to('conflict-capture');before=list(s.sent)
+                        command=['intent','--resume-directory','--state-dir',str(state),'--capture',str(cap),'--token-file',str(token)]
+                        s.mode={'lost':'resume-lost','reject':'resume-apierror'}.get(recovery_mode,'ok')
+                        result=run(command)
+                        self.assertEqual(result.returncode,0 if recovery_mode=='ok' else 1,result.stderr)
+                        s.mode='ok'
+                        if recovery_mode in ('phase','conflict','reject','log'):
+                            self.assertEqual(s.sent,before)
+                            if recovery_mode=='reject': self.assertEqual(run(command).returncode,1)
+                            return
+                        self.assertEqual(s.sent,before+['DIRECTORY'])
+                        if recovery_mode=='ok': self.assertTrue(json.loads(result.stdout)['resumed'])
+                        self.assertEqual(s.intent.read_bytes(),before_intent)
+                        count=len(s.sent);self.assertEqual(run(command).returncode,1)
+                        self.assertEqual(len(s.sent),count) # Old capture + durable pending event must block a resend.
+                        fresh=scan_to('recovered')
+                        command[command.index('--capture')+1]=str(fresh)
+                        result=run(command);self.assertEqual(result.returncode,0,result.stderr)
+                        self.assertEqual(json.loads(result.stdout)['directory_resume'],'already_observed')
+                        result=run(['read','--no-cache','--capture',str(fresh),'--token-file',str(token),'cat','/hello.txt'])
+                        self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,data)
+                        self.assertEqual(len(s.sent),count)
+                        saved=s.intent;s.intent=root/'unlink-recovered'/'intent.json'
+                        deleted=run(['unlink','--capture',str(fresh),'--path','/hello.txt','--state-dir',str(s.intent.parent),
+                            '--token-file',str(token),'--send-interval-ms','0'])
+                        self.assertEqual(deleted.returncode,0,deleted.stderr);s.intent=saved
+                        removed=scan_to('removed-recovered');command[command.index('--capture')+1]=str(removed)
+                        count=len(s.sent);result=run(command)
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        self.assertEqual(json.loads(result.stdout)['directory_resume'],'already_observed')
+                        self.assertEqual(len(s.sent),count) # Never resurrect an observed ADD after REMOVE.
+                        return
                     if mode=='lost': self.assertIn(b'outcome_unknown=1',p.stderr)
                     if mode in ('lost','response','edit'):
                         count=len(s.sent);retry=run(args);self.assertEqual(retry.returncode,1);self.assertEqual(len(s.sent),count)
@@ -510,6 +559,10 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
+    def test_resume_directory(self):
+        for case in ('ok','lost','reject','phase','conflict','log'):
+            with self.subTest(case=case): self.exercise(mode='edit',recover=True,recovery_mode=case)
+    def test_resume_empty_directory_publication(self): self.exercise(b'',mode='create-pin-after-commit',recover=True)
     def test_backlink_repair(self):
         for mode in ('ok','lost','changed','origin','cleanup','pin'):
             with self.subTest(mode=mode): self.directories(replace=True,replace_mode='replace-edit',diagnose=True,repair_case=mode)
