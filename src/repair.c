@@ -287,7 +287,7 @@ static int finish_local_intent(const char *state,const cJSON *intent,const char 
     current=json_load_at(dir,"intent.json",e);
     if(!current || !cJSON_Compare(current,intent,1)) {fail(e,"intent changed during finalization");goto done;}
     if(same(json_string(intent,"phase"),"complete")) {
-        if(!same(json_string(intent,"file_commit_id"),commit_id) || !same(json_string(intent,"directory_message_id"),directory_id)) fail(e,"complete intent stored IDs differ from canonical publications");
+        if(!same(json_string(intent,"file_commit_id"),commit_id) || (directory_id?!same(json_string(intent,"directory_message_id"),directory_id):cJSON_HasObjectItem(intent,"directory_message_id"))) fail(e,"complete intent stored IDs differ from canonical publications");
         else if(fsync(dir)) fail(e,"cannot sync intent directory");else rc=0;
         goto done;
     }
@@ -296,7 +296,7 @@ static int finish_local_intent(const char *state,const cJSON *intent,const char 
     cJSON_DeleteItemFromObjectCaseSensitive(finished,"file_commit_id");
     cJSON_DeleteItemFromObjectCaseSensitive(finished,"directory_message_id");
     if(!cJSON_AddStringToObject(finished,"phase","complete") || !cJSON_AddStringToObject(finished,"file_commit_id",commit_id) ||
-        !cJSON_AddStringToObject(finished,"directory_message_id",directory_id)) {fail(e,"out of memory");goto done;}
+        (directory_id && !cJSON_AddStringToObject(finished,"directory_message_id",directory_id))) {fail(e,"out of memory");goto done;}
     raw=cJSON_PrintUnformatted(finished);if(!raw) {fail(e,"out of memory");goto done;}
     fd=openat(dir,"intent.finalize.tmp",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
     if(fd<0) {fail(e,"cannot create intent.finalize.tmp; preserve any existing recovery file");goto done;}
@@ -315,14 +315,20 @@ done:
 int finalize_put(tgfs_bot *bot,const char *state,const cJSON *journal,const cJSON *intent,cJSON *report,int logfd,tgfs_error *e)
 {
     const cJSON *commits=cJSON_GetObjectItemCaseSensitive(report,"commit_ids"),*directories=cJSON_GetObjectItemCaseSensitive(report,"directory_ids");
-    if(!same(json_string(intent,"kind"),"put") || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(intent,"replace")) ||
-        !cJSON_GetArraySize(commits) || !cJSON_GetArraySize(directories) || !same(json_string(report,"staging"),"verified"))
-        return fail(e,"finalize requires a verified create with confirmed FILE_COMMIT and ADD");
+    int replacing=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(intent,"replace"));
+    if(!same(json_string(intent,"kind"),"put") || !cJSON_GetArraySize(commits) ||
+        (!replacing && !cJSON_GetArraySize(directories)) || !same(json_string(report,"staging"),"verified"))
+        return fail(e,"finalize requires verified put, confirmed FILE_COMMIT and ADD for creation");
+    uint64_t base=0;
+    if(replacing && (!uuid_valid(json_string(intent,"base_version_id")) || json_decimal(intent,"base_commit_id",&base) || !base ||
+        cJSON_HasObjectItem(intent,"add_operation_id") || cJSON_HasObjectItem(intent,"directory_document") ||
+        cJSON_HasObjectItem(intent,"directory_caption") || cJSON_HasObjectItem(intent,"directory_message_id")))
+        return fail(e,"invalid replacement intent fields");
     const char *bad[]={"unobserved_part_indexes","ambiguous_part_indexes","unobserved_known_ids"};
     for(size_t i=0;i<3;i++) if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,bad[i]))) return fail(e,"finalize blocked by missing or ambiguous parts");
-    const char *commit_id=cJSON_GetArrayItem(commits,0)->valuestring,*directory_id=cJSON_GetArrayItem(directories,0)->valuestring;
-    uint64_t cid,did;decimal(commit_id,&cid);decimal(directory_id,&did);
-    if(did<=cid) return fail(e,"ADD precedes canonical FILE_COMMIT");
+    const char *commit_id=cJSON_GetArrayItem(commits,0)->valuestring,*directory_id=replacing?NULL:cJSON_GetArrayItem(directories,0)->valuestring;
+    uint64_t cid,did=0;decimal(commit_id,&cid);if(directory_id) decimal(directory_id,&did);
+    if(directory_id && did<=cid) return fail(e,"ADD precedes canonical FILE_COMMIT");
     /* Force live validation of all canonical parts, including those correct in the capture. */
     cJSON *original=cJSON_Duplicate(cJSON_GetObjectItemCaseSensitive(report,"backlink_repairs"),1),*all=cJSON_CreateArray();
     if(!original || !all) {cJSON_Delete(original);cJSON_Delete(all);return fail(e,"out of memory");}
@@ -338,15 +344,15 @@ int finalize_put(tgfs_bot *bot,const char *state,const cJSON *journal,const cJSO
     int checked=repair_backlinks(bot,journal,intent,report,logfd,e);
     cJSON_ReplaceItemInObjectCaseSensitive(report,"backlink_repairs",original);
     if(checked) return -1;
-    const cJSON *cr=record_find(journal,commit_id),*dr=record_find(journal,directory_id);
+    const cJSON *cr=record_find(journal,commit_id),*dr=directory_id?record_find(journal,directory_id):NULL;
     cJSON *commit=fresh_caption(bot,journal,cr,logfd,e);if(!commit) return -1;
-    cJSON *directory=fresh_caption(bot,journal,dr,logfd,e);if(!directory) {cJSON_Delete(commit);return -1;}
+    cJSON *directory=dr?fresh_caption(bot,journal,dr,logfd,e):NULL;if(dr && !directory) {cJSON_Delete(commit);return -1;}
     int same_metadata=json_semantic_equal(commit,cJSON_GetObjectItemCaseSensitive(cr,"record")) &&
-        json_semantic_equal(directory,cJSON_GetObjectItemCaseSensitive(dr,"record"));cJSON_Delete(directory);
+        (!dr || json_semantic_equal(directory,cJSON_GetObjectItemCaseSensitive(dr,"record")));cJSON_Delete(directory);
     if(!same_metadata) {cJSON_Delete(commit);return fail(e,"fresh commit or ADD metadata changed");}
     const char *next=json_string(commit,"next_message");
-    if(!cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(commit,"next_message")) && !same(next,directory_id)) {
-        cJSON_Delete(commit);return fail(e,"commit navigation conflicts with confirmed ADD");
+    if(!cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(commit,"next_message")) && (replacing || !same(next,directory_id))) {
+        cJSON_Delete(commit);return fail(e,replacing?"replacement commit navigation must remain null":"commit navigation conflicts with confirmed ADD");
     }
     cJSON *p=params(json_string(journal,"storage_chat_id")),*out=NULL;
     if(call(bot,"getChat",p,&out,0,e)) {cJSON_Delete(commit);return -1;}
@@ -358,7 +364,7 @@ int finalize_put(tgfs_bot *bot,const char *state,const cJSON *journal,const cJSO
         !tgfs_bot_integer(cJSON_GetObjectItemCaseSensitive(pin,"chat"),"id",&pin_channel) && pin_channel==expected_channel && !json_decimal(cJSON_GetObjectItemCaseSensitive(journal,"superblock"),"start_id",&start) &&
         !tgfs_bot_integer(pin,"message_id",&pinned) && pinned==(long long)start && json_semantic_equal(header,cJSON_GetObjectItemCaseSensitive(journal,"superblock"));
     cJSON_Delete(header);cJSON_Delete(out);if(!valid) {cJSON_Delete(commit);return fail(e,"pinned SUPERBLOCK differs from capture");}
-    int repaired=!same(next,directory_id);
+    int repaired=directory_id && !same(next,directory_id);
     if(repaired) {
         cJSON_DeleteItemFromObjectCaseSensitive(commit,"next_message");
         if(!cJSON_AddStringToObject(commit,"next_message",directory_id)) {cJSON_Delete(commit);return fail(e,"out of memory");}
@@ -376,7 +382,8 @@ int finalize_put(tgfs_bot *bot,const char *state,const cJSON *journal,const cJSO
     }
     cJSON_Delete(commit);
     int updated=finish_local_intent(state,intent,commit_id,directory_id,logfd,e);if(updated<0) return -1;
-    if(!cJSON_AddBoolToObject(report,"finalized",1) || !cJSON_AddBoolToObject(report,"intent_updated",updated) ||
+    if(!cJSON_AddStringToObject(report,"finalize_kind",replacing?"replace":"create") ||
+        !cJSON_AddBoolToObject(report,"finalized",1) || !cJSON_AddBoolToObject(report,"intent_updated",updated) ||
         !cJSON_AddBoolToObject(report,"commit_navigation_repaired",repaired)) return fail(e,"out of memory");
     cJSON_ReplaceItemInObjectCaseSensitive(report,"scope",cJSON_CreateString("capture_plus_live_verification"));
     cJSON_ReplaceItemInObjectCaseSensitive(report,"local_phase",cJSON_CreateString("complete"));

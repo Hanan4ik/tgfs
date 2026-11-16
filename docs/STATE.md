@@ -221,3 +221,14 @@ ID одного файла. Конкретное поле старое сооб�
 без подмены chat/message ID в локальном объекте. 118 методов с alias/legacy/
 corruption/unique-conflict регрессиями. После обновления повторить --finalize
 на том же state/capture-010, не удаляя intent или recovery-log.
+
+## Завершение замены (2026-11-16)
+
+Пользователь подтвердил create --finalize на capture-011: commit37/part36/ADD38,
+finalized=true/intent_updated=false. Повреждение прежнего capture не доказано.
+[--finalize](FINALIZE_PUT.md) расширен на replace: verified staging/parts/commit,
+свежая проверка и ремонт backlinks, обязательный null next_message commit,
+atomic local complete без directory_message_id/нового ADD. 119 тестов,
+повторы/empty/multipart/lost commit/backlinks/missing/conflict. Следующий
+живой тест — replace-documents-hello-001 с capture-011. Следующий свободный
+scan capture-012; полное resume и mkdir/unlink completion открыты.

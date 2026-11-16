@@ -1,7 +1,7 @@
 # Завершение подтверждённого создания файла
 
-Добавлен явный `tgfs intent --finalize`. Режим поддерживает только создание
-нового файла (put, replace=false) с подтверждёнными FILE_COMMIT и ADD в capture.
+Добавлен явный `tgfs intent --finalize`. Режим поддерживает создание и замену содержимого файла. Для create нужны
+подтверждённые FILE_COMMIT и ADD; для replace — только FILE_COMMIT.
 Он проверяет ссылки частей, FILE_COMMIT → DIRECTORY и при необходимости
 атомарно записывает phase=complete в локальный intent. Не загружает новые
 CHUNK/FILE_COMMIT, не публикует ADD и не восстанавливает удалённое имя.
@@ -16,7 +16,7 @@ backlinks исправляются существующим протоколом
 размеры/имена и содержимое документа должны оставаться прежними.
 file_id может изменяться; при этом требуется побайтная сверка downloads.
 
-Затем commit и DIRECTORY перечитываются через служебные пересылки и сверяются
+Затем commit и (для create) DIRECTORY перечитываются через служебные пересылки и сверяются
 с подтверждёнными metadata/documents. Проверяется закреп SUPERBLOCK. Если
 commit.next_message=null, он устанавливается на канонический DIRECTORY ID.
 Если ссылка уже правильная, edit не отправляется. Другой ненулевой указатель
@@ -92,7 +92,7 @@ commit_navigation_repaired=false и local_phase=complete. Служебные с�
 существующего temp-файла, атомарный phase=complete и повтор после REMOVE без
 новых публикаций. Локально 114 passed/4 kernel skips; ASan/UBSan с detect_leaks=0
 из-за ptrace. Реальное непустое finalize требует ещё живой проверки на
-незавершённом intent. Replace/mkdir/unlink completion, недостающие загрузки,
+незавершённом intent. mkdir/unlink completion, недостающие загрузки,
 полный recovery/GC и автоматическая очистка service log остаются открытыми.
 
 ## Исправление проверки file_id (2026-11-16)
@@ -107,3 +107,52 @@ capture без file_unique_id поддержан через ту же content-п
 Несовпадение конкретного поля теперь указывается в ошибке, без секретов
 или полных file_id. Фактическая причина пользовательского расхождения ещё
 требует повторной живой проверки; старый общий текст её не доказывает.
+
+## Завершение замены (2026-11-16)
+
+--finalize теперь поддерживает put --replace. Публикация новой версии уже
+подтверждается FILE_COMMIT; нового ADD нет и финализатор его не создаёт.
+Проверяются staging, refs и свежие metadata всех частей/commit; необходимые
+backlinks исправляются прежним протоколом. Для replace next_message commit
+должен быть null. Другой указатель блокирует завершение, а не стирается.
+
+Локальная фиксация использует тот же atomic temp/fsync/rename/fsync и flock.
+Проверяется формат base refs; это не CAS и не запрет устаревшей базы.
+Смешение replacement intent с ADD/DIRECTORY fields отвергается.
+Сохраняются исходные object_id/version_id/operation_id, base refs и остальные
+поля. Записывается canonical file_commit_id и phase=complete;
+directory_message_id не создаётся. Для уже complete проверяются сохранённые
+refs, файл не переписывается. Ошибка проверки/неизвестный исход backlinks
+не приводит к local complete. Новых storage publications нет.
+
+В отчёт добавлен finalize_kind=create/replace. Для replace directory_ids=[],
+commit_navigation_repaired=false. Остальные finalized/intent_updated/phase
+и scope сохраняют прежний смысл. Историческую замену можно завершить даже
+после удаления имени: это не восстановление пути и не выбор текущей версии.
+
+Пользователь подтвердил create finalize с capture-011: commit37/CHUNK36/ADD38,
+local complete, intent_updated=false. Успех нового capture не доказывает
+повреждение capture-010; сравнение этих журналов не выполнялось.
+Новый безопасный тест завершённого replace intent, с прежним tgfs_net:
+
+```bash
+git pull --ff-only
+make
+./build/tgfs intent "${tgfs_net[@]}" \
+  --state-dir "$HOME/.local/state/tgfs/replace-documents-hello-001" \
+  --capture ./capture-011 \
+  --finalize
+```
+
+Ожидаются finalized=true, finalize_kind=replace, intent_updated=false,
+commit_navigation_repaired=false, directory_ids=[], local_phase=complete.
+Имя /documents/hello.txt останется удалённым. Новый scan не нужен; следующий
+свободный пользовательский журнал — capture-012.
+
+119 тестовых методов: добавлен сценарий replace completion с подслучаями
+обычной/пустой/multipart версии, lost commit response, неудачных backlinks,
+недостающего commit/части, конфликта navigation и повторного no-op без edit.
+Проверяются отсутствие ADD/новых data/commit, canonical ID в локальном intent
+и отсутствие directory_message_id. Локально 115 passed/4 kernel skips;
+ASan/UBSan с detect_leaks=0 из-за ptrace. Живое завершение replace ещё ожидает
+подтверждения. Загрузка недостающих частей и completion mkdir/unlink открыты.
