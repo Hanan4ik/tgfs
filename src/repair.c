@@ -35,17 +35,45 @@ static const cJSON *record_find(const cJSON *journal,const char *id)
 {
     const cJSON *r;cJSON_ArrayForEach(r,cJSON_GetObjectItemCaseSensitive(journal,"records")) if(same(json_string(r,"message_id"),id)) return r;return NULL;
 }
-static int message_matches(const cJSON *message,const cJSON *record,const char *chat,const char *id,tgfs_error *e)
+static unsigned char *document_bytes(tgfs_bot *bot,const char *id,size_t expected,size_t *size,tgfs_error *e)
 {
-    long long mid,cid,expected;uint64_t wanted;
+    cJSON *p=cJSON_CreateObject(),*out=NULL;
+    if(!p || !cJSON_AddStringToObject(p,"file_id",id)) {cJSON_Delete(p);fail(e,"out of memory");return NULL;}
+    if(call(bot,"getFile",p,&out,0,e)) return NULL;
+    const char *path=json_string(out,"file_path");long long length;
+    if(!path || !json_string(out,"file_id") || tgfs_bot_integer(out,"file_size",&length) || length!=(long long)expected) {
+        cJSON_Delete(out);fail(e,"fresh document getFile metadata differs");return NULL;
+    }
+    unsigned char *bytes=NULL;tgfs_bot_error b;
+    int rc=tgfs_bot_download(bot,path,&bytes,size,&b);cJSON_Delete(out);
+    if(rc) {fail(e,"%s [http=%ld api=%d]",b.message,b.http_status,b.api_code);return NULL;}
+    if(*size!=expected) {free(bytes);fail(e,"fresh document download size differs");return NULL;}
+    return bytes;
+}
+static int message_matches(tgfs_bot *bot,const cJSON *message,const cJSON *record,const char *chat,const char *id,tgfs_error *e)
+{
+    long long mid,cid,expected,asize,bsize;uint64_t wanted;
     const cJSON *c=cJSON_GetObjectItemCaseSensitive(message,"chat");
     const cJSON *a=cJSON_GetObjectItemCaseSensitive(message,"document"),*b=cJSON_GetObjectItemCaseSensitive(record,"document");
-    if(tgfs_bot_integer(message,"message_id",&mid) || decimal(id,&wanted) || mid!=(long long)wanted ||
-        tgfs_bot_channel_id(chat,&expected) || tgfs_bot_integer(c,"id",&cid) || cid!=expected ||
-        !same(json_string(c,"type"),"channel") || !same(json_string(a,"file_id"),json_string(b,"file_id")) ||
-        !same(json_string(a,"file_name"),json_string(b,"file_name")) ||
-        !cJSON_Compare(cJSON_GetObjectItemCaseSensitive(a,"file_size"),cJSON_GetObjectItemCaseSensitive(b,"file_size"),1))
-        return fail(e,"fresh message/document disagrees with capture");
+    if(tgfs_bot_integer(message,"message_id",&mid) || decimal(id,&wanted) || mid!=(long long)wanted)
+        return fail(e,"fresh message_id differs for expected message %s",id);
+    if(tgfs_bot_channel_id(chat,&expected) || tgfs_bot_integer(c,"id",&cid) || cid!=expected || !same(json_string(c,"type"),"channel"))
+        return fail(e,"fresh chat identity differs for message %s",id);
+    if(!same(json_string(a,"file_name"),json_string(b,"file_name"))) return fail(e,"fresh document.file_name differs for message %s",id);
+    if(tgfs_bot_integer(a,"file_size",&asize) || tgfs_bot_integer(b,"file_size",&bsize) || asize<0 || asize!=bsize || asize>TGFS_MAX_CHUNK)
+        return fail(e,"fresh document.file_size differs for message %s",id);
+    const char *aid=json_string(a,"file_id"),*bid=json_string(b,"file_id");
+    const char *au=json_string(a,"file_unique_id"),*bu=json_string(b,"file_unique_id");
+    if(!aid || !*aid || !bid || !*bid) return fail(e,"fresh document.file_id missing for message %s",id);
+    if(au && bu && !same(au,bu)) return fail(e,"fresh document.file_unique_id differs for message %s",id);
+    if(!same(aid,bid)) {
+        size_t an=0,bn=0;unsigned char *ab=document_bytes(bot,aid,(size_t)asize,&an,e);
+        if(!ab) return -1;
+        unsigned char *bb=document_bytes(bot,bid,(size_t)bsize,&bn,e);
+        if(!bb) {free(ab);return -1;}
+        int equal=an==bn && !memcmp(ab,bb,an);free(ab);free(bb);
+        if(!equal) return fail(e,"fresh document bytes differ for message %s",id);
+    }
     return 0;
 }
 static cJSON *fresh_caption(tgfs_bot *bot,const cJSON *journal,const cJSON *record,int fd,tgfs_error *e)
@@ -67,14 +95,8 @@ static cJSON *fresh_caption(tgfs_bot *bot,const cJSON *journal,const cJSON *reco
         tgfs_bot_integer(cJSON_GetObjectItemCaseSensitive(origin,"chat"),"id",&origin_chat) || origin_chat!=storage_id) {fail(e,"repair forward origin mismatch");goto cleanup;}
     const char *raw=json_string(out,"caption");
     if(raw) caption=json_parse_bytes((const unsigned char *)raw,strlen(raw),e);else fail(e,"fresh caption missing");
-    /* Forwarded Message has a service identity; compare the immutable document separately. */
-    cJSON *source=cJSON_Duplicate(out,1);
-    if(!source) {cJSON_Delete(caption);caption=NULL;fail(e,"out of memory");goto cleanup;}
-    cJSON_ReplaceItemInObjectCaseSensitive(source,"message_id",cJSON_CreateNumber((double)mid));
-    cJSON *chat=cJSON_GetObjectItemCaseSensitive(source,"chat");
-    cJSON_ReplaceItemInObjectCaseSensitive(chat,"id",cJSON_CreateNumber((double)storage_id));
-    if(message_matches(source,record,storage,id,e)) {cJSON_Delete(caption);caption=NULL;}
-    cJSON_Delete(source);
+    if(message_matches(bot,out,record,service,copy,e)) {cJSON_Delete(caption);caption=NULL;}
+
 cleanup:
     cJSON_Delete(out);out=NULL;p=params(service);
     if(!p || !cJSON_AddNumberToObject(p,"message_id",(double)copy_id)) {cJSON_Delete(p);cJSON_Delete(caption);caption=NULL;fail(e,"out of memory");goto done;}
@@ -138,7 +160,10 @@ int repair_backlinks(tgfs_bot *bot,const cJSON *journal,const cJSON *intent,cJSO
         if(!text || !p || !cJSON_AddNumberToObject(p,"message_id",(double)mid) || !cJSON_AddStringToObject(p,"caption",text)) {free(text);cJSON_Delete(p);cJSON_Delete(v);fail(e,"out of memory");goto done;}
         if(log_event(fd,"edit_pending",id,e)) {free(text);cJSON_Delete(p);cJSON_Delete(v);goto done;}
         int edited=call(bot,"editMessageCaption",p,&out,1,e);
-        if(!edited && (message_matches(out,record_find(journal,id),json_string(journal,"storage_chat_id"),id,e) || !same(json_string(out,"caption"),text))) edited=fail(e,"repair edit response mismatch; outcome may be unknown");
+        if(!edited) {
+            if(message_matches(bot,out,record_find(journal,id),json_string(journal,"storage_chat_id"),id,e)) edited=-1;
+            else if(!same(json_string(out,"caption"),text)) edited=fail(e,"repair edit caption mismatch; outcome may be unknown");
+        }
         free(text);cJSON_Delete(out);
         if(edited || log_event(fd,"edit_confirmed",id,e)) {cJSON_Delete(v);goto done;}
         if(!cJSON_AddItemToArray(applied,v)) {cJSON_Delete(v);fail(e,"out of memory");goto done;}
@@ -343,7 +368,10 @@ int finalize_put(tgfs_bot *bot,const char *state,const cJSON *journal,const cJSO
         }
         if(log_event(logfd,"commit_navigation_pending",commit_id,e)) {free(raw);cJSON_Delete(p);cJSON_Delete(commit);return -1;}
         int rc=call(bot,"editMessageCaption",p,&out,1,e);
-        if(!rc && (message_matches(out,cr,json_string(journal,"storage_chat_id"),commit_id,e) || !same(json_string(out,"caption"),raw))) rc=fail(e,"commit edit response mismatch; outcome may be unknown");
+        if(!rc) {
+            if(message_matches(bot,out,cr,json_string(journal,"storage_chat_id"),commit_id,e)) rc=-1;
+            else if(!same(json_string(out,"caption"),raw)) rc=fail(e,"commit edit caption mismatch; outcome may be unknown");
+        }
         free(raw);cJSON_Delete(out);if(rc || log_event(logfd,"commit_navigation_confirmed",commit_id,e)) {cJSON_Delete(commit);return -1;}
     }
     cJSON_Delete(commit);
