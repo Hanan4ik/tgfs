@@ -166,3 +166,16 @@ already_observed, без повторной публикации. Добавле
 с lost edit/repeat/empty/conflict/live drift/temp/REMOVE. Следующий живой тест —
 тот же create state/capture-010: finalized=true, intent_updated=false.
 Полное resume и завершение остальных типов намерений остаются открытыми.
+
+## Проверка идентичности пересланного документа (2026-11-16)
+
+Живой finalize остановился на общем fresh message/document mismatch. Найдено
+некорректное требование равенства file_id: Bot API допускает несколько валидных
+ID одного файла. Конкретное поле старое сообщение ошибки не сохраняло.
+Теперь alternate file_id проверяется скачиванием и побайтной сверкой с
+документом из capture; конфликт file_unique_id/имени/размера/bytes блокирует
+изменения. Добавлены field-specific ошибки без значений token/file_id.
+Пересланная копия проверяется по собственному service/copy ID и forward_origin,
+без подмены chat/message ID в локальном объекте. 118 методов с alias/legacy/
+corruption/unique-conflict регрессиями. После обновления повторить --finalize
+на том же state/capture-010, не удаляя intent или recovery-log.

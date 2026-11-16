@@ -51,7 +51,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mid=s.next;s.next+=1
             fid='file_'+str(mid);s.files[fid]=raw
             msg=dict(message_id=mid,chat=dict(id=STORAGE,type='channel'),caption=caption,
-                document=dict(file_id=fid,file_name=filename,file_size=len(raw)))
+                document=dict(file_id=fid,file_unique_id='unique_'+fid,file_name=filename,file_size=len(raw)))
             s.messages[mid]=msg;s.sent.append(kind)
             if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT') or (s.mode=='unlink-lost' and intent.get('kind')=='unlink') or s.mode=='resume-lost':
                 self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
@@ -84,6 +84,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg=copy.deepcopy(s.messages[p['message_id']]);msg['message_id']=s.copy_id;s.copy_id+=1
             msg['chat']=dict(id=SERVICE,type='channel')
             msg['forward_origin']=dict(type='channel',chat=dict(id=STORAGE,type='channel'),message_id=p['message_id'])
+            if s.mode in ('file-alias','file-alias-missing-unique','file-alias-corrupt','file-alias-unique-conflict'):
+                doc=msg['document'];old=doc['file_id'];alias='alias_'+old
+                s.files[alias]=(b'X'*len(s.files[old])) if s.mode=='file-alias-corrupt' else s.files[old]
+                doc['file_id']=alias
+                if s.mode!='file-alias-missing-unique': doc['file_unique_id']='unique_'+old
+                else: doc.pop('file_unique_id',None)
+                if s.mode=='file-alias-unique-conflict': doc['file_unique_id']='different'
             if s.mode=='repair-origin': msg['forward_origin']['message_id']+=1
             return self.reply(msg)
         if method=='getFile':
@@ -168,18 +175,28 @@ class Put(unittest.TestCase):
                             if finalize_case=='conflict':
                                 cid=int(json.loads(original_intent)['file_commit_id']);bad=json.loads(s.messages[cid]['caption'])
                                 bad['next_message']='99999';s.messages[cid]['caption']=json.dumps(bad)
+                            if finalize_case in ('alias','alias-legacy','alias-corrupt','alias-unique'):
+                                for message in s.messages.values():
+                                    if 'document' in message: message['document']['file_unique_id']='unique_'+message['document']['file_id']
                             if finalize_case=='chunk':
                                 part_id=int(json.loads(original_intent)['parts'][0]['message_id']);bad=json.loads(s.messages[part_id]['caption'])
                                 bad['part_sha256']='0'*64;s.messages[part_id]['caption']=json.dumps(bad)
                             if finalize_case=='local':
                                 temp=state/'intent.finalize.tmp';temp.write_text('preserve');temp.chmod(0o600)
-                            s.mode='repair-lost-edit' if finalize_case=='lost' else 'ok'
+                            if finalize_case=='alias-capture':
+                                captured=json.loads((fresh/'journal.json').read_text())
+                                for record in captured['records']: record.get('document',{}).pop('file_unique_id',None)
+                                (fresh/'journal.json').write_text(json.dumps(captured))
+                            s.mode={'alias-capture':'file-alias','lost':'repair-lost-edit','alias':'file-alias','alias-legacy':'file-alias-missing-unique',
+                                'alias-corrupt':'file-alias-corrupt','alias-unique':'file-alias-unique-conflict'}.get(finalize_case,'ok')
                             calls=len(s.calls);result=run(finalize_command)
-                            self.assertEqual(result.returncode,0 if finalize_case=='ok' else 1,result.stderr)
+                            self.assertEqual(result.returncode,0 if finalize_case in ('ok','alias','alias-legacy','alias-capture') else 1,result.stderr)
                             s.mode='ok'
-                            if finalize_case in ('conflict','local','chunk'):
+                            if finalize_case in ('conflict','local','chunk','alias-corrupt','alias-unique'):
+                                if finalize_case=='alias-corrupt': self.assertIn(b'document bytes differ',result.stderr)
+                                if finalize_case=='alias-unique': self.assertIn(b'document.file_unique_id',result.stderr)
                                 self.assertEqual(s.intent.read_bytes(),original_intent)
-                                if finalize_case in ('conflict','chunk'): self.assertNotIn('editMessageCaption',s.calls[calls:])
+                                if finalize_case in ('conflict','chunk','alias-corrupt','alias-unique'): self.assertNotIn('editMessageCaption',s.calls[calls:])
                                 if finalize_case=='local': self.assertEqual(temp.read_text(),'preserve')
                                 return
                             if finalize_case=='lost':
@@ -593,7 +610,7 @@ class Put(unittest.TestCase):
             finally:
                 s.shutdown();s.server_close();t.join()
     def test_finalize_put(self):
-        for mode in ('ok','lost','conflict','local','chunk'):
+        for mode in ('ok','lost','conflict','local','chunk','alias','alias-legacy','alias-capture','alias-corrupt','alias-unique'):
             with self.subTest(mode=mode): self.exercise(mode='edit',recover=True,finalize_case=mode)
     def test_finalize_empty(self): self.exercise(b'',mode='create-pin-after-commit',recover=True,finalize_case='ok')
     def test_resume_directory(self):
