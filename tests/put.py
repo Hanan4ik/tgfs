@@ -270,7 +270,7 @@ class Put(unittest.TestCase):
                         self.assertEqual(listing.stdout,b'hello.txt\nnotes.txt\n')
             finally:
                 s.shutdown();s.server_close();t.join()
-    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok',diagnose=False,repair_case=None,finish_replace=None):
+    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok',diagnose=False,repair_case=None,finish_replace=None,metadata_finish=False):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -313,6 +313,28 @@ class Put(unittest.TestCase):
                 self.assertFalse(report['resumed']);self.assertEqual((state/'intent.json').read_bytes(),before)
                 self.assertTrue(set(s.calls[start:])<={'getChat','getFile'})
                 return report
+            def finish_metadata(state,cap,expected=0):
+                original=(state/'intent.json').read_bytes();count=len(s.sent)
+                command=['intent','--finalize','--state-dir',str(state),'--capture',str(cap),'--token-file',str(token)]
+                current=json.loads(original)
+                if metadata_finish=='conflict' and current['kind']=='mkdir':
+                    mid=int(current['child_message_id']);old=s.messages[mid]['caption'];bad=json.loads(old)
+                    bad['next_message']='999999';s.messages[mid]['caption']=json.dumps(bad)
+                    run(command,code=1);s.messages[mid]['caption']=old
+                    self.assertEqual((state/'intent.json').read_bytes(),original);return
+                if metadata_finish=='lost' and current['kind']=='mkdir' and current['phase']!='complete' and not expected:
+                    s.mode='repair-lost-edit';run(command,code=1);s.mode='ok'
+                    self.assertEqual((state/'intent.json').read_bytes(),original)
+                    calls=len(s.calls);run(command);self.assertNotIn('editMessageCaption',s.calls[calls:])
+                result=run(command,code=expected);self.assertEqual(len(s.sent),count)
+                if expected:
+                    self.assertEqual((state/'intent.json').read_bytes(),original);return
+                report=json.loads(result.stdout);self.assertTrue(report['finalized'])
+                current=json.loads((state/'intent.json').read_text());self.assertEqual(current['phase'],'complete')
+                self.assertEqual(report['finalize_kind'],current['kind']);self.assertNotIn('file_commit_id',current)
+                persisted=(state/'intent.json').read_bytes();calls=len(s.calls)
+                again=json.loads(run(command).stdout);self.assertFalse(again['intent_updated'])
+                self.assertNotIn('editMessageCaption',s.calls[calls:]);self.assertEqual((state/'intent.json').read_bytes(),persisted)
             try:
                 run(['intent','--help']);self.assertEqual(s.calls,[])
                 run(['mkdir','--help']);self.assertEqual(s.calls,[])
@@ -327,6 +349,10 @@ class Put(unittest.TestCase):
                     before=len(s.sent);saved=s.intent.parent
                     write('mkdir',capture,'--path','/documents',state=saved,code=1)
                     self.assertEqual(len(s.sent),before)
+                    if metadata_finish:
+                        s.mode='ok';cap=scan()
+                        finish_metadata(saved,cap,0 if mode in ('mkdir-lost-parent','mkdir-edit') else 1)
+                        return
                     if mode in ('mkdir-lost-parent','mkdir-edit'):
                         s.mode='ok';fresh=scan();self.assertEqual(read(fresh,'ls','/'),b'documents\n')
                         self.assertEqual(read(fresh,'ls','/documents'),b'')
@@ -548,6 +574,7 @@ class Put(unittest.TestCase):
                     inject_ops([copy.deepcopy(original_add)]) # Retry of the old ADD cannot resurrect the name.
                     final=scan()
                     if diagnose: check_intent(saved,final,'not_observed' if unlink_mode in ('unlink-pin','unlink-apierror') else 'confirmed')
+                    if metadata_finish: finish_metadata(saved,final,1 if unlink_mode in ('unlink-pin','unlink-apierror') else 0)
                     file_exists=unlink_mode in ('unlink-pin','unlink-apierror','concurrent')
                     listing=read(final,'ls','/documents/sub')
                     self.assertEqual(b'multi.txt\n' in listing,file_exists)
@@ -603,6 +630,9 @@ class Put(unittest.TestCase):
                     result=run(['intent','--state-dir',str(state_file.parent),'--capture',str(final),'--token-file',str(token)],code=1)
                     self.assertIn(b'CHUNK',result.stderr);s.files[fid]=original_chunk
 
+                if metadata_finish and not unlink:
+                    for candidate in root.glob('state-*/intent.json'):
+                        if json.loads(candidate.read_text()).get('kind')=='mkdir': finish_metadata(candidate.parent,final)
                 # Parent documents stay append-only; only the new child caption was edited.
 
                 original=json.loads(s.messages[int(directory['child_message_id'])]['caption'])
@@ -634,6 +664,15 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
+    def test_finalize_mkdir(self):
+        self.directories(metadata_finish=True)
+        self.directories(metadata_finish='conflict')
+        self.directories(mode='mkdir-edit',metadata_finish='lost')
+        for mode in ('mkdir-lost-child','mkdir-lost-parent','mkdir-edit','mkdir-pin'):
+            with self.subTest(mode=mode): self.directories(mode=mode,metadata_finish=True)
+    def test_finalize_unlink(self):
+        for mode in ('ok','unlink-lost','unlink-response','unlink-apierror','unlink-pin'):
+            with self.subTest(mode=mode): self.directories(unlink=True,unlink_mode=mode,metadata_finish=True)
     def test_finalize_replace(self):
         for mode in ('ok','replace-edit','replace-lost-commit','replace-lost-chunk','replace-pin'):
             with self.subTest(mode=mode): self.directories(replace=True,replace_mode=mode,diagnose=True,finish_replace='ok')

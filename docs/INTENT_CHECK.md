@@ -155,3 +155,9 @@ next_step=verified_in_capture. publication=confirmed относится к пр�
 Добавлен отдельный [--finalize](FINALIZE_PUT.md): живые проверки всех частей,
 ремонт FILE_COMMIT → подтверждённый ADD и атомарная фиксация local complete.
 Это не универсальный resume; флаги изменяющих режимов взаимоисключающие.
+
+## Metadata completion
+
+[--finalize](FINALIZE_METADATA.md) поддерживает также подтверждённые mkdir и
+unlink: свежие документы, навигация child→ADD и atomic local complete.
+Неподтверждённые публикации не отправляются повторно.

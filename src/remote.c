@@ -549,7 +549,7 @@ void tgfs_intent_help(FILE *stream)
 {
     fputs("usage: tgfs intent --state-dir DIRECTORY --capture DIRECTORY --token-file PATH [options]\n"
           "Reconcile put/mkdir/unlink intent with a newer completed capture; default is read-only.\n"
-          "  --finalize               Verify put publication, repair supported navigation, persist complete.\n"
+          "  --finalize               Verify put/mkdir/unlink publication, repair supported navigation, persist complete.\n"
           "  --resume-directory       Resume never-attempted ADD for a verified new-file put.\n"
           "  --repair-backlinks       Explicitly repair verified CHUNK navigation; logs/locks state-dir.\n"
           "  --state-dir DIRECTORY    Existing private directory containing intent.json.\n"
@@ -634,7 +634,8 @@ int tgfs_intent_main(int argc,char **argv)
     if(intent_data_plan(&r,state,intent,journal,report,&e)) goto done;
     if(repair && repair_backlinks(r.bot,journal,intent,report,log_fd,&e)) goto done;
     if(resume && resume_directory(r.bot,fs,journal,intent,report,log_fd,&e)) goto done;
-    if(finalize && finalize_put(r.bot,state,journal,intent,report,log_fd,&e)) goto done;
+    if(finalize && (same(kind,"put")?finalize_put(r.bot,state,journal,intent,report,log_fd,&e):
+        finalize_metadata(r.bot,state,journal,intent,report,log_fd,&e))) goto done;
     char *raw=cJSON_PrintUnformatted(report);
     if(!raw) {fail(&e,"out of memory");goto done;}
     rc=puts(raw)<0?1:0;free(raw);
