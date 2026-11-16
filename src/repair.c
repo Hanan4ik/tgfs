@@ -284,18 +284,20 @@ static int finish_local_intent(const char *state,const cJSON *intent,const char 
     if(dir<0) return fail(e,"cannot reopen intent directory");
     cJSON *current=NULL,*finished=NULL;char *raw=NULL;int fd=-1,rc=-1;
     if(fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {fail(e,"intent directory changed permissions");goto done;}
+    const char *kind=json_string(intent,"kind");
+    const char *primary=same(kind,"put")?"file_commit_id":same(kind,"mkdir")?"child_message_id":NULL;
     current=json_load_at(dir,"intent.json",e);
     if(!current || !cJSON_Compare(current,intent,1)) {fail(e,"intent changed during finalization");goto done;}
     if(same(json_string(intent,"phase"),"complete")) {
-        if(!same(json_string(intent,"file_commit_id"),commit_id) || (directory_id?!same(json_string(intent,"directory_message_id"),directory_id):cJSON_HasObjectItem(intent,"directory_message_id"))) fail(e,"complete intent stored IDs differ from canonical publications");
+        if((primary && !same(json_string(intent,primary),commit_id)) || (directory_id?!same(json_string(intent,"directory_message_id"),directory_id):cJSON_HasObjectItem(intent,"directory_message_id"))) fail(e,"complete intent stored IDs differ from canonical publications");
         else if(fsync(dir)) fail(e,"cannot sync intent directory");else rc=0;
         goto done;
     }
     finished=cJSON_Duplicate(intent,1);if(!finished) {fail(e,"out of memory");goto done;}
     cJSON_DeleteItemFromObjectCaseSensitive(finished,"phase");
-    cJSON_DeleteItemFromObjectCaseSensitive(finished,"file_commit_id");
+    if(primary) cJSON_DeleteItemFromObjectCaseSensitive(finished,primary);
     cJSON_DeleteItemFromObjectCaseSensitive(finished,"directory_message_id");
-    if(!cJSON_AddStringToObject(finished,"phase","complete") || !cJSON_AddStringToObject(finished,"file_commit_id",commit_id) ||
+    if(!cJSON_AddStringToObject(finished,"phase","complete") || (primary && !cJSON_AddStringToObject(finished,primary,commit_id)) ||
         (directory_id && !cJSON_AddStringToObject(finished,"directory_message_id",directory_id))) {fail(e,"out of memory");goto done;}
     raw=cJSON_PrintUnformatted(finished);if(!raw) {fail(e,"out of memory");goto done;}
     fd=openat(dir,"intent.finalize.tmp",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
@@ -385,6 +387,86 @@ int finalize_put(tgfs_bot *bot,const char *state,const cJSON *journal,const cJSO
     if(!cJSON_AddStringToObject(report,"finalize_kind",replacing?"replace":"create") ||
         !cJSON_AddBoolToObject(report,"finalized",1) || !cJSON_AddBoolToObject(report,"intent_updated",updated) ||
         !cJSON_AddBoolToObject(report,"commit_navigation_repaired",repaired)) return fail(e,"out of memory");
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"scope",cJSON_CreateString("capture_plus_live_verification"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"local_phase",cJSON_CreateString("complete"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("intent_complete"));
+    return 0;
+}
+
+int finalize_metadata(tgfs_bot *bot,const char *state,const cJSON *journal,const cJSON *intent,cJSON *report,int logfd,tgfs_error *e)
+{
+    const char *kind=json_string(intent,"kind");int mkdir=same(kind,"mkdir");
+    const cJSON *dirs=cJSON_GetObjectItemCaseSensitive(report,"directory_ids"),*children=cJSON_GetObjectItemCaseSensitive(report,"child_ids");
+    if((!mkdir && !same(kind,"unlink")) || !cJSON_GetArraySize(dirs) || (mkdir && !cJSON_GetArraySize(children)))
+        return fail(e,"metadata finalize requires confirmed publications");
+    const cJSON *saved=cJSON_GetObjectItemCaseSensitive(intent,"directory_caption");
+    const cJSON *body=cJSON_GetObjectItemCaseSensitive(intent,"directory_document"),*ops=cJSON_GetObjectItemCaseSensitive(body,"operations");
+    const cJSON *op=cJSON_GetArrayItem(ops,0);size_t format;
+    if(directory_operations_valid(body,e)) return -1;
+    if(cJSON_GetArraySize(ops)!=1 || !same(json_string(op,"action"),mkdir?"ADD":"REMOVE") ||
+        !same(json_string(op,"operation_id"),json_string(intent,mkdir?"add_operation_id":"remove_operation_id")) ||
+        !same(json_string(saved,"object_id"),json_string(intent,"parent_id")) ||
+        !same(json_string(saved,"type"),"DIRECTORY") || !same(json_string(saved,"magic"),"TGFS") ||
+        json_count(saved,"format_version",&format) || format!=1 ||
+        (mkdir?!same(json_string(op,"object_id"),json_string(intent,"object_id")):
+        !cJSON_Compare(cJSON_GetObjectItemCaseSensitive(op,"observed_adds"),cJSON_GetObjectItemCaseSensitive(intent,"observed_adds"),1)))
+        return fail(e,"metadata intent fields disagree with saved operation");
+    const char *saved_path=json_string(intent,"path");char path[4097];
+    if(!saved_path || saved_path[0]!='/' || strlen(saved_path)>4096) return fail(e,"invalid metadata intent path");
+    memcpy(path,saved_path,strlen(saved_path)+1);size_t length=strlen(path);
+    while(mkdir && length>1 && path[length-1]=='/') path[--length]=0;
+    if(!same(strrchr(path,'/')+1,json_string(op,"name"))) return fail(e,"metadata intent path disagrees with operation name");
+    if(mkdir) {
+        const cJSON *cc=cJSON_GetObjectItemCaseSensitive(intent,"child_caption");
+        const cJSON *cb=cJSON_GetObjectItemCaseSensitive(intent,"child_document");
+        if(!same(json_string(cc,"object_id"),json_string(intent,"object_id")) ||
+            !same(json_string(cc,"parent_id"),json_string(intent,"parent_id")) ||
+            !same(json_string(cc,"magic"),"TGFS") || !same(json_string(cc,"type"),"DIRECTORY") ||
+            json_count(cc,"format_version",&format) || format!=1 || !cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(cc,"next_message")) ||
+            directory_operations_valid(cb,e) || cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(cb,"operations")))
+            return fail(e,"saved child DIRECTORY disagrees with mkdir intent");
+    }
+    const char *directory_id=cJSON_GetArrayItem(dirs,0)->valuestring;
+    const char *child_id=mkdir?cJSON_GetArrayItem(children,0)->valuestring:NULL;
+    uint64_t did,cid=0;decimal(directory_id,&did);if(child_id) decimal(child_id,&cid);
+    if(mkdir && cid>=did) return fail(e,"mkdir ADD precedes child DIRECTORY");
+    const cJSON *dr=record_find(journal,directory_id),*cr=mkdir?record_find(journal,child_id):NULL;
+    cJSON *directory=fresh_caption(bot,journal,dr,logfd,e);if(!directory) return -1;
+    int good=json_semantic_equal(directory,cJSON_GetObjectItemCaseSensitive(dr,"record")) &&
+        cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(directory,"next_message"));cJSON_Delete(directory);
+    if(!good) return fail(e,"fresh operation DIRECTORY metadata or navigation differs");
+    cJSON *child=mkdir?fresh_caption(bot,journal,cr,logfd,e):NULL;if(mkdir && !child) return -1;
+    if(child && (!json_semantic_equal(child,cJSON_GetObjectItemCaseSensitive(cr,"record")) ||
+        (!cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(child,"next_message")) && !same(json_string(child,"next_message"),directory_id)))) {
+        cJSON_Delete(child);return fail(e,"fresh child DIRECTORY metadata or navigation conflicts");
+    }
+    cJSON *p=params(json_string(journal,"storage_chat_id")),*out=NULL;
+    if(call(bot,"getChat",p,&out,0,e)) {cJSON_Delete(child);return -1;}
+    const cJSON *pin=cJSON_GetObjectItemCaseSensitive(out,"pinned_message");const char *text=json_string(pin,"text");
+    cJSON *header=text?json_parse_bytes((const unsigned char *)text,strlen(text),e):NULL;
+    uint64_t start;long long mid,channel,actual,pin_channel;
+    good=header && !tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&channel) &&
+        !tgfs_bot_integer(out,"id",&actual) && actual==channel && same(json_string(out,"type"),"channel") &&
+        !tgfs_bot_integer(cJSON_GetObjectItemCaseSensitive(pin,"chat"),"id",&pin_channel) && pin_channel==channel &&
+        !json_decimal(cJSON_GetObjectItemCaseSensitive(journal,"superblock"),"start_id",&start) &&
+        !tgfs_bot_integer(pin,"message_id",&mid) && mid==(long long)start && json_semantic_equal(header,cJSON_GetObjectItemCaseSensitive(journal,"superblock"));
+    cJSON_Delete(header);cJSON_Delete(out);if(!good) {cJSON_Delete(child);return fail(e,"pinned SUPERBLOCK differs from capture");}
+    int repaired=mkdir && !same(json_string(child,"next_message"),directory_id);
+    if(repaired) {
+        cJSON_DeleteItemFromObjectCaseSensitive(child,"next_message");
+        if(!cJSON_AddStringToObject(child,"next_message",directory_id)) {cJSON_Delete(child);return fail(e,"out of memory");}
+        char *raw=cJSON_PrintUnformatted(child);p=params(json_string(journal,"storage_chat_id"));out=NULL;
+        if(!raw || !p || !cJSON_AddNumberToObject(p,"message_id",(double)cid) || !cJSON_AddStringToObject(p,"caption",raw)) {free(raw);cJSON_Delete(p);cJSON_Delete(child);return fail(e,"out of memory");}
+        if(log_event(logfd,"child_navigation_pending",child_id,e)) {free(raw);cJSON_Delete(p);cJSON_Delete(child);return -1;}
+        int rc=call(bot,"editMessageCaption",p,&out,1,e);
+        if(!rc && message_matches(bot,out,cr,json_string(journal,"storage_chat_id"),child_id,e)) rc=-1;
+        if(!rc && !same(json_string(out,"caption"),raw)) rc=fail(e,"child edit response mismatch; outcome may be unknown");
+        free(raw);cJSON_Delete(out);if(rc || log_event(logfd,"child_navigation_confirmed",child_id,e)) {cJSON_Delete(child);return -1;}
+    }
+    cJSON_Delete(child);
+    int updated=finish_local_intent(state,intent,child_id?child_id:directory_id,directory_id,logfd,e);if(updated<0) return -1;
+    if(!cJSON_AddStringToObject(report,"finalize_kind",kind) || !cJSON_AddBoolToObject(report,"finalized",1) ||
+        !cJSON_AddBoolToObject(report,"intent_updated",updated) || !cJSON_AddBoolToObject(report,"child_navigation_repaired",repaired)) return fail(e,"out of memory");
     cJSON_ReplaceItemInObjectCaseSensitive(report,"scope",cJSON_CreateString("capture_plus_live_verification"));
     cJSON_ReplaceItemInObjectCaseSensitive(report,"local_phase",cJSON_CreateString("complete"));
     cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("intent_complete"));

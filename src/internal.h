@@ -51,4 +51,5 @@ int remote_unlink_target(struct tgfs_bot *bot, const cJSON *journal, const char 
 int repair_backlinks(struct tgfs_bot *bot, const cJSON *journal, const cJSON *intent, cJSON *report, int log_fd, tgfs_error *e);
 int resume_directory(struct tgfs_bot *bot, tgfs *fs, const cJSON *journal, const cJSON *intent, cJSON *report, int log_fd, tgfs_error *e);
 int finalize_put(struct tgfs_bot *bot, const char *state, const cJSON *journal, const cJSON *intent, cJSON *report, int logfd, tgfs_error *e);
+int finalize_metadata(struct tgfs_bot *bot, const char *state, const cJSON *journal, const cJSON *intent, cJSON *report, int logfd, tgfs_error *e);
 #endif

@@ -190,3 +190,17 @@ atomic local complete без directory_message_id/нового ADD. 119 тест
 повторы/empty/multipart/lost commit/backlinks/missing/conflict. Следующий
 живой тест — replace-documents-hello-001 с capture-011. Следующий свободный
 scan capture-012; полное resume и mkdir/unlink completion открыты.
+
+## Завершение mkdir/unlink (2026-11-16)
+
+Пользователь подтвердил replace finalize на capture-011: commit41/part40,
+complete/no-op. Добавлен [metadata finalize](FINALIZE_METADATA.md) для mkdir
+и unlink: свежая проверка подтверждённых документов, child→ADD navigation,
+atomic complete с нужными refs без file_commit_id. Неотправленные/неизвестные
+публикации не создаются. 121 тест: missing/lost/repair/conflict/repeat.
+Следующие живые no-op проверки — mkdir-documents-001 и unlink-documents-hello-001
+с capture-011. Следующий scan capture-012; ранний resume/cleanup ещё открыты.
+
+Порядок этапов предлагает ассистент по зависимостям кода и нашим договорённостям;
+STATE/KANBAN и #11 фиксируют выполненное/открытое, не являются внешним готовым
+планом реализации. Пользовательский приоритет имеет преимущество.
