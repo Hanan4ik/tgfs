@@ -549,7 +549,7 @@ void tgfs_intent_help(FILE *stream)
 {
     fputs("usage: tgfs intent --state-dir DIRECTORY --capture DIRECTORY --token-file PATH [options]\n"
           "Reconcile put/mkdir/unlink intent with a newer completed capture; default is read-only.\n"
-          "  --finalize               Verify create/ADD, repair commit navigation, persist complete.\n"
+          "  --finalize               Verify put publication, repair supported navigation, persist complete.\n"
           "  --resume-directory       Resume never-attempted ADD for a verified new-file put.\n"
           "  --repair-backlinks       Explicitly repair verified CHUNK navigation; logs/locks state-dir.\n"
           "  --state-dir DIRECTORY    Existing private directory containing intent.json.\n"

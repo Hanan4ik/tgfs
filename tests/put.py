@@ -270,7 +270,7 @@ class Put(unittest.TestCase):
                         self.assertEqual(listing.stdout,b'hello.txt\nnotes.txt\n')
             finally:
                 s.shutdown();s.server_close();t.join()
-    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok',diagnose=False,repair_case=None):
+    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok',diagnose=False,repair_case=None,finish_replace=None):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -419,6 +419,31 @@ class Put(unittest.TestCase):
                             if replace_mode=='replace-edit': self.assertTrue(evidence['backlink_repairs'])
                             if replace_mode=='replace-lost-chunk': self.assertTrue(evidence['unobserved_part_indexes'])
                             if replace_mode=='replace-lost-commit': self.assertEqual(len(evidence['verified_chunk_ids']),len(updated['parts']))
+                        if finish_replace:
+                            before_state=s.intent.read_bytes();before_sent=list(s.sent)
+                            if finish_replace=='invalid':
+                                malformed=json.loads(before_state);malformed['add_operation_id']=str(uuid.uuid4())
+                                s.intent.write_text(json.dumps(malformed));before_state=s.intent.read_bytes()
+                            command=['intent','--finalize','--state-dir',str(state),'--capture',str(final),'--token-file',str(token)]
+                            if finish_replace=='conflict':
+                                cid=int(updated['file_commit_id']);changed=json.loads(s.messages[cid]['caption'])
+                                changed['next_message']='99999';s.messages[cid]['caption']=json.dumps(changed)
+                            expected=0 if replace_mode in ('ok','replace-edit','replace-lost-commit') and finish_replace not in ('conflict','invalid') else 1
+                            result=run(command,code=expected)
+                            self.assertEqual(s.sent,before_sent)
+                            if expected:
+                                self.assertEqual(s.intent.read_bytes(),before_state)
+                                if finish_replace in ('conflict','invalid'): return
+                            else:
+                                completed=json.loads(s.intent.read_text());evidence=json.loads(result.stdout)
+                                self.assertEqual(completed['phase'],'complete');self.assertNotIn('directory_message_id',completed)
+                                self.assertEqual(evidence['directory_ids'],[]);self.assertEqual(evidence['finalize_kind'],'replace')
+                                self.assertFalse(evidence['commit_navigation_repaired']);self.assertTrue(evidence['finalized'])
+                                persisted=s.intent.read_bytes();calls=len(s.calls)
+                                evidence=json.loads(run(command).stdout)
+                                self.assertFalse(evidence['intent_updated']);self.assertNotIn('editMessageCaption',s.calls[calls:])
+                                self.assertEqual(s.intent.read_bytes(),persisted)
+                                self.assertEqual(completed['file_commit_id'],evidence['commit_ids'][0])
                         if repair_case:
                             before_intent=(state/'intent.json').read_bytes();before_sent=len(s.sent)
                             command=['intent','--repair-backlinks','--state-dir',str(state),'--capture',str(final),'--token-file',str(token)]
@@ -609,6 +634,11 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
+    def test_finalize_replace(self):
+        for mode in ('ok','replace-edit','replace-lost-commit','replace-lost-chunk','replace-pin'):
+            with self.subTest(mode=mode): self.directories(replace=True,replace_mode=mode,diagnose=True,finish_replace='ok')
+        self.directories(replace=True,diagnose=True,finish_replace='conflict')
+        self.directories(replace=True,diagnose=True,finish_replace='invalid')
     def test_finalize_put(self):
         for mode in ('ok','lost','conflict','local','chunk','alias','alias-legacy','alias-capture','alias-corrupt','alias-unique'):
             with self.subTest(mode=mode): self.exercise(mode='edit',recover=True,finalize_case=mode)
