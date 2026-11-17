@@ -46,7 +46,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 assert 'directory_send_pending' in (s.intent.parent/'backlink-repair.log').read_text()
             else: assert intent['phase']==expected
             if intent.get('kind') not in ('mkdir','unlink'): assert (s.intent.parent/'data.bin').read_bytes()==s.input_data
-            if s.mode.startswith('reject-'):
+            if s.mode.startswith('reject-') and (not getattr(s,'reject_kind',None) or kind==s.reject_kind):
                 case=s.mode[7:];code=429 if case in ('429','badretry','no-retry') else 403 if case=='403' else 500 if case=='500' else 400
                 http=500 if case=='http500' else 403 if case=='mismatch' else code
                 error=dict(ok=False,error_code=code,description=TOKEN)
@@ -54,6 +54,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if case=='result': error['result']=dict(message_id=999)
                 if case=='429': error['parameters']=dict(retry_after=1)
                 if case=='badretry': error['parameters']=dict(retry_after='invalid')
+                if case=='log-write':
+                    # Fail the next journal append in the real C process, after its pending intent was saved.
+                    import resource
+                    limit=(s.intent.parent/'backlink-repair.log').stat().st_size+16
+                    resource.prlimit(s.client_pid,resource.RLIMIT_FSIZE,(limit,limit))
                 return self.reply(error=error,status=http)
             if (s.mode=='unlink-apierror' and intent.get('kind')=='unlink') or s.mode=='resume-apierror':
                 return self.reply(error=dict(ok=False,error_code=429,description=TOKEN,parameters=dict(retry_after=5)),status=429)
@@ -788,7 +793,7 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
-    def upload_recovery(self,case='ok',replace=False):
+    def upload_recovery(self,case='ok',replace=False,retry=None):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -803,7 +808,12 @@ class Put(unittest.TestCase):
             t=threading.Thread(target=s.serve_forever,kwargs=dict(poll_interval=.01),daemon=True);t.start()
             env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{s.server_port}')
             def run(args):
-                result=subprocess.run([BINARY,*args],env=env,capture_output=True,timeout=30)
+                process=subprocess.Popen([BINARY,*args],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                s.client_pid=process.pid
+                try: stdout,stderr=process.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill();process.communicate();raise
+                result=subprocess.CompletedProcess(process.args,process.returncode,stdout,stderr)
                 for text in (TOKEN,'AddressSanitizer','runtime error:'): self.assertNotIn(text,result.stderr.decode())
                 return result
             def scan(name):
@@ -844,10 +854,17 @@ class Put(unittest.TestCase):
                 if case=='staging': (state/'data.bin').write_bytes(b'XXXXXXXX')
                 if case=='log':
                     log=state/'backlink-repair.log';log.write_text('{broken');log.chmod(0o600)
+                if case=='legacy-log':
+                    log=state/'backlink-repair.log'
+                    log.write_text(json.dumps(dict(event='upload_chunk_pending',message_id='0'))+'\n');log.chmod(0o600)
                 before=list(s.sent);before_intent=s.intent.read_bytes()
                 s.mode={'lost-chunk':'upload-lost-chunk','lost-commit':'upload-lost-commit','response':'response',
                     'origin':'repair-origin','cleanup':'repair-cleanup','pin':'pin','reject':'resume-apierror'}.get(case,'ok')
                 cmd=['intent','--resume-upload','--state-dir',str(state),'--capture',str(cap),'--token-file',str(token)]
+                if retry:
+                    phase,reason=retry.split(':',1)
+                    self.retry_upload(run,scan,cmd,s,state,phase,reason,data,replace)
+                    return
                 result=run(cmd)
                 blocked=case in ('missing','commit-uncertain','duplicate','staging','log','origin','cleanup','pin')
                 uncertain=case in ('lost-chunk','lost-commit','response','reject')
@@ -885,8 +902,88 @@ class Put(unittest.TestCase):
                 self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,data)
             finally:
                 s.shutdown();s.server_close();t.join()
+    def retry_upload(self,run,scan,cmd,s,state,phase,case,data,replace):
+        s.reject_kind='CHUNK' if phase=='chunk' else 'FILE_COMMIT'
+        s.mode='reject-'+('400' if case in ('twice','then-lost','staging','manifest','wrong-op','orphan','bad-log','old-pending','missing-known','pin','origin','cleanup') else case)
+        result=run(cmd)
+        if case=='log-write':
+            self.assertNotEqual(result.returncode,0,result.stderr);before=list(s.sent)
+            s.mode='ok';cap=scan('after-log-failure');cmd[cmd.index('--capture')+1]=str(cap)
+            calls=len(s.calls);result=run(cmd);self.assertEqual(result.returncode,1,result.stderr)
+            self.assertNotIn('sendDocument',s.calls[calls:]);self.assertEqual(s.sent,before);return
+        self.assertEqual(result.returncode,1,result.stderr)
+        log=state/'backlink-repair.log';events=[json.loads(line) for line in log.read_text().splitlines()]
+        rejected=[event for event in events if event['event']=='upload_'+phase+'_rejected']
+        safe=case in ('400','403','429','twice','then-lost','staging','manifest','wrong-op','orphan','bad-log','old-pending','missing-known','pin','origin','cleanup')
+        self.assertEqual(bool(rejected),safe);before=list(s.sent)
+        saved=json.loads(s.intent.read_text());self.assertEqual(saved['phase'],phase+'_send_pending')
+        ids={key:saved[key] for key in ('object_id','version_id','operation_id')}
+        s.mode='ok';cap=scan('retry-capture');cmd[cmd.index('--capture')+1]=str(cap)
+        if case=='429':
+            calls=len(s.calls);result=run(cmd);self.assertEqual(result.returncode,1,result.stderr)
+            self.assertIn(b'cooldown',result.stderr);self.assertNotIn('sendDocument',s.calls[calls:])
+            time.sleep(max(0,int(rejected[-1]['retry_not_before'])-time.time()+1.05))
+        if case in ('staging','manifest','wrong-op','orphan','bad-log','old-pending','missing-known','pin','origin','cleanup'):
+            if case=='staging': (state/'data.bin').write_bytes(b'X'*len(data))
+            elif case=='manifest':
+                saved['commit_document']['unexpected']=True;s.intent.write_text(json.dumps(saved))
+            elif case=='wrong-op':
+                events[-1]['operation_id']=str(uuid.uuid4());log.write_text(''.join(json.dumps(event)+'\n' for event in events))
+            elif case=='orphan':
+                log.write_text(''.join(json.dumps(event)+'\n' for event in events if event['event']!='upload_'+phase+'_pending'))
+            elif case=='old-pending':
+                for event in events:
+                    if event['event']=='upload_'+phase+'_pending': event.pop('operation_id',None)
+                log.write_text(''.join(json.dumps(event)+'\n' for event in events))
+            elif case=='missing-known':
+                del s.messages[int(saved['parts'][0]['message_id'])]
+                cap=scan('missing-known');cmd[cmd.index('--capture')+1]=str(cap)
+            elif case in ('pin','origin','cleanup'): s.mode={'pin':'pin','origin':'repair-origin','cleanup':'repair-cleanup'}[case]
+            else: log.write_text(log.read_text()[:-8])
+            safe=False
+        if case=='twice':
+            s.mode='reject-400';result=run(cmd);self.assertEqual(result.returncode,1,result.stderr)
+            self.assertEqual(s.sent,before);s.mode='ok'
+        if case=='then-lost': s.mode='upload-lost-'+phase
+        calls=len(s.calls);result=run(cmd)
+        self.assertEqual(result.returncode,0 if safe and case!='then-lost' else 1,result.stderr)
+        if not safe:
+            self.assertNotIn('sendDocument',s.calls[calls:]);self.assertEqual(s.sent,before);return
+        self.assertEqual(s.sent.count('FILE_COMMIT'),before.count('FILE_COMMIT')+1 if case!='then-lost' or phase=='commit' else before.count('FILE_COMMIT'))
+        if phase=='commit': self.assertEqual(s.sent.count('CHUNK'),before.count('CHUNK'))
+        if case=='then-lost':
+            s.mode='ok';after=list(s.sent);result=run(cmd)
+            self.assertEqual(result.returncode,1,result.stderr);self.assertEqual(s.sent,after)
+            cap=scan('retry-lost');cmd[cmd.index('--capture')+1]=str(cap)
+            result=run(cmd);self.assertEqual(result.returncode,0,result.stderr)
+        current=[json.loads(message['caption']) for message in s.messages.values() if 'caption' in message and json.loads(message['caption']).get('version_id')==ids['version_id']]
+        self.assertEqual(sum(record['type']=='CHUNK' for record in current),(len(data)+2)//3)
+        self.assertEqual(sum(record['type']=='FILE_COMMIT' for record in current),1)
+        self.assertEqual({key:json.loads(s.intent.read_text())[key] for key in ids},ids)
+        cap=scan('retry-committed');cmd[cmd.index('--capture')+1]=str(cap)
+        result=run(cmd);self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['upload_resume'],'already_committed')
+        if not replace:
+            cmd[1]='--resume-directory';result=run(cmd);self.assertEqual(result.returncode,0,result.stderr)
+            cap=scan('retry-published');cmd[cmd.index('--capture')+1]=str(cap)
+        cmd[1]='--finalize';result=run(cmd);self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue(json.loads(result.stdout)['finalized'])
+        result=run(['read','--no-cache','--capture',str(cap),'--token-file',cmd[-1],'cat','/hello.txt'])
+        self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,data)
+    def test_retry_upload_rejection_write_failure(self):
+        for phase in ('chunk','commit'):
+            with self.subTest(phase=phase): self.upload_recovery(retry=phase+':log-write')
+    def test_retry_rejected_chunk(self):
+        for case in ('400','403','429','twice','then-lost','staging','wrong-op','orphan','bad-log','old-pending','missing-known','pin','origin','cleanup','500','http500','mismatch','nodescription','result','badretry','no-retry'):
+            with self.subTest(case=case): self.upload_recovery(retry='chunk:'+case)
+        self.upload_recovery(replace=True,retry='chunk:400')
+    def test_retry_rejected_commit(self):
+        for case in ('400','403','429','twice','then-lost','staging','manifest','wrong-op','orphan','bad-log','old-pending','missing-known','pin','origin','cleanup','500','http500','mismatch','nodescription','result','badretry','no-retry'):
+            with self.subTest(case=case): self.upload_recovery(retry='commit:'+case)
+        self.upload_recovery(case='empty',retry='commit:400')
+        self.upload_recovery(replace=True,retry='commit:400')
     def test_resume_upload(self):
-        for case in ('ok','prepared','empty','legacy','pending','lost-chunk','lost-commit','response'):
+        for case in ('ok','prepared','empty','legacy','legacy-log','pending','lost-chunk','lost-commit','response'):
             with self.subTest(case=case): self.upload_recovery(case)
     def test_resume_upload_barriers(self):
         for case in ('missing','commit-uncertain','duplicate','staging','log','origin','cleanup','pin','reject'):

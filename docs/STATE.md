@@ -306,3 +306,23 @@ resume, local crash-files и cleanup/GC. Живой непустой recovery п
 
 Проверка: 127 тестовых методов; обычный локальный прогон прошёл
 (123 passed/4 kernel skips без /dev/fuse).
+
+
+## Повтор CHUNK и FILE_COMMIT после подтверждённого отказа (2026-11-18)
+
+--resume-upload принимает только fsync-сохранённые отказы 4xx собственных
+recovery-запросов с исходным UUID и индексом/commit. Для 429 соблюдается срок.
+CHUNK повторяется лишь на сохранённой pending-границе; commit — с полным
+проверенным префиксом и точным сохранённым manifest, без переотправки частей.
+Перед повтором снова проверяются staging/source/destination/pin и создаётся
+новый pending; старый rejected не разрешает повтор после нового unknown.
+Проверены create/replace/empty, 400/403/429, повторный reject, lost response,
+ошибка записи отказа в реальном C-процессе, повреждённые/чужие/legacy logs,
+изменённые staging/manifest/source/pin и завершение через scan/finalize/cat.
+Исходный writer и старые unknown без evidence сохраняют прежний барьер.
+Документ: [RESUME_UPLOAD.md](RESUME_UPLOAD.md). Следующие пробелы — исходный
+writer, init/unlink resume, local crash-files и cleanup/GC. Живой непустой
+recovery пока не проверен; искусственно вызывать ошибки в Telegram не нужно.
+
+Проверка: 130 тестовых методов; обычный локальный прогон прошёл
+(126 passed/4 kernel skips без /dev/fuse).

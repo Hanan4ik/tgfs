@@ -2,6 +2,7 @@
 #define TGFS_INTERNAL_H
 #include "tgfs/tgfs.h"
 #include "cJSON.h"
+#include "tgfs/bot_api.h"
 #include <stdint.h>
 
 #define TGFS_MAX_JSON (8U * 1024U * 1024U)
@@ -53,7 +54,9 @@ int resume_directory(struct tgfs_bot *bot, tgfs *fs, const cJSON *journal, const
 int finalize_put(struct tgfs_bot *bot, const char *state, const cJSON *journal, const cJSON *intent, cJSON *report, int logfd, tgfs_error *e);
 int finalize_metadata(struct tgfs_bot *bot, const char *state, const cJSON *journal, const cJSON *intent, cJSON *report, int logfd, tgfs_error *e);
 int upload_log_event(int fd, const char *event, const char *id, tgfs_error *e);
-int upload_attempts(int fd, unsigned char attempted[4096], int *commit_attempted, tgfs_error *e);
+int upload_attempts(int fd, const char *operation, unsigned char attempted[4096], int *commit_attempted, tgfs_error *e);
+int upload_request_event(int fd, const char *event, const char *id, const char *operation, tgfs_error *e);
+int upload_rejection(int fd, const char *event, const char *id, const char *operation, const tgfs_bot_error *b, tgfs_error *e);
 int verify_upload_part(struct tgfs_bot *bot, const cJSON *journal, const cJSON *record, int fd, tgfs_error *e);
 int resume_upload(struct tgfs_bot *bot, tgfs *fs, const char *state, const cJSON *journal, const cJSON *intent, cJSON *report, int fd, tgfs_error *e);
 #endif
