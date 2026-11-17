@@ -21,14 +21,14 @@ static int log_event(int fd,const char *event,const char *id,tgfs_error *e)
     return append_log(fd,line,(size_t)n,e);
 }
 /* Only a validated, explicit rejection may release this request's send barrier. */
-static int directory_rejection(int fd,const char *operation,const tgfs_bot_error *b,tgfs_error *e)
+int upload_rejection(int fd,const char *event,const char *id,const char *operation,const tgfs_bot_error *b,tgfs_error *e)
 {
     if(b->kind!=TGFS_BOT_API || b->outcome_unknown || b->http_status<400 || b->http_status>=500 ||
         b->api_code!=b->http_status || (b->api_code==429 && !b->retry_after)) return 0;
-    time_t now=time(NULL);if(now<0) return fail(e,"cannot timestamp rejected ADD; send barrier retained");
+    time_t now=time(NULL);if(now<0) return fail(e,"cannot timestamp rejected request; send barrier retained");
     uint64_t deadline=b->retry_after?(uint64_t)now+b->retry_after:0;
-    char line[256];int n=snprintf(line,sizeof(line),"{\"event\":\"directory_send_rejected\",\"message_id\":\"%s\",\"http_status\":%ld,\"api_code\":%d,\"retry_not_before\":\"%llu\"}\n",
-        operation,b->http_status,b->api_code,(unsigned long long)deadline);
+    char line[320];int n=snprintf(line,sizeof(line),"{\"event\":\"%s\",\"message_id\":\"%s\",\"operation_id\":\"%s\",\"http_status\":%ld,\"api_code\":%d,\"retry_not_before\":\"%llu\"}\n",
+        event,id,operation,b->http_status,b->api_code,(unsigned long long)deadline);
     if(n<0 || (size_t)n>=sizeof(line)) return fail(e,"rejection log overflow");
     return append_log(fd,line,(size_t)n,e);
 }
@@ -326,7 +326,7 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
     if(rc) {
         fail(e,"%s [http=%ld api=%d outcome_unknown=%d retry_after=%u]",b.message,b.http_status,b.api_code,b.outcome_unknown,b.retry_after);
         tgfs_error saved=*e;
-        if(directory_rejection(fd,operation,&b,e)) {free(text);free(document);cJSON_Delete(out);return -1;}
+        if(upload_rejection(fd,"directory_send_rejected",operation,operation,&b,e)) {free(text);free(document);cJSON_Delete(out);return -1;}
         *e=saved;
     }
     long long channel,returned_channel,returned_size;mid=0;
@@ -551,27 +551,65 @@ int upload_log_event(int fd,const char *event,const char *id,tgfs_error *e)
 {
     return log_event(fd,event,id,e);
 }
-int upload_attempts(int fd,unsigned char attempted[4096],int *commit_attempted,tgfs_error *e)
+int upload_request_event(int fd,const char *event,const char *id,const char *operation,tgfs_error *e)
+{
+    char line[200];int n=snprintf(line,sizeof(line),"{\"event\":\"%s\",\"message_id\":\"%s\",\"operation_id\":\"%s\"}\n",event,id,operation);
+    if(n<0 || (size_t)n>=sizeof(line)) return fail(e,"upload log overflow");
+    return append_log(fd,line,(size_t)n,e);
+}
+/* 0: no logged request; 1: unresolved; 2: rejected; 3: confirmed commit. */
+int upload_attempts(int fd,const char *operation,unsigned char attempted[4096],int *commit_attempted,tgfs_error *e)
 {
     struct stat st;
     if(fstat(fd,&st) || st.st_size>TGFS_MAX_JSON || lseek(fd,0,SEEK_SET)<0) return fail(e,"cannot inspect upload recovery log");
     FILE *stream=fdopen(dup(fd),"r");if(!stream) return fail(e,"cannot read upload recovery log");
+    unsigned char owned[4096]={0};int commit_owned=0;
+    uint64_t deadlines[4096]={0},commit_deadline=0;
     char *line=NULL;size_t capacity=0,total=0;ssize_t n;int rc=0;
     while((n=getline(&line,&capacity,stream))>=0) {
         total+=(size_t)n;
         if(total>TGFS_MAX_JSON) {rc=fail(e,"upload recovery log too large");break;}
         cJSON *entry=json_parse_bytes((const unsigned char *)line,(size_t)n,e);
         if(!entry || !json_string(entry,"event")) {cJSON_Delete(entry);rc=fail(e,"invalid upload recovery log");break;}
-        if(same(json_string(entry,"event"),"upload_chunk_pending")) {
-            uint64_t index;
-            if(decimal(json_string(entry,"message_id"),&index) || index>=4096) rc=fail(e,"invalid upload attempt index");
-            else attempted[index]=1;
+        const char *event=json_string(entry,"event");
+        int chunk_pending=same(event,"upload_chunk_pending"),chunk_rejected=same(event,"upload_chunk_rejected");
+        int commit_pending=same(event,"upload_commit_pending"),commit_rejected=same(event,"upload_commit_rejected");
+        if(chunk_pending || chunk_rejected || commit_pending || commit_rejected) {
+            uint64_t index=0;
+            if((chunk_pending || chunk_rejected) && (decimal(json_string(entry,"message_id"),&index) || index>=4096))
+                rc=fail(e,"invalid upload attempt index");
+            else {
+                int commit=commit_pending || commit_rejected;
+                int previous=commit?*commit_attempted:attempted[index];
+                int ours=same(json_string(entry,"operation_id"),operation);
+                if(commit && !same(json_string(entry,"message_id"),operation)) rc=fail(e,"commit operation differs in recovery log");
+                else if(chunk_pending || commit_pending) {
+                    if(previous==1 || previous==3 || (cJSON_HasObjectItem(entry,"operation_id") && !ours)) rc=fail(e,"conflicting upload attempts in recovery log");
+                    else if(commit) {*commit_attempted=1;commit_owned=ours;commit_deadline=0;}
+                    else {attempted[index]=1;owned[index]=(unsigned char)ours;deadlines[index]=0;}
+                } else {
+                    size_t http,api;uint64_t when;
+                    if(previous!=1 || !ours || !(commit?commit_owned:owned[index]) ||
+                        json_count(entry,"http_status",&http) || json_count(entry,"api_code",&api) ||
+                        http<400 || http>=500 || api!=http || json_decimal(entry,"retry_not_before",&when) || (api==429 && !when))
+                        rc=fail(e,"invalid upload rejection evidence");
+                    else if(commit) {*commit_attempted=2;commit_deadline=when;}
+                    else {attempted[index]=2;deadlines[index]=when;}
+                }
+            }
         }
-        if(same(json_string(entry,"event"),"upload_commit_pending")) *commit_attempted=1;
+        if(same(event,"upload_commit_confirmed")) *commit_attempted=3;
         cJSON_Delete(entry);if(rc) break;
     }
     if(ferror(stream)) rc=fail(e,"cannot read upload recovery log");
-    free(line);fclose(stream);return rc;
+    free(line);fclose(stream);
+    uint64_t deadline=commit_deadline;
+    for(size_t i=0;i<4096;i++) if(deadlines[i]>deadline) deadline=deadlines[i];
+    if(!rc && deadline) {
+        time_t now=time(NULL);
+        if(now<0 || (uint64_t)now<=deadline) rc=fail(e,"upload retry cooldown active; retry after Unix time %llu",(unsigned long long)deadline);
+    }
+    return rc;
 }
 int verify_upload_part(tgfs_bot *bot,const cJSON *journal,const cJSON *record,int fd,tgfs_error *e)
 {

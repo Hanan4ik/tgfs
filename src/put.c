@@ -109,25 +109,27 @@ static int check_message(const cJSON *m,long long channel,const char *name,size_
     return 0;
 }
 static int upload(tgfs_bot *bot,const char *chat,long long channel,const char *filename,
-                  const unsigned char *bytes,size_t size,const cJSON *caption,long long *id,tgfs_error *e)
+                  const unsigned char *bytes,size_t size,const cJSON *caption,long long *id,tgfs_error *e,tgfs_bot_error *failure)
 {
+    if(failure) *failure=(tgfs_bot_error){.kind=TGFS_BOT_LOCAL,.outcome_unknown=1};
     char *text=cJSON_PrintUnformatted(caption);cJSON *out=NULL;
     if(!text) return fail(e,"out of memory");
     tgfs_bot_error b;
     int rc=pace(e);
     if(!rc) {
         rc=tgfs_bot_send_document(bot,chat,filename,bytes,size,text,&out,&b);
-        if(rc) api_fail(e,&b);else rc=check_message(out,channel,filename,size,text,id,e);
+        if(rc) {if(failure) *failure=b;api_fail(e,&b);}else rc=check_message(out,channel,filename,size,text,id,e);
     }
     cJSON_Delete(out);free(text);return rc;
 }
 static int upload_json(tgfs_bot *bot,const char *chat,long long channel,const char *name,
-                       const cJSON *body,const cJSON *caption,long long *id,size_t *size,tgfs_error *e)
+                       const cJSON *body,const cJSON *caption,long long *id,size_t *size,tgfs_error *e,tgfs_bot_error *failure)
 {
+    if(failure) *failure=(tgfs_bot_error){.kind=TGFS_BOT_LOCAL,.outcome_unknown=1};
     char *raw=cJSON_PrintUnformatted(body);
     if(!raw) return fail(e,"out of memory");
     *size=strlen(raw);
-    int rc=upload(bot,chat,channel,name,(const unsigned char *)raw,*size,caption,id,e);free(raw);return rc;
+    int rc=upload(bot,chat,channel,name,(const unsigned char *)raw,*size,caption,id,e,failure);free(raw);return rc;
 }
 static int edit(tgfs_bot *bot,const char *chat,long long channel,long long id,const char *name,
                 size_t size,const cJSON *caption,tgfs_error *e)
@@ -278,7 +280,7 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
             cJSON_Delete(part);goto done;
         }
         long long id=0;
-        int uploaded=upload(bot,chat,channel,filename,bytes+offset,length,caption,&id,e);
+        int uploaded=upload(bot,chat,channel,filename,bytes+offset,length,caption,&id,e,NULL);
         if(!uploaded && id<=previous) uploaded=fail(e,"non-increasing uploaded message ID");
         if(!uploaded) previous=id;
         /* A known ID is retained even if remaining response metadata mismatched. */
@@ -295,7 +297,7 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
     if(replace && check_pin(bot,journal,e)) goto done;
     if(!cJSON_AddItemToObject(body,"parts",cJSON_Duplicate(parts,1)) ||
         !cJSON_AddItemToObject(intent,"commit_document",cJSON_Duplicate(body,1)) || persist(dir,intent,"commit_send_pending",e)) goto done;
-    int committed=upload_json(bot,chat,channel,"file-commit.json",body,commit,&commit_id,&commit_size,e);
+    int committed=upload_json(bot,chat,channel,"file-commit.json",body,commit,&commit_id,&commit_size,e,NULL);
     if(!committed && commit_id<=previous) committed=fail(e,"non-increasing commit ID");
     if(commit_id>0 && add_id(intent,"file_commit_id",commit_id)) {fail(e,"out of memory");goto done;}
     if(committed) {tgfs_error saved=*e;persist(dir,intent,"commit_response_uncertain",e);*e=saved;goto done;}
@@ -315,7 +317,7 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
     }
     if(!replace) {
         if(check_pin(bot,journal,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
-        int published=upload_json(bot,chat,channel,"directory.json",directory_body,directory,&directory_id,&directory_size,e);
+        int published=upload_json(bot,chat,channel,"directory.json",directory_body,directory,&directory_id,&directory_size,e,NULL);
         (void)directory_size;
         if(!published && directory_id<=commit_id) published=fail(e,"non-increasing directory ID");
         if(directory_id>0 && add_id(intent,"directory_message_id",directory_id)) {fail(e,"out of memory");goto done;}
@@ -439,12 +441,12 @@ static int make_directory(tgfs_bot *bot,const cJSON *journal,const char *path,co
         fail(e,"cannot allocate directory intent");goto done;
     }
     if(persist(dir,intent,"child_send_pending",e)) goto done;
-    int sent=upload_json(bot,chat,channel,"directory.json",empty,child,&child_id,&child_size,e);
+    int sent=upload_json(bot,chat,channel,"directory.json",empty,child,&child_id,&child_size,e,NULL);
     if(!sent && (uint64_t)child_id<=boundary) sent=fail(e,"non-increasing child directory ID");
     if(child_id>0 && add_id(intent,"child_message_id",child_id)) {fail(e,"out of memory");goto done;}
     if(sent) {tgfs_error saved=*e;persist(dir,intent,"child_response_uncertain",e);*e=saved;goto done;}
     if(persist(dir,intent,"child_sent",e) || check_pin(bot,journal,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
-    sent=upload_json(bot,chat,channel,"directory.json",body,parent_caption,&parent_id,&parent_size,e);
+    sent=upload_json(bot,chat,channel,"directory.json",body,parent_caption,&parent_id,&parent_size,e,NULL);
     (void)parent_size;
     if(!sent && parent_id<=child_id) sent=fail(e,"non-increasing parent directory ID");
     if(parent_id>0 && add_id(intent,"directory_message_id",parent_id)) {fail(e,"out of memory");goto done;}
@@ -489,7 +491,7 @@ static int unlink_file(tgfs_bot *bot,const cJSON *journal,const char *path,const
         !cJSON_AddItemToObject(intent,"directory_caption",cJSON_Duplicate(caption,1)) ||
         !cJSON_AddItemToObject(intent,"directory_document",cJSON_Duplicate(body,1))) {fail(e,"cannot allocate unlink intent");goto done;}
     if(persist(dir,intent,"prepared",e) || check_pin(bot,journal,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
-    int sent=upload_json(bot,chat,channel,"directory.json",body,caption,&directory_id,&document_size,e);
+    int sent=upload_json(bot,chat,channel,"directory.json",body,caption,&directory_id,&document_size,e,NULL);
     if(!sent && (uint64_t)directory_id<=boundary) sent=fail(e,"non-increasing DIRECTORY ID");
     if(directory_id>0 && add_id(intent,"directory_message_id",directory_id)) {fail(e,"out of memory");goto done;}
     if(sent) {tgfs_error saved=*e;persist(dir,intent,"directory_response_uncertain",e);*e=saved;goto done;}
@@ -586,10 +588,10 @@ int resume_upload(tgfs_bot *bot,tgfs *fs,const char *state,const cJSON *journal,
         return cJSON_AddStringToObject(report,"upload_resume","already_committed")?0:fail(e,"out of memory");
     if(!json_string(original,"parent_path") || json_string(original,"parent_path")[0]!='/' ||
         !json_string(original,"name") || strlen(json_string(original,"name"))>245) return fail(e,"invalid saved upload destination");
-    const char *phase=json_string(original,"phase");
-    if(!same(phase,"prepared") && !same(phase,"chunk_sent") && !same(phase,"chunk_send_pending") && !same(phase,"chunk_response_uncertain"))
+    const char *phase=json_string(original,"phase");int commit_retry=same(phase,"commit_send_pending");
+    if(!commit_retry && !same(phase,"prepared") && !same(phase,"chunk_sent") && !same(phase,"chunk_send_pending") && !same(phase,"chunk_response_uncertain"))
         return fail(e,"FILE_COMMIT may already have been attempted; capture and review its outcome");
-    if(cJSON_GetObjectItemCaseSensitive(original,"file_commit_id") || cJSON_GetObjectItemCaseSensitive(original,"commit_document") ||
+    if(cJSON_GetObjectItemCaseSensitive(original,"file_commit_id") || (!commit_retry && cJSON_GetObjectItemCaseSensitive(original,"commit_document")) ||
         cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"directory_ids"))) return fail(e,"early upload intent contains publication evidence");
     const cJSON *record;
     cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(journal,"records")) {
@@ -608,8 +610,17 @@ int resume_upload(tgfs_bot *bot,tgfs *fs,const char *state,const cJSON *journal,
     if(count>PUT_MAX_PARTS) return fail(e,"too many upload parts");
     const cJSON *oldparts=cJSON_GetObjectItemCaseSensitive(original,"parts");size_t known=(size_t)cJSON_GetArraySize(oldparts);
     unsigned char attempted[4096]={0};int commit_attempted=0;
-    if(upload_attempts(logfd,attempted,&commit_attempted,e)) return -1;
-    if(commit_attempted) return fail(e,"recovery log contains a FILE_COMMIT attempt; use a newer capture");
+    if(upload_attempts(logfd,json_string(original,"operation_id"),attempted,&commit_attempted,e)) return -1;
+    if(commit_retry ? (commit_attempted!=2 || known!=count || !cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(original,"commit_document"))) : commit_attempted!=0)
+        return fail(e,"FILE_COMMIT retry requires durable rejection of the saved complete manifest");
+    size_t retry_index=SIZE_MAX;
+    for(size_t i=0;i<4096;i++) {
+        if(i>=count && attempted[i]) return fail(e,"logged part outside saved upload");
+        if(attempted[i]==2) {
+            if(!same(phase,"chunk_send_pending") || i!=known) return fail(e,"rejected CHUNK disagrees with saved pending frontier");
+            retry_index=i;attempted[i]=0;
+        }
+    }
     if(known>count || (same(phase,"prepared") && known) || (same(phase,"chunk_sent") && !known))
         return fail(e,"invalid saved upload frontier");
     for(size_t i=0;i<known;i++) {
@@ -621,7 +632,7 @@ int resume_upload(tgfs_bot *bot,tgfs *fs,const char *state,const cJSON *journal,
     if(same(phase,"chunk_send_pending")) {
         size_t pending;
         if(json_count(original,"pending_part",&pending) || pending!=known || pending>=count) return fail(e,"invalid pending part frontier");
-        attempted[pending]=1;
+        if(pending!=retry_index) attempted[pending]=1;
     } else if(same(phase,"chunk_response_uncertain")) {
         size_t last;
         if(cJSON_GetObjectItemCaseSensitive(original,"last_attempted_part")) {
@@ -709,11 +720,16 @@ int resume_upload(tgfs_bot *bot,tgfs *fs,const char *state,const cJSON *journal,
             cJSON_DeleteItemFromObjectCaseSensitive(intent,"last_attempted_part");
             if(!cJSON_AddNumberToObject(intent,"pending_part",(double)i) ||
                 !cJSON_AddNumberToObject(intent,"last_attempted_part",(double)i) || check_pin(bot,journal,e) ||
-                upload_log_event(logfd,"upload_chunk_pending",index,e) || persist(dir,intent,"chunk_send_pending",e)) {
+                upload_request_event(logfd,"upload_chunk_pending",index,json_string(intent,"operation_id"),e) || persist(dir,intent,"chunk_send_pending",e)) {
                 cJSON_Delete(part);cJSON_Delete(caption);goto done;
             }
-            int uploaded=upload(bot,json_string(journal,"storage_chat_id"),channel,filename,bytes+offset,n,caption,&id,e);
-            if(uploaded) {cJSON_Delete(part);cJSON_Delete(caption);goto done;}
+            tgfs_bot_error rejection;
+            int uploaded=upload(bot,json_string(journal,"storage_chat_id"),channel,filename,bytes+offset,n,caption,&id,e,&rejection);
+            if(uploaded) {
+                tgfs_error saved=*e;
+                if(!upload_rejection(logfd,"upload_chunk_rejected",index,json_string(intent,"operation_id"),&rejection,e)) *e=saved;
+                cJSON_Delete(part);cJSON_Delete(caption);goto done;
+            }
             if(id<=(long long)previous) {cJSON_Delete(part);cJSON_Delete(caption);fail(e,"non-increasing resumed CHUNK ID");goto done;}
             previous=(uint64_t)id;
             char text[32];snprintf(text,sizeof(text),"%lld",id);
@@ -727,13 +743,23 @@ int resume_upload(tgfs_bot *bot,tgfs *fs,const char *state,const cJSON *journal,
             if(persist(dir,intent,"chunk_sent",e)) goto done;
         }
     }
-    if(!cJSON_AddItemToObject(body,"parts",cJSON_Duplicate(refs,1)) ||
-        !cJSON_AddItemToObject(intent,"commit_document",cJSON_Duplicate(body,1))) {fail(e,"out of memory");goto done;}
+    if(!cJSON_AddItemToObject(body,"parts",cJSON_Duplicate(refs,1))) {fail(e,"out of memory");goto done;}
+    if(commit_retry && !cJSON_Compare(body,cJSON_GetObjectItemCaseSensitive(original,"commit_document"),1)) {
+        fail(e,"retry manifest differs from saved FILE_COMMIT");goto done;
+    }
+    cJSON_DeleteItemFromObjectCaseSensitive(intent,"commit_document");
+    if(!cJSON_AddItemToObject(intent,"commit_document",cJSON_Duplicate(body,1))) {fail(e,"out of memory");goto done;}
     long long id=0;size_t commit_size;
     if(tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&channel) || check_pin(bot,journal,e) ||
-        upload_log_event(logfd,"upload_commit_pending",json_string(intent,"operation_id"),e) || persist(dir,intent,"commit_send_pending",e)) goto done;
-    int committed=upload_json(bot,json_string(journal,"storage_chat_id"),channel,"file-commit.json",body,cc,&id,&commit_size,e);
-    if(committed || id<=(long long)previous) {if(!committed) fail(e,"non-increasing resumed FILE_COMMIT ID");goto done;}
+        upload_request_event(logfd,"upload_commit_pending",json_string(intent,"operation_id"),json_string(intent,"operation_id"),e) || persist(dir,intent,"commit_send_pending",e)) goto done;
+    tgfs_bot_error rejection;
+    int committed=upload_json(bot,json_string(journal,"storage_chat_id"),channel,"file-commit.json",body,cc,&id,&commit_size,e,&rejection);
+    if(committed) {
+        tgfs_error saved=*e;
+        if(!upload_rejection(logfd,"upload_commit_rejected",json_string(intent,"operation_id"),json_string(intent,"operation_id"),&rejection,e)) *e=saved;
+        goto done;
+    }
+    if(id<=(long long)previous) {fail(e,"non-increasing resumed FILE_COMMIT ID");goto done;}
     if(add_id(intent,"file_commit_id",id) || persist(dir,intent,replace?"published_backlinks_pending":"backlinks_pending",e)) goto done;
     char text[32];snprintf(text,sizeof(text),"%lld",id);
     if(upload_log_event(logfd,"upload_commit_confirmed",text,e) ||
