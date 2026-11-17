@@ -204,3 +204,24 @@ atomic complete с нужными refs без file_commit_id. Неотправл
 Порядок этапов предлагает ассистент по зависимостям кода и нашим договорённостям;
 STATE/KANBAN и #11 фиксируют выполненное/открытое, не являются внешним готовым
 планом реализации. Пользовательский приоритет имеет преимущество.
+
+
+## Продолжение загрузки до commit (2026-11-17)
+
+Пользователь подтвердил metadata finalize на capture-011: mkdir child33/ADD34
+и unlink REMOVE43, complete/confirmed/no-op. Добавлен
+[--resume-upload](RESUME_UPLOAD.md): verified staging и свежая сверка CHUNK,
+повторное использование префикса, отправка только достоверно не предпринятых
+частей и одного FILE_COMMIT. Общая локальная flock, fsync send barriers и
+atomic intent сохраняют UUID/refs. Неизвестная попытка без capture evidence
+блокирует повтор; старые uncertain intents трактуются консервативно.
+После успеха нужны новый scan и существующие resume-directory/finalize;
+навигация/ADD не выполняются этим режимом. Проверены lost chunk/commit,
+повтор с устаревшим capture, пустой файл, replace и блокирующие несостыковки.
+Следующий живой тест — безопасный already_committed для существующего put,
+без искусственной порчи/прерывания. Следующий scan пользователя capture-012.
+Полная классификация retry, local crash-files и cleanup/GC остаются открытыми.
+
+Проверка реализации: 124 теста; локально 120 passed/4 kernel skips, полный
+ASan/UBSan с отключённым локальным LSan прошёл. CI проверяет kernel mounts
+и sanitizer с обычными настройками. Живой interrupted-upload ещё не проверен.

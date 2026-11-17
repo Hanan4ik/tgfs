@@ -53,7 +53,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg=dict(message_id=mid,chat=dict(id=STORAGE,type='channel'),caption=caption,
                 document=dict(file_id=fid,file_unique_id='unique_'+fid,file_name=filename,file_size=len(raw)))
             s.messages[mid]=msg;s.sent.append(kind)
-            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT') or (s.mode=='unlink-lost' and intent.get('kind')=='unlink') or s.mode=='resume-lost':
+            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT') or (s.mode=='unlink-lost' and intent.get('kind')=='unlink') or s.mode=='resume-lost' or (s.mode=='upload-lost-chunk' and kind=='CHUNK') or (s.mode=='upload-lost-commit' and kind=='FILE_COMMIT'):
                 self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
             if (s.mode=='response' and kind=='CHUNK') or (s.mode=='mkdir-response' and expected=='child_send_pending') or (s.mode=='unlink-response' and intent.get('kind')=='unlink'):
                 msg=copy.deepcopy(msg);msg['document']['file_name']='wrong'
@@ -81,6 +81,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s.messages[mid]=msg;return self.reply(msg)
         if method=='forwardMessage':
             assert int(p['chat_id'])==SERVICE and int(p['from_chat_id'])==STORAGE
+            if p['message_id'] not in s.messages: return self.reply(error=dict(ok=False,error_code=400,description='message unavailable'),status=400)
             msg=copy.deepcopy(s.messages[p['message_id']]);msg['message_id']=s.copy_id;s.copy_id+=1
             msg['chat']=dict(id=SERVICE,type='channel')
             msg['forward_origin']=dict(type='channel',chat=dict(id=STORAGE,type='channel'),message_id=p['message_id'])
@@ -664,6 +665,110 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
+    def upload_recovery(self,case='ok',replace=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);capture=root/'capture';capture.mkdir()
+            journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
+                storage_chat_id=str(STORAGE),service_chat_id=str(SERVICE),superblock=SB,boundary_id='2',records=[])
+            (capture/'journal.json').write_text(json.dumps(journal))
+            data=b'abcdefgh';source=root/'source';source.write_bytes(data)
+            token=root/'token';token.write_text(TOKEN);token.chmod(0o600)
+            state=root/'state'
+            s=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+            s.intent=state/'intent.json';s.input_data=data;s.mode='lost';s.calls=[];s.sent=[];s.files={};s.next=3;s.copy_id=1001
+            s.messages={1:dict(message_id=1,chat=dict(id=STORAGE,type='channel'),text=json.dumps(SB))}
+            t=threading.Thread(target=s.serve_forever,kwargs=dict(poll_interval=.01),daemon=True);t.start()
+            env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{s.server_port}')
+            def run(args):
+                result=subprocess.run([BINARY,*args],env=env,capture_output=True,timeout=30)
+                for text in (TOKEN,'AddressSanitizer','runtime error:'): self.assertNotIn(text,result.stderr.decode())
+                return result
+            def scan(name):
+                cap=root/name
+                result=run(['scan','--token-file',str(token),'--storage-chat-id',str(STORAGE),'--service-chat-id',str(SERVICE),'--output',str(cap)])
+                self.assertEqual(result.returncode,0,result.stderr);return cap
+            args=['put','--capture',str(capture),'--file',str(source),'--name','hello.txt','--state-dir',str(state),
+                '--token-file',str(token),'--chunk-bytes','3','--send-interval-ms','0']
+            try:
+                if replace:
+                    s.mode='ok';self.assertEqual(run(args).returncode,0)
+                    capture=scan('base');state=root/'replacement';s.intent=state/'intent.json'
+                    args[args.index('--capture')+1]=str(capture);args[args.index('--state-dir')+1]=str(state);args+=['--replace']
+                    s.mode='lost'
+                result=run(args);self.assertEqual(result.returncode,1,result.stderr)
+                saved=json.loads(s.intent.read_text());original_ids={k:saved[k] for k in ('object_id','version_id','operation_id')}
+                first=s.next-1
+                if case in ('prepared','empty'):
+                    # Model a crash before the first request, using an explicitly constructed saved state.
+                    del s.messages[first];s.sent.pop();saved['phase']='prepared';saved['parts']=[]
+                    saved.pop('last_attempted_part',None)
+                    if case=='empty':
+                        import hashlib
+                        data=b'';s.input_data=data;(state/'data.bin').write_bytes(data)
+                        saved['file_size']='0';saved['file_sha256']=hashlib.sha256(data).hexdigest()
+                        saved['commit_caption'].update(file_size='0',file_sha256=saved['file_sha256'],part_count=0)
+                    s.intent.write_text(json.dumps(saved))
+                if case=='legacy':
+                    saved.pop('last_attempted_part');s.intent.write_text(json.dumps(saved))
+                if case=='pending':
+                    saved['phase']='chunk_send_pending';saved['pending_part']=0;s.intent.write_text(json.dumps(saved))
+                if case in ('missing','commit-uncertain'): del s.messages[first]
+                if case=='commit-uncertain':
+                    saved['phase']='commit_send_pending';s.intent.write_text(json.dumps(saved))
+                if case=='duplicate':
+                    msg=copy.deepcopy(s.messages[first]);msg['message_id']=s.next;s.messages[s.next]=msg;s.next+=1
+                s.mode='ok';cap=scan('before-recovery')
+                if case=='staging': (state/'data.bin').write_bytes(b'XXXXXXXX')
+                if case=='log':
+                    log=state/'backlink-repair.log';log.write_text('{broken');log.chmod(0o600)
+                before=list(s.sent);before_intent=s.intent.read_bytes()
+                s.mode={'lost-chunk':'upload-lost-chunk','lost-commit':'upload-lost-commit','response':'response',
+                    'origin':'repair-origin','cleanup':'repair-cleanup','pin':'pin','reject':'resume-apierror'}.get(case,'ok')
+                cmd=['intent','--resume-upload','--state-dir',str(state),'--capture',str(cap),'--token-file',str(token)]
+                result=run(cmd)
+                blocked=case in ('missing','commit-uncertain','duplicate','staging','log','origin','cleanup','pin')
+                uncertain=case in ('lost-chunk','lost-commit','response','reject')
+                self.assertEqual(result.returncode,1 if blocked or uncertain else 0,result.stderr)
+                if blocked:
+                    self.assertEqual(s.sent,before);self.assertEqual(s.intent.read_bytes(),before_intent);return
+                s.mode='ok'
+                if uncertain:
+                    before=list(s.sent);self.assertEqual(run(cmd).returncode,1)
+                    self.assertEqual(s.sent,before) # Same capture + persistent barrier cannot repeat a request.
+                    cap=scan('after-uncertain');cmd[cmd.index('--capture')+1]=str(cap)
+                    if case=='reject':
+                        self.assertEqual(run(cmd).returncode,1);self.assertEqual(s.sent,before);return
+                    result=run(cmd)
+                    self.assertEqual(result.returncode,0,result.stderr)
+                else:
+                    report=json.loads(result.stdout);self.assertEqual(report['upload_resume'],'committed')
+                    self.assertEqual(report['next_step'],'capture_after_upload_resume')
+                now=json.loads(s.intent.read_text())
+                for key,value in original_ids.items(): self.assertEqual(now[key],value)
+                before=list(s.sent)
+                self.assertEqual(run(cmd).returncode,1 if case!='lost-commit' else 0)
+                self.assertEqual(s.sent,before)
+                cap=scan('committed');cmd[cmd.index('--capture')+1]=str(cap)
+                result=run(cmd);self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(json.loads(result.stdout)['upload_resume'],'already_committed')
+                self.assertEqual(s.sent,before)
+                if not replace:
+                    cmd[1]='--resume-directory';result=run(cmd);self.assertEqual(result.returncode,0,result.stderr)
+                    cap=scan('published');cmd[cmd.index('--capture')+1]=str(cap)
+                cmd[1]='--finalize';result=run(cmd);self.assertEqual(result.returncode,0,result.stderr)
+                self.assertTrue(json.loads(result.stdout)['finalized'])
+                self.assertEqual(json.loads(s.intent.read_text())['phase'],'complete')
+                result=run(['read','--no-cache','--capture',str(cap),'--token-file',str(token),'cat','/hello.txt'])
+                self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,data)
+            finally:
+                s.shutdown();s.server_close();t.join()
+    def test_resume_upload(self):
+        for case in ('ok','prepared','empty','legacy','pending','lost-chunk','lost-commit','response'):
+            with self.subTest(case=case): self.upload_recovery(case)
+    def test_resume_upload_barriers(self):
+        for case in ('missing','commit-uncertain','duplicate','staging','log','origin','cleanup','pin','reject'):
+            with self.subTest(case=case): self.upload_recovery(case)
+    def test_resume_replacement_upload(self): self.upload_recovery(replace=True)
     def test_finalize_mkdir(self):
         self.directories(metadata_finish=True)
         self.directories(metadata_finish='conflict')
