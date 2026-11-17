@@ -170,3 +170,7 @@ backlinks/next_message, смена pin, потеря ответа, неверн�
 Добавлен put --replace: object_id сохраняется, версия/operation_id новые,
 DIRECTORY ADD не нужен. Без флага существующее имя всё ещё отвергается.
 [Публикация, ошибки после commit и живой тест](FILE_REPLACE.md).
+
+Раннее продолжение прерванной загрузки: [--resume-upload](RESUME_UPLOAD.md).
+Новые intents сохраняют last_attempted_part перед каждой попыткой CHUNK;
+неизвестный ответ не разрешает автоматический повтор.

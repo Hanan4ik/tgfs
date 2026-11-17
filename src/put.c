@@ -273,7 +273,8 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
             cJSON_Delete(caption);cJSON_Delete(part);fail(e,"out of memory");goto done;
         }
         if(!cJSON_AddItemToArray(captions,caption)) {cJSON_Delete(caption);cJSON_Delete(part);fail(e,"out of memory");goto done;}
-        if(!cJSON_AddNumberToObject(intent,"pending_part",(double)i) || persist(dir,intent,"chunk_send_pending",e)) {
+        cJSON_DeleteItemFromObjectCaseSensitive(intent,"last_attempted_part");
+        if(!cJSON_AddNumberToObject(intent,"last_attempted_part",(double)i) || !cJSON_AddNumberToObject(intent,"pending_part",(double)i) || persist(dir,intent,"chunk_send_pending",e)) {
             cJSON_Delete(part);goto done;
         }
         long long id=0;
@@ -572,3 +573,178 @@ usage:
 
 int tgfs_mkdir_main(int argc,char **argv) {return path_write_main(argc,argv,0);}
 int tgfs_unlink_main(int argc,char **argv) {return path_write_main(argc,argv,1);}
+
+/* Resume only from evidence: a missing captured message never proves an unsent request. */
+int resume_upload(tgfs_bot *bot,tgfs *fs,const char *state,const cJSON *journal,const cJSON *original,cJSON *report,int logfd,tgfs_error *e)
+{
+    if(!same(json_string(original,"kind"),"put") || !same(json_string(report,"staging"),"verified"))
+        return fail(e,"upload resume requires verified put staging");
+    if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"ambiguous_part_indexes")) ||
+        cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"unobserved_known_ids")))
+        return fail(e,"upload resume blocked by ambiguous or unobserved known parts");
+    if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"commit_ids")))
+        return cJSON_AddStringToObject(report,"upload_resume","already_committed")?0:fail(e,"out of memory");
+    if(!json_string(original,"parent_path") || json_string(original,"parent_path")[0]!='/' ||
+        !json_string(original,"name") || strlen(json_string(original,"name"))>245) return fail(e,"invalid saved upload destination");
+    const char *phase=json_string(original,"phase");
+    if(!same(phase,"prepared") && !same(phase,"chunk_sent") && !same(phase,"chunk_send_pending") && !same(phase,"chunk_response_uncertain"))
+        return fail(e,"FILE_COMMIT may already have been attempted; capture and review its outcome");
+    if(cJSON_GetObjectItemCaseSensitive(original,"file_commit_id") || cJSON_GetObjectItemCaseSensitive(original,"commit_document") ||
+        cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"directory_ids"))) return fail(e,"early upload intent contains publication evidence");
+    const cJSON *record;
+    cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(journal,"records")) {
+        const cJSON *c=cJSON_GetObjectItemCaseSensitive(record,"record");
+        if(same(json_string(c,"type"),"FILE_COMMIT") &&
+            (same(json_string(c,"operation_id"),json_string(original,"operation_id")) ||
+             (same(json_string(c,"object_id"),json_string(original,"object_id")) && same(json_string(c,"version_id"),json_string(original,"version_id")))))
+            return fail(e,"captured commit requires publication reconciliation, never resend blindly");
+    }
+    uint64_t size,boundary;size_t chunk,count;long long channel;
+    if(tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&channel)) return fail(e,"invalid storage channel");
+    if(json_decimal(original,"file_size",&size) || json_decimal(journal,"boundary_id",&boundary) ||
+        json_count(original,"chunk_bytes",&chunk) || !chunk || chunk>TGFS_MAX_CHUNK || size>PUT_MAX_SIZE)
+        return fail(e,"invalid upload metadata");
+    count=(size_t)((size+chunk-1)/chunk);
+    if(count>PUT_MAX_PARTS) return fail(e,"too many upload parts");
+    const cJSON *oldparts=cJSON_GetObjectItemCaseSensitive(original,"parts");size_t known=(size_t)cJSON_GetArraySize(oldparts);
+    unsigned char attempted[4096]={0};int commit_attempted=0;
+    if(upload_attempts(logfd,attempted,&commit_attempted,e)) return -1;
+    if(commit_attempted) return fail(e,"recovery log contains a FILE_COMMIT attempt; use a newer capture");
+    if(known>count || (same(phase,"prepared") && known) || (same(phase,"chunk_sent") && !known))
+        return fail(e,"invalid saved upload frontier");
+    for(size_t i=0;i<known;i++) {
+        uint64_t offset;
+        if(json_decimal(cJSON_GetArrayItem(oldparts,(int)i),"offset",&offset) || offset!=i*chunk)
+            return fail(e,"saved part refs must form a contiguous prefix");
+        attempted[i]=1;
+    }
+    if(same(phase,"chunk_send_pending")) {
+        size_t pending;
+        if(json_count(original,"pending_part",&pending) || pending!=known || pending>=count) return fail(e,"invalid pending part frontier");
+        attempted[pending]=1;
+    } else if(same(phase,"chunk_response_uncertain")) {
+        size_t last;
+        if(cJSON_GetObjectItemCaseSensitive(original,"last_attempted_part")) {
+            if(json_count(original,"last_attempted_part",&last) || last>=count || (last!=known && last+1!=known))
+                return fail(e,"invalid last attempted part");
+            attempted[last]=1;
+        } else if(known<count) attempted[known]=1; /* Legacy intent: conservatively include the next index. */
+    }
+    const cJSON *found[4096]={0};
+    cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(journal,"records")) {
+        const cJSON *c=cJSON_GetObjectItemCaseSensitive(record,"record");
+        if(!same(json_string(c,"type"),"CHUNK") || !same(json_string(c,"object_id"),json_string(original,"object_id")) ||
+            !same(json_string(c,"version_id"),json_string(original,"version_id"))) continue;
+        uint64_t offset;
+        if(json_decimal(c,"offset",&offset) || offset/chunk>=count) return fail(e,"invalid captured upload range");
+        found[offset/chunk]=record;
+    }
+    int gap=0;uint64_t previous=0;
+    for(size_t i=0;i<count;i++) {
+        if(!found[i]) {
+            gap=1;
+            if(attempted[i]) return fail(e,"part %zu may already have been attempted; missing capture evidence blocks resend",i);
+        } else {
+            uint64_t id;
+            if(gap || json_decimal(found[i],"message_id",&id) || id<=previous) return fail(e,"captured upload parts must form an ordered prefix");
+            previous=id;
+            if(i<known && !same(json_string(cJSON_GetArrayItem(oldparts,(int)i),"message_id"),json_string(found[i],"message_id")))
+                return fail(e,"saved and captured part identities differ");
+        }
+    }
+    const cJSON *cc=cJSON_GetObjectItemCaseSensitive(original,"commit_caption");size_t format;
+    if(!uuid_valid(json_string(original,"operation_id")) || !same(json_string(cc,"operation_id"),json_string(original,"operation_id")) ||
+        !same(json_string(cc,"magic"),"TGFS") || !same(json_string(cc,"type"),"FILE_COMMIT") ||
+        json_count(cc,"format_version",&format) || format!=1 || !cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(cc,"next_message")))
+        return fail(e,"invalid saved FILE_COMMIT caption");
+    char parent[37],grandparent[37],object[37],version[37];uint64_t base;
+    int replace=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(original,"replace"));
+    if(!cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(original,"replace"))) return fail(e,"invalid replace flag");
+    int target=replace?replacement_target(fs,json_string(original,"parent_path"),json_string(original,"name"),object,parent,version,&base,e):
+        directory_target(fs,json_string(original,"parent_path"),json_string(original,"name"),parent,grandparent,e);
+    if(target || !same(parent,json_string(original,"parent_id")) || (replace && !same(object,json_string(original,"object_id"))))
+        return fail(e,"captured upload destination changed");
+    int dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC),rc=-1;struct stat st;
+    unsigned char *bytes=NULL;cJSON *intent=NULL,*parts=NULL,*current=NULL,*body=NULL;size_t length=0;
+    if(dir<0) return fail(e,"cannot reopen upload state");
+    if(fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {fail(e,"upload state permissions changed");goto done;}
+    current=json_load_at(dir,"intent.json",e);
+    if(!current || !cJSON_Compare(current,original,1)) {fail(e,"intent changed during upload preflight");goto done;}
+    if(fstatat(dir,"data.bin",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() || (st.st_mode&0077)) {
+        fail(e,"upload staging permissions changed");goto done;
+    }
+    bytes=bytes_load_at(dir,"data.bin",PUT_MAX_SIZE,&length,e);char hash[65];
+    if(!bytes || length!=size || digest(bytes,length,hash) || !same(hash,json_string(original,"file_sha256"))) {fail(e,"upload staging changed");goto done;}
+    intent=cJSON_Duplicate(original,1);parts=cJSON_CreateArray();body=cJSON_CreateObject();
+    if(!intent || !parts || !body) {fail(e,"out of memory");goto done;}
+    /* Verify all reused messages before the first new storage publication. */
+    if(check_pin(bot,journal,e)) goto done;
+    for(size_t i=0;i<count;i++) if(found[i] && verify_upload_part(bot,journal,found[i],logfd,e)) goto done;
+    if(clock_gettime(CLOCK_MONOTONIC,&last_send)) {fail(e,"cannot pace resumed publications");goto done;}
+    cJSON_DeleteItemFromObjectCaseSensitive(intent,"parts");
+    if(!cJSON_AddItemToObject(intent,"parts",parts)) {fail(e,"out of memory");goto done;}parts=NULL;
+    cJSON *refs=cJSON_GetObjectItemCaseSensitive(intent,"parts");
+    cJSON *sent=cJSON_AddArrayToObject(report,"uploaded_chunk_ids");
+    if(!sent) {fail(e,"out of memory");goto done;}
+#ifdef TGFS_TESTING
+    send_interval_ms=0;
+#endif
+    previous=boundary;
+    for(size_t i=0;i<count;i++) {
+        size_t offset=i*chunk,n=length-offset;if(n>chunk) n=chunk;
+        cJSON *part=cJSON_CreateObject(),*caption=envelope("CHUNK",json_string(intent,"object_id"));
+        if(!part || !caption || digest(bytes+offset,n,hash) || add_id(part,"offset",(long long)offset) ||
+            add_id(part,"part_size",(long long)n) || !cJSON_AddStringToObject(part,"part_sha256",hash) ||
+            !cJSON_AddStringToObject(caption,"parent_id",json_string(intent,"parent_id")) ||
+            !cJSON_AddStringToObject(caption,"version_id",json_string(intent,"version_id")) ||
+            !cJSON_AddNumberToObject(caption,"part_count",(double)count) || add_id(caption,"offset",(long long)offset) ||
+            add_id(caption,"part_size",(long long)n) || add_id(caption,"file_size",(long long)size) ||
+            !cJSON_AddStringToObject(caption,"part_sha256",hash) || !cJSON_AddStringToObject(caption,"file_sha256",json_string(intent,"file_sha256")) ||
+            !cJSON_AddNullToObject(caption,"file_commit_id")) {cJSON_Delete(part);cJSON_Delete(caption);fail(e,"out of memory");goto done;}
+        long long id=0;
+        if(found[i]) {uint64_t mid;json_decimal(found[i],"message_id",&mid);id=(long long)mid;}
+        else {
+            char index[32],filename[256];snprintf(index,sizeof(index),"%zu",i);snprintf(filename,sizeof(filename),"%s.%zu",json_string(intent,"name"),i);
+            cJSON_DeleteItemFromObjectCaseSensitive(intent,"pending_part");
+            cJSON_DeleteItemFromObjectCaseSensitive(intent,"last_attempted_part");
+            if(!cJSON_AddNumberToObject(intent,"pending_part",(double)i) ||
+                !cJSON_AddNumberToObject(intent,"last_attempted_part",(double)i) || check_pin(bot,journal,e) ||
+                upload_log_event(logfd,"upload_chunk_pending",index,e) || persist(dir,intent,"chunk_send_pending",e)) {
+                cJSON_Delete(part);cJSON_Delete(caption);goto done;
+            }
+            int uploaded=upload(bot,json_string(journal,"storage_chat_id"),channel,filename,bytes+offset,n,caption,&id,e);
+            if(uploaded) {cJSON_Delete(part);cJSON_Delete(caption);goto done;}
+            if(id<=(long long)previous) {cJSON_Delete(part);cJSON_Delete(caption);fail(e,"non-increasing resumed CHUNK ID");goto done;}
+            previous=(uint64_t)id;
+            char text[32];snprintf(text,sizeof(text),"%lld",id);
+            if(!cJSON_AddItemToArray(sent,cJSON_CreateString(text))) {cJSON_Delete(part);cJSON_Delete(caption);fail(e,"out of memory");goto done;}
+        }
+        cJSON_Delete(caption);
+        if(add_id(part,"message_id",id) || !cJSON_AddItemToArray(refs,part)) {cJSON_Delete(part);fail(e,"out of memory");goto done;}
+        /* Reused prefix is written together with the next pending request or commit. */
+        if(!found[i]) {
+            cJSON_DeleteItemFromObjectCaseSensitive(intent,"pending_part");
+            if(persist(dir,intent,"chunk_sent",e)) goto done;
+        }
+    }
+    if(!cJSON_AddItemToObject(body,"parts",cJSON_Duplicate(refs,1)) ||
+        !cJSON_AddItemToObject(intent,"commit_document",cJSON_Duplicate(body,1))) {fail(e,"out of memory");goto done;}
+    long long id=0;size_t commit_size;
+    if(tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&channel) || check_pin(bot,journal,e) ||
+        upload_log_event(logfd,"upload_commit_pending",json_string(intent,"operation_id"),e) || persist(dir,intent,"commit_send_pending",e)) goto done;
+    int committed=upload_json(bot,json_string(journal,"storage_chat_id"),channel,"file-commit.json",body,cc,&id,&commit_size,e);
+    if(committed || id<=(long long)previous) {if(!committed) fail(e,"non-increasing resumed FILE_COMMIT ID");goto done;}
+    if(add_id(intent,"file_commit_id",id) || persist(dir,intent,replace?"published_backlinks_pending":"backlinks_pending",e)) goto done;
+    char text[32];snprintf(text,sizeof(text),"%lld",id);
+    if(upload_log_event(logfd,"upload_commit_confirmed",text,e) ||
+        !cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(report,"commit_ids"),cJSON_CreateString(text)) ||
+        !cJSON_AddStringToObject(report,"upload_resume","committed")) {if(!e->message[0]) fail(e,"cannot record resumed commit");goto done;}
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"resumed",cJSON_CreateBool(1));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"scope",cJSON_CreateString("capture_plus_recovery_response"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"local_phase",cJSON_CreateString(replace?"published_backlinks_pending":"backlinks_pending"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"publication",cJSON_CreateString(replace?"confirmed":"not_observed"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("capture_after_upload_resume"));
+    rc=0;
+done:
+    free(bytes);cJSON_Delete(current);cJSON_Delete(intent);cJSON_Delete(parts);cJSON_Delete(body);close(dir);return rc;
+}

@@ -472,3 +472,40 @@ int finalize_metadata(tgfs_bot *bot,const char *state,const cJSON *journal,const
     cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("intent_complete"));
     return 0;
 }
+
+/* Share the same durable, locked recovery journal with the upload writer. */
+int upload_log_event(int fd,const char *event,const char *id,tgfs_error *e)
+{
+    return log_event(fd,event,id,e);
+}
+int upload_attempts(int fd,unsigned char attempted[4096],int *commit_attempted,tgfs_error *e)
+{
+    struct stat st;
+    if(fstat(fd,&st) || st.st_size>TGFS_MAX_JSON || lseek(fd,0,SEEK_SET)<0) return fail(e,"cannot inspect upload recovery log");
+    FILE *stream=fdopen(dup(fd),"r");if(!stream) return fail(e,"cannot read upload recovery log");
+    char *line=NULL;size_t capacity=0,total=0;ssize_t n;int rc=0;
+    while((n=getline(&line,&capacity,stream))>=0) {
+        total+=(size_t)n;
+        if(total>TGFS_MAX_JSON) {rc=fail(e,"upload recovery log too large");break;}
+        cJSON *entry=json_parse_bytes((const unsigned char *)line,(size_t)n,e);
+        if(!entry || !json_string(entry,"event")) {cJSON_Delete(entry);rc=fail(e,"invalid upload recovery log");break;}
+        if(same(json_string(entry,"event"),"upload_chunk_pending")) {
+            uint64_t index;
+            if(decimal(json_string(entry,"message_id"),&index) || index>=4096) rc=fail(e,"invalid upload attempt index");
+            else attempted[index]=1;
+        }
+        if(same(json_string(entry,"event"),"upload_commit_pending")) *commit_attempted=1;
+        cJSON_Delete(entry);if(rc) break;
+    }
+    if(ferror(stream)) rc=fail(e,"cannot read upload recovery log");
+    free(line);fclose(stream);return rc;
+}
+int verify_upload_part(tgfs_bot *bot,const cJSON *journal,const cJSON *record,int fd,tgfs_error *e)
+{
+    cJSON *fresh=fresh_caption(bot,journal,record,fd,e);if(!fresh) return -1;
+    int good=cJSON_Compare(fresh,cJSON_GetObjectItemCaseSensitive(record,"record"),1) &&
+        cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(fresh,"file_commit_id")) &&
+        cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(fresh,"next_message"));
+    cJSON_Delete(fresh);
+    return good?0:fail(e,"fresh uncommitted CHUNK metadata differs or has navigation");
+}

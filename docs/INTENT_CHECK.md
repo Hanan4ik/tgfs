@@ -161,3 +161,6 @@ next_step=verified_in_capture. publication=confirmed относится к пр�
 [--finalize](FINALIZE_METADATA.md) поддерживает также подтверждённые mkdir и
 unlink: свежие документы, навигация child→ADD и atomic local complete.
 Неподтверждённые публикации не отправляются повторно.
+
+Продолжение ранней загрузки: [--resume-upload](RESUME_UPLOAD.md). Режимы
+изменений выбираются по одному; без флага intent остаётся read-only.
