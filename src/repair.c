@@ -9,12 +9,28 @@
 #include <fcntl.h>
 
 static int same(const char *a,const char *b) {return a && b && !strcmp(a,b);}
+static int append_log(int fd,const char *line,size_t length,tgfs_error *e)
+{
+    size_t done=0;while(done<length) {ssize_t wrote=write(fd,line+done,length-done);if(wrote<0 && errno==EINTR) continue;if(wrote<=0) return fail(e,"cannot write repair log");done+=(size_t)wrote;}
+    return fsync(fd)?fail(e,"cannot persist repair log"):0;
+}
 static int log_event(int fd,const char *event,const char *id,tgfs_error *e)
 {
     char line[160];int n=snprintf(line,sizeof(line),"{\"event\":\"%s\",\"message_id\":\"%s\"}\n",event,id?id:"");
     if(n<0 || (size_t)n>=sizeof(line)) return fail(e,"repair log overflow");
-    size_t done=0;while(done<(size_t)n) {ssize_t wrote=write(fd,line+done,(size_t)n-done);if(wrote<0 && errno==EINTR) continue;if(wrote<=0) return fail(e,"cannot write repair log");done+=(size_t)wrote;}
-    return fsync(fd)?fail(e,"cannot persist repair log"):0;
+    return append_log(fd,line,(size_t)n,e);
+}
+/* Only a validated, explicit rejection may release this request's send barrier. */
+static int directory_rejection(int fd,const char *operation,const tgfs_bot_error *b,tgfs_error *e)
+{
+    if(b->kind!=TGFS_BOT_API || b->outcome_unknown || b->http_status<400 || b->http_status>=500 ||
+        b->api_code!=b->http_status || (b->api_code==429 && !b->retry_after)) return 0;
+    time_t now=time(NULL);if(now<0) return fail(e,"cannot timestamp rejected ADD; send barrier retained");
+    uint64_t deadline=b->retry_after?(uint64_t)now+b->retry_after:0;
+    char line[256];int n=snprintf(line,sizeof(line),"{\"event\":\"directory_send_rejected\",\"message_id\":\"%s\",\"http_status\":%ld,\"api_code\":%d,\"retry_not_before\":\"%llu\"}\n",
+        operation,b->http_status,b->api_code,(unsigned long long)deadline);
+    if(n<0 || (size_t)n>=sizeof(line)) return fail(e,"rejection log overflow");
+    return append_log(fd,line,(size_t)n,e);
 }
 static cJSON *params(const char *chat)
 {
@@ -182,23 +198,42 @@ done:
 }
 
 /* A durable pending record is a send barrier, even after a lost response or crash. */
-static int directory_attempted(int fd,tgfs_error *e)
+static int directory_attempted(int fd,const char *operation,tgfs_error *e)
 {
     struct stat st;
     if(fstat(fd,&st) || st.st_size>TGFS_MAX_JSON) return fail(e,"recovery log too large or unreadable");
     if(lseek(fd,0,SEEK_SET)<0) return fail(e,"cannot read recovery log");
     FILE *stream=fdopen(dup(fd),"r");if(!stream) return fail(e,"cannot inspect recovery log");
-    char *line=NULL;size_t capacity=0,total=0;ssize_t n;int found=0;
+    char *line=NULL;size_t capacity=0,total=0;ssize_t n;int found=0;uint64_t deadline=0;
     while((n=getline(&line,&capacity,stream))>=0) {
         total+=(size_t)n;
         if(total>TGFS_MAX_JSON) {fail(e,"recovery log too large");found=-1;break;}
         cJSON *entry=json_parse_bytes((const unsigned char *)line,(size_t)n,e);
         if(!entry) {found=-1;break;}
-        if(same(json_string(entry,"event"),"directory_send_pending")) found=1;
+        const char *event=json_string(entry,"event");
+        if(same(event,"directory_send_pending")) {
+            if(found || !same(json_string(entry,"message_id"),operation)) {cJSON_Delete(entry);fail(e,"conflicting ADD attempts in recovery log");found=-1;break;}
+            found=1;
+        }
+        if(same(event,"directory_publication_confirmed")) found=2;
+        if(same(event,"directory_send_rejected")) {
+            size_t http,api;uint64_t when;
+            if(found!=1 || !same(json_string(entry,"message_id"),operation) || json_count(entry,"http_status",&http) ||
+                json_count(entry,"api_code",&api) || http<400 || http>=500 || api!=http ||
+                json_decimal(entry,"retry_not_before",&when) || (api==429 && !when)) {
+                cJSON_Delete(entry);fail(e,"invalid ADD rejection evidence in recovery log");found=-1;break;
+            }
+            found=0;if(when>deadline) deadline=when;
+        }
         cJSON_Delete(entry);
     }
     if(ferror(stream)) {fail(e,"cannot read recovery log");found=-1;}
-    free(line);fclose(stream);return found;
+    free(line);fclose(stream);
+    if(!found && deadline) {
+        time_t now=time(NULL);
+        if(now<0 || (uint64_t)now<=deadline) return fail(e,"ADD retry cooldown active; retry after Unix time %llu",(unsigned long long)deadline);
+    }
+    return found;
 }
 int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *intent,cJSON *report,int fd,tgfs_error *e)
 {
@@ -216,7 +251,7 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
     if(mkdir ? (!same(phase,"child_sent") && !same(phase,"child_send_pending") && !same(phase,"child_response_uncertain")) :
         (!same(phase,"backlinks_pending") && !same(phase,"commit_send_pending") && !same(phase,"commit_response_uncertain")))
         return fail(e,"ADD may already have been attempted; directory resume is blocked");
-    int attempted=directory_attempted(fd,e);if(attempted<0) return -1;
+    int attempted=directory_attempted(fd,json_string(intent,"add_operation_id"),e);if(attempted<0) return -1;
     if(attempted) return fail(e,"recovery log contains a previous ADD attempt; use a newer capture, never resend blindly");
     const char *path=json_string(intent,"parent_path"),*name=json_string(intent,"name"),*operation=json_string(intent,"add_operation_id");
     char mkdir_path[4097];
@@ -288,7 +323,12 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
 #endif
     tgfs_bot_error b;out=NULL;
     int rc=tgfs_bot_send_document(bot,json_string(journal,"storage_chat_id"),"directory.json",document,strlen(document),text,&out,&b);
-    if(rc) fail(e,"%s [http=%ld api=%d outcome_unknown=%d]",b.message,b.http_status,b.api_code,b.outcome_unknown);
+    if(rc) {
+        fail(e,"%s [http=%ld api=%d outcome_unknown=%d retry_after=%u]",b.message,b.http_status,b.api_code,b.outcome_unknown,b.retry_after);
+        tgfs_error saved=*e;
+        if(directory_rejection(fd,operation,&b,e)) {free(text);free(document);cJSON_Delete(out);return -1;}
+        *e=saved;
+    }
     long long channel,returned_channel,returned_size;mid=0;
     const cJSON *chat=cJSON_GetObjectItemCaseSensitive(out,"chat"),*doc=cJSON_GetObjectItemCaseSensitive(out,"document");
     uint64_t boundary;json_decimal(journal,"boundary_id",&boundary);
