@@ -64,7 +64,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if int(p['chat_id'])==STORAGE:
                 chat['pinned_message']=copy.deepcopy(s.messages[1])
                 if s.mode=='unlink-pin': s.unlink_pin_reads+=1
-                if (s.mode=='create-pin-after-commit' and 'FILE_COMMIT' in s.sent) or (s.mode=='unlink-pin' and s.unlink_pin_reads>=3) or s.mode=='pin' or (s.mode=='mkdir-pin' and s.sent) or (s.mode=='replace-pin' and len(s.sent)>s.before_replace):
+                if (s.mode=='create-pin-after-commit' and 'FILE_COMMIT' in s.sent) or (s.mode=='unlink-pin' and s.unlink_pin_reads>=3) or s.mode=='pin' or (s.mode=='mkdir-pin' and len(s.sent)>getattr(s,'mkdir_pin_after',0)) or (s.mode=='replace-pin' and len(s.sent)>s.before_replace):
                     header=copy.deepcopy(SB);header['root_object_id']=str(uuid.uuid4())
                     chat['pinned_message']['text']=json.dumps(header)
             return self.reply(chat)
@@ -271,7 +271,7 @@ class Put(unittest.TestCase):
                         self.assertEqual(listing.stdout,b'hello.txt\nnotes.txt\n')
             finally:
                 s.shutdown();s.server_close();t.join()
-    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok',diagnose=False,repair_case=None,finish_replace=None,metadata_finish=False):
+    def directories(self,mode='ok',mount=False,replace=False,replace_mode='ok',unlink=False,unlink_mode='ok',diagnose=False,repair_case=None,finish_replace=None,metadata_finish=False,metadata_resume=None):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -339,17 +339,82 @@ class Put(unittest.TestCase):
             try:
                 run(['intent','--help']);self.assertEqual(s.calls,[])
                 run(['mkdir','--help']);self.assertEqual(s.calls,[])
-                result,directory=write('mkdir',capture,'--path','/documents',code=0 if mode=='ok' else 1)
+                mkdir_path='/documents'
+                if metadata_resume=='nested':
+                    s.mode='ok';write('mkdir',capture,'--path','/container');capture=scan()
+                    s.mode=mode;s.mkdir_pin_after=len(s.sent);mkdir_path='/container/documents/'
+                result,directory=write('mkdir',capture,'--path',mkdir_path,code=0 if mode=='ok' else 1)
                 if mode!='ok':
                     self.assertIsNotNone(directory)
                     expected={'mkdir-lost-child':'child_response_uncertain','mkdir-response':'child_response_uncertain',
                         'mkdir-lost-parent':'directory_response_uncertain','mkdir-pin':'child_sent',
                         'mkdir-edit':'published_navigation_pending'}[mode]
                     self.assertEqual(directory['phase'],expected)
-                    self.assertEqual(len(s.sent),1 if mode in ('mkdir-lost-child','mkdir-response','mkdir-pin') else 2)
+                    self.assertEqual(len(s.sent),(2 if metadata_resume=='nested' else 0)+(1 if mode in ('mkdir-lost-child','mkdir-response','mkdir-pin') else 2))
                     before=len(s.sent);saved=s.intent.parent
                     write('mkdir',capture,'--path','/documents',state=saved,code=1)
                     self.assertEqual(len(s.sent),before)
+                    if metadata_resume:
+                        s.mode='ok';cap=scan();s.intent=saved/'intent.json'
+                        original=s.intent.read_bytes();count=len(s.sent)
+                        command=['intent','--resume-directory','--state-dir',str(saved),'--capture',str(cap),'--token-file',str(token)]
+                        if metadata_resume=='pending':
+                            mid=next(mid for mid,msg in s.messages.items() if json.loads(msg.get('caption','{}')).get('object_id')==ROOT)
+                            del s.messages[mid]
+                            cap=scan();command[command.index('--capture')+1]=str(cap)
+                        if metadata_resume in ('missing','duplicate'):
+                            mid=int(directory['child_message_id'])
+                            if metadata_resume=='missing': del s.messages[mid]
+                            else:
+                                dup=copy.deepcopy(s.messages[mid]);dup['message_id']=s.next
+                                s.messages[s.next]=dup;s.next+=1
+                            cap=scan();command[command.index('--capture')+1]=str(cap)
+                        if metadata_resume=='conflict':
+                            saved_intent=s.intent
+                            write('mkdir',cap,'--path','/documents');s.intent=saved_intent
+                            cap=scan();command[command.index('--capture')+1]=str(cap);count=len(s.sent)
+                        if metadata_resume=='known-id':
+                            changed=json.loads(original);changed['child_message_id']='99999'
+                            s.intent.write_text(json.dumps(changed));original=s.intent.read_bytes()
+                        if metadata_resume in ('child-pending','directory-ref','wrong-path','phase'):
+                            changed=json.loads(original)
+                            if metadata_resume=='child-pending':
+                                changed['phase']='child_send_pending';changed.pop('child_message_id',None)
+                            elif metadata_resume=='directory-ref': changed['directory_message_id']='99999'
+                            elif metadata_resume=='wrong-path': changed['path']='/wrong-name'
+                            else: changed['phase']='complete'
+                            s.intent.write_text(json.dumps(changed));original=s.intent.read_bytes()
+                        if metadata_resume=='invalid-child':
+                            changed=json.loads(original);changed['child_caption']['parent_id']=str(uuid.uuid4())
+                            s.intent.write_text(json.dumps(changed));original=s.intent.read_bytes()
+                        if metadata_resume=='log':
+                            log=saved/'backlink-repair.log';log.write_text('{bad');log.chmod(0o600)
+                        if metadata_resume=='navigation':
+                            mid=int(directory['child_message_id']);bad=json.loads(s.messages[mid]['caption'])
+                            bad['next_message']='99999';s.messages[mid]['caption']=json.dumps(bad)
+                        s.mode={'lost':'resume-lost','reject':'resume-apierror','origin':'repair-origin',
+                                'cleanup':'repair-cleanup','pin':'pin'}.get(metadata_resume,'ok')
+                        blocked=metadata_resume in ('directory-ref','wrong-path','phase','pending','missing','duplicate','conflict','known-id','invalid-child','log','navigation','origin','cleanup','pin','reject')
+                        result=run(command,code=1 if blocked or metadata_resume=='lost' else 0)
+                        self.assertEqual(s.intent.read_bytes(),original)
+                        if blocked:
+                            self.assertEqual(len(s.sent),count)
+                            if metadata_resume=='reject': run(command,code=1)
+                            return
+                        already=mode in ('mkdir-lost-parent','mkdir-edit')
+                        self.assertEqual(len(s.sent),count if already else count+1)
+                        if metadata_resume!='lost':
+                            report=json.loads(result.stdout)
+                            self.assertEqual(report['directory_resume'],'already_observed' if already else 'published')
+                            self.assertEqual(report['resumed'],not already)
+                        s.mode='ok'
+                        if not already: run(command,code=1) # pending log + stale capture
+                        final=scan();command[command.index('--capture')+1]=str(final)
+                        self.assertEqual(json.loads(run(command).stdout)['directory_resume'],'already_observed')
+                        self.assertEqual(len(s.sent),count if already else count+1)
+                        self.assertEqual(read(final,'ls',mkdir_path.rstrip('/')),b'')
+                        finish_metadata(saved,final)
+                        return
                     if metadata_finish:
                         s.mode='ok';cap=scan()
                         finish_metadata(saved,cap,0 if mode in ('mkdir-lost-parent','mkdir-edit') else 1)
@@ -358,6 +423,7 @@ class Put(unittest.TestCase):
                         s.mode='ok';fresh=scan();self.assertEqual(read(fresh,'ls','/'),b'documents\n')
                         self.assertEqual(read(fresh,'ls','/documents'),b'')
                     return
+                mkdir_intent=s.intent
                 self.assertEqual(directory['phase'],'complete');self.assertEqual(uuid.UUID(directory['object_id']).version,4)
                 self.assertEqual(s.sent,['DIRECTORY','DIRECTORY'])
                 child=json.loads(s.messages[int(directory['child_message_id'])]['caption'])
@@ -368,6 +434,14 @@ class Put(unittest.TestCase):
                 write('put',capture,'--file',str(source),'--name','too-early.txt','--parent','/documents',code=1)
                 self.assertEqual(len(s.sent),before)
                 cap=scan();self.assertEqual(read(cap,'ls','/'),b'documents\n');self.assertEqual(read(cap,'ls','/documents'),b'')
+                if metadata_resume:
+                    s.intent=mkdir_intent
+                    original=s.intent.read_bytes();count=len(s.sent)
+                    command=['intent','--resume-directory','--state-dir',str(s.intent.parent),'--capture',str(cap),'--token-file',str(token)]
+                    report=json.loads(run(command).stdout)
+                    self.assertEqual(report['directory_resume'],'already_observed');self.assertFalse(report['resumed'])
+                    self.assertEqual(s.intent.read_bytes(),original);self.assertEqual(len(s.sent),count)
+                    return
                 write('mkdir',cap,'--path','/documents',code=1)
                 write('mkdir',cap,'--path','/missing/sub',code=1)
                 write('mkdir',cap,'--path','/documents/../bad',code=1)
@@ -769,6 +843,14 @@ class Put(unittest.TestCase):
         for case in ('missing','commit-uncertain','duplicate','staging','log','origin','cleanup','pin','reject'):
             with self.subTest(case=case): self.upload_recovery(case)
     def test_resume_replacement_upload(self): self.upload_recovery(replace=True)
+    def test_resume_mkdir_directory(self):
+        self.directories(metadata_resume='ok')
+        for mode in ('mkdir-lost-child','mkdir-response','mkdir-pin','mkdir-lost-parent','mkdir-edit'):
+            with self.subTest(mode=mode): self.directories(mode=mode,metadata_resume='ok')
+        self.directories(mode='mkdir-lost-parent',metadata_resume='pending')
+        self.directories(mode='mkdir-pin',metadata_resume='nested')
+        for case in ('child-pending','directory-ref','wrong-path','phase','lost','reject','missing','duplicate','conflict','known-id','invalid-child','log','navigation','origin','cleanup','pin'):
+            with self.subTest(case=case): self.directories(mode='mkdir-pin',metadata_resume=case)
     def test_finalize_mkdir(self):
         self.directories(metadata_finish=True)
         self.directories(metadata_finish='conflict')

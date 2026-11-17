@@ -267,3 +267,24 @@ atomic intent сохраняют UUID/refs. Неизвестная попытк�
 Проверка реализации: 124 теста; локально 120 passed/4 kernel skips, полный
 ASan/UBSan с отключённым локальным LSan прошёл. CI проверяет kernel mounts
 и sanitizer с обычными настройками. Живой interrupted-upload ещё не проверен.
+
+
+## Продолжение публикации mkdir (2026-11-18)
+
+Пользователь подтвердил --resume-upload на завершённом put/capture-011:
+commit37/part36/ADD38, already_committed/resumed=false, проверка по capture.
+[--resume-directory](RESUME_DIRECTORY.md) расширен на mkdir с подтверждённым
+дочерним DIRECTORY. До первой попытки ADD допустимы child_send_pending,
+child_response_uncertain/child_sent; missing/ambiguous child, конфликт имени,
+неверные refs/metadata/navigation/pin и durable send barrier блокируют запись.
+Исходные UUID сохраняются, повторной отправки child и перезаписи intent нет.
+После ADD нужны новый scan и существующий --finalize. Тестовый API проверяет
+lost child/ADD, stale repeat/reject, nested path, conflicts и полное завершение.
+Безопасный живой тест — mkdir-documents-001/capture-011: already_observed,
+resumed=false; искусственный сбой не требуется. Живой непустой mkdir recovery,
+init/unlink resume, local crash-files и cleanup/GC остаются открытыми.
+
+Проверка: 125 тестовых методов, обычный локальный прогон прошёл
+(121 passed/4 kernel skips без /dev/fuse). Полный ASan/UBSan также прошёл;
+локальный LSan отключён из-за ограничений окружения. CI дополнительно
+проверяет kernel mounts и sanitizer с обычными настройками.

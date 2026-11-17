@@ -202,19 +202,32 @@ static int directory_attempted(int fd,tgfs_error *e)
 }
 int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *intent,cJSON *report,int fd,tgfs_error *e)
 {
-    if(!same(json_string(intent,"kind"),"put") || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(intent,"replace")) ||
-        !cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"commit_ids")) || !same(json_string(report,"staging"),"verified"))
+    int mkdir=same(json_string(intent,"kind"),"mkdir");
+    if(!mkdir && (!same(json_string(intent,"kind"),"put") || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(intent,"replace")) ||
+        !cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"commit_ids")) || !same(json_string(report,"staging"),"verified")))
         return fail(e,"directory resume requires a verified new-file put with confirmed FILE_COMMIT");
+    if(mkdir && !cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"child_ids")))
+        return fail(e,"mkdir resume requires a confirmed child DIRECTORY");
     const char *blocked[]={"unobserved_part_indexes","ambiguous_part_indexes","unobserved_known_ids"};
     for(size_t i=0;i<3;i++) if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,blocked[i]))) return fail(e,"directory resume blocked by missing or ambiguous parts");
     if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"directory_ids")))
         return cJSON_AddStringToObject(report,"directory_resume","already_observed")?0:fail(e,"out of memory");
     const char *phase=json_string(intent,"phase");
-    if(!same(phase,"backlinks_pending") && !same(phase,"commit_send_pending") && !same(phase,"commit_response_uncertain"))
+    if(mkdir ? (!same(phase,"child_sent") && !same(phase,"child_send_pending") && !same(phase,"child_response_uncertain")) :
+        (!same(phase,"backlinks_pending") && !same(phase,"commit_send_pending") && !same(phase,"commit_response_uncertain")))
         return fail(e,"ADD may already have been attempted; directory resume is blocked");
     int attempted=directory_attempted(fd,e);if(attempted<0) return -1;
     if(attempted) return fail(e,"recovery log contains a previous ADD attempt; use a newer capture, never resend blindly");
     const char *path=json_string(intent,"parent_path"),*name=json_string(intent,"name"),*operation=json_string(intent,"add_operation_id");
+    char mkdir_path[4097];
+    if(mkdir) {
+        const char *saved=json_string(intent,"path");
+        if(!saved || saved[0]!='/' || strlen(saved)>4096) return fail(e,"invalid mkdir intent path");
+        memcpy(mkdir_path,saved,strlen(saved)+1);size_t length=strlen(mkdir_path);
+        while(length>1 && mkdir_path[length-1]=='/') mkdir_path[--length]=0;
+        char *slash=strrchr(mkdir_path,'/');name=slash+1;path="/";
+        if(slash!=mkdir_path) {*slash=0;path=mkdir_path;}
+    }
     if(!path || !uuid_valid(operation)) return fail(e,"missing saved directory destination");
     char parent[37],grandparent[37];
     if(directory_target(fs,path,name,parent,grandparent,e)) return -1;
@@ -229,12 +242,32 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
         !same(json_string(caption,"type"),"DIRECTORY") || !same(json_string(caption,"magic"),"TGFS") ||
         (grandparent[0]?!same(json_string(caption,"parent_id"),grandparent):!cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(caption,"parent_id"))))
         return fail(e,"saved ADD/caption destination disagrees with intent and captured parent");
-    if(repair_backlinks(bot,journal,intent,report,fd,e)) return -1;
-    const char *commit_id=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(report,"commit_ids"),0)->valuestring;
-    const cJSON *record=record_find(journal,commit_id);
+    const char *source_id;
+    if(mkdir) {
+        const cJSON *children=cJSON_GetObjectItemCaseSensitive(report,"child_ids");
+        if(cJSON_GetArraySize(children)!=1) return fail(e,"mkdir resume requires one confirmed child DIRECTORY");
+        source_id=cJSON_GetArrayItem(children,0)->valuestring;
+        const char *known=json_string(intent,"child_message_id");
+        if((cJSON_GetObjectItemCaseSensitive(intent,"child_message_id") && !same(known,source_id)) ||
+            cJSON_GetObjectItemCaseSensitive(intent,"directory_message_id"))
+            return fail(e,"saved mkdir message IDs disagree with captured pre-ADD state");
+        const cJSON *cc=cJSON_GetObjectItemCaseSensitive(intent,"child_caption");
+        const cJSON *cb=cJSON_GetObjectItemCaseSensitive(intent,"child_document");
+        if(!same(json_string(cc,"object_id"),json_string(intent,"object_id")) ||
+            !same(json_string(cc,"parent_id"),parent) || !same(json_string(cc,"magic"),"TGFS") ||
+            !same(json_string(cc,"type"),"DIRECTORY") || json_count(cc,"format_version",&format) || format!=1 ||
+            !cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(cc,"next_message")) || directory_operations_valid(cb,e) ||
+            cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(cb,"operations")))
+            return fail(e,"saved child DIRECTORY disagrees with mkdir intent");
+    } else {
+        if(repair_backlinks(bot,journal,intent,report,fd,e)) return -1;
+        source_id=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(report,"commit_ids"),0)->valuestring;
+    }
+    const cJSON *record=record_find(journal,source_id);
     cJSON *fresh=fresh_caption(bot,journal,record,fd,e);if(!fresh) return -1;
-    int good=json_semantic_equal(fresh,cJSON_GetObjectItemCaseSensitive(record,"record"));cJSON_Delete(fresh);
-    if(!good) return fail(e,"fresh FILE_COMMIT differs from capture");
+    int good=json_semantic_equal(fresh,cJSON_GetObjectItemCaseSensitive(record,"record")) &&
+        (!mkdir || cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(fresh,"next_message")));cJSON_Delete(fresh);
+    if(!good) return fail(e,"fresh source metadata or navigation differs from capture");
     /* Validate the pin again immediately before publication. */
     cJSON *p=params(json_string(journal,"storage_chat_id")),*out=NULL;
     if(call(bot,"getChat",p,&out,0,e)) return -1;
