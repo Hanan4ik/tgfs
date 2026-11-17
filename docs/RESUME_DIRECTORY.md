@@ -1,14 +1,15 @@
-# Восстановление публикации имени после FILE_COMMIT
+# Восстановление публикации имени
 
-Реализован явный `tgfs intent --resume-directory` для создания нового файла.
-Это продолжение одного этапа put, не полное resume. Режим не отправляет новые
+Реализован явный `tgfs intent --resume-directory` для создания нового файла
+и ADD родителя в `mkdir` с уже опубликованным дочерним DIRECTORY.
+Это продолжение публикации имени, не полное resume. Режим не отправляет новые
 CHUNK/FILE_COMMIT, не заменяет файл и не восстанавливает удалённые имена.
 С --repair-backlinks одновременно использовать нельзя: необходимые backlinks
 режим проверяет/исправляет сам.
 
 ## Условия и запреты
 
-Требуются intent kind=put, replace=false, подтверждённый canonical FILE_COMMIT,
+Для put требуются intent kind=put, replace=false, подтверждённый canonical FILE_COMMIT,
 verified staging/CHUNK/refs и отсутствие ненаблюдённых/неоднозначных частей.
 Сохраняются UUID объекта, версии, FILE_COMMIT и ADD из первоначального intent.
 
@@ -95,5 +96,46 @@ backlinks, пустой файл, lost ADD response, явный reject и бар
 воскрешения после REMOVE. Проверяется сохранность intent и отсутствие новых
 CHUNK/FILE_COMMIT. Локально 112 passed/4 kernel skips; ASan/UBSan с detect_leaks=0
 из-за ptrace. Живое непустое продолжение ещё ожидает реального незавершённого
-намерения. init/mkdir/unlink resume, загрузка недостающих частей, полный ремонт
-навигации и автоматический cleanup log остаются открытыми.
+намерения. Загрузка недостающих частей добавлена в [RESUME_UPLOAD.md](RESUME_UPLOAD.md),
+финализация — в [FINALIZE_METADATA.md](FINALIZE_METADATA.md) и
+[FINALIZE_PUT.md](FINALIZE_PUT.md). Init/unlink resume и автоматический
+cleanup log остаются открытыми.
+
+
+## Прерванный mkdir (2026-11-18)
+
+Для `kind=mkdir` тот же флаг восстанавливает только ADD родителя. Дочерний
+DIRECTORY должен уже присутствовать в новом capture с точным сохранённым
+пустым документом и metadata. Если ADD ещё не найден, требуется ровно один
+дочерний документ; сохранённый child_message_id, если он есть, обязан совпадать.
+Сам дочерний документ повторно не отправляется, data.bin не нужен.
+
+Разрешены только child_send_pending, child_response_uncertain и child_sent:
+это фазы до первой попытки ADD в исходном writer. directory_send_pending и
+более поздние фазы при ненаблюдённом ADD блокируются, как и любой прежний
+recovery directory_send_pending. Даже явный API reject сохраняет барьер.
+Если исходная ADD уже наблюдалась, возвращается already_observed без отправки.
+
+Перед публикацией проверяются сохранённый path (включая вложенный каталог и
+завершающий /), UUID родителя, свободное имя, исходный ADD UUID и caption.
+Дочерний документ перечитывается через служебную копию, проверяются источник,
+идентичность документа, metadata и next_message=null. Неожиданная ссылка,
+изменённый pin, сбой чтения или очистки копии блокируют отправку. Дальше
+используется тот же fsync-барьер и проверка ответа, что для put.
+
+После published нужен новый scan и `--finalize`: он свяжет дочерний DIRECTORY
+с подтверждённым ADD и атомарно завершит intent. Resume сам не редактирует
+дочернюю навигацию и не переписывает intent.json. При неизвестном ответе
+повтор по прежнему capture блокируется; новый capture с ADD даёт already_observed.
+
+Безопасная проверка на уже завершённом пользовательском mkdir:
+
+```sh
+./build/tgfs intent "${tgfs_net[@]}" \
+  --state-dir "$HOME/.local/state/tgfs/mkdir-documents-001" \
+  --capture ./capture-011 --resume-directory
+```
+
+Ожидаются directory_resume=already_observed и resumed=false. Новые документы
+не публикуются; искусственно прерывать mkdir не нужно. Непустой recovery
+проверен тестовым API, живой прерванный mkdir пока не проверен.
