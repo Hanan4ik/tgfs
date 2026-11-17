@@ -288,3 +288,21 @@ init/unlink resume, local crash-files и cleanup/GC остаются откры�
 (121 passed/4 kernel skips без /dev/fuse). Полный ASan/UBSan также прошёл;
 локальный LSan отключён из-за ограничений окружения. CI дополнительно
 проверяет kernel mounts и sanitizer с обычными настройками.
+
+
+## Подтверждённый отказ ADD и повтор (2026-11-18)
+
+Пользователь подтвердил живой mkdir resume no-op на capture-011:
+child33/ADD34, already_observed/resumed=false. Реализовано разрешение следующего
+явного --resume-directory после подтверждённого 4xx отказа предыдущего recovery
+запуска: совпадающие HTTP/API коды, валидный envelope, fsync rejected для той же
+pending операции; 429 требует retry_after и сохранённого срока. После ожидания
+все проверки назначения/source/pin повторяются. Автоматического retry внутри
+запуска нет. Потерянный ответ, 5xx, malformed response и старый unknown без
+rejected по-прежнему блокируют запись; старый rejected не снимает новый pending.
+Документ: [RESUME_DIRECTORY.md](RESUME_DIRECTORY.md). Следующие пробелы —
+такая же доказательная обработка CHUNK/commit и исходного writer, init/unlink
+resume, local crash-files и cleanup/GC. Живой непустой recovery пока не проверен.
+
+Проверка: 127 тестовых методов; обычный локальный прогон прошёл
+(123 passed/4 kernel skips без /dev/fuse).

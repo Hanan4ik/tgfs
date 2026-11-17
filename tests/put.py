@@ -46,6 +46,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 assert 'directory_send_pending' in (s.intent.parent/'backlink-repair.log').read_text()
             else: assert intent['phase']==expected
             if intent.get('kind') not in ('mkdir','unlink'): assert (s.intent.parent/'data.bin').read_bytes()==s.input_data
+            if s.mode.startswith('reject-'):
+                case=s.mode[7:];code=429 if case in ('429','badretry','no-retry') else 403 if case=='403' else 500 if case=='500' else 400
+                http=500 if case=='http500' else 403 if case=='mismatch' else code
+                error=dict(ok=False,error_code=code,description=TOKEN)
+                if case=='nodescription': error.pop('description')
+                if case=='result': error['result']=dict(message_id=999)
+                if case=='429': error['parameters']=dict(retry_after=1)
+                if case=='badretry': error['parameters']=dict(retry_after='invalid')
+                return self.reply(error=error,status=http)
             if (s.mode=='unlink-apierror' and intent.get('kind')=='unlink') or s.mode=='resume-apierror':
                 return self.reply(error=dict(ok=False,error_code=429,description=TOKEN,parameters=dict(retry_after=5)),status=429)
             mid=s.next;s.next+=1
@@ -106,6 +115,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
 
 class Put(unittest.TestCase):
+    def retry_add(self,run,command,s,state,case):
+        original=(state/'intent.json').read_bytes();before=list(s.sent)
+        s.mode='reject-'+('400' if case in ('twice','then-lost','bad-log','wrong-operation','orphan-rejection','confirmed') else case)
+        result=run(command);self.assertEqual(result.returncode,1,result.stderr)
+        self.assertEqual(s.sent,before);self.assertEqual((state/'intent.json').read_bytes(),original)
+        log=state/'backlink-repair.log';events=[json.loads(line) for line in log.read_text().splitlines()]
+        rejected=[event for event in events if event['event']=='directory_send_rejected']
+        safe=case in ('400','403','429','twice','then-lost','bad-log','wrong-operation','orphan-rejection','confirmed')
+        self.assertEqual(bool(rejected),safe)
+        if case=='429':
+            start=len(s.calls);s.mode='ok';result=run(command)
+            self.assertEqual(result.returncode,1);self.assertIn(b'cooldown',result.stderr)
+            self.assertNotIn('sendDocument',s.calls[start:])
+            time.sleep(max(0,int(rejected[-1]['retry_not_before'])-time.time()+1.05))
+        if case in ('bad-log','wrong-operation','orphan-rejection','confirmed'):
+            if case=='bad-log': log.write_text(log.read_text()[:-8])
+            elif case=='wrong-operation':
+                events[-1]['message_id']=str(uuid.uuid4());log.write_text(''.join(json.dumps(event)+'\n' for event in events))
+            elif case=='orphan-rejection': log.write_text(json.dumps(rejected[-1])+'\n')
+            else:
+                events.insert(-1,dict(event='directory_publication_confirmed',message_id='999'))
+                log.write_text(''.join(json.dumps(event)+'\n' for event in events))
+            safe=False
+        if case=='twice':
+            result=run(command);self.assertEqual(result.returncode,1)
+            self.assertEqual(s.sent,before)
+        s.mode='resume-lost' if case=='then-lost' else 'ok';start=len(s.calls)
+        result=run(command);self.assertEqual(result.returncode,0 if safe and case!='then-lost' else 1,result.stderr)
+        if safe:
+            self.assertEqual(s.sent,before+['DIRECTORY'])
+            if case!='then-lost': self.assertEqual(json.loads(result.stdout)['directory_resume'],'published')
+            s.mode='ok';result=run(command);self.assertEqual(result.returncode,1)
+            self.assertEqual(s.sent,before+['DIRECTORY'])
+        else:
+            self.assertNotIn('sendDocument',s.calls[start:]);self.assertEqual(s.sent,before)
+        self.assertEqual((state/'intent.json').read_bytes(),original)
     def exercise(self,data=b'hello\n',mode='ok',readback=True,recover=False,recovery_mode='ok',finalize_case=None):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
@@ -150,6 +195,8 @@ class Put(unittest.TestCase):
                             result=run(other);self.assertEqual(result.returncode,0,result.stderr)
                             s.intent=saved;cap=scan_to('conflict-capture');before=list(s.sent)
                         command=['intent','--resume-directory','--state-dir',str(state),'--capture',str(cap),'--token-file',str(token)]
+                        if recovery_mode.startswith('retry:'):
+                            self.retry_add(run,command,s,state,recovery_mode[6:]);return
                         s.mode={'lost':'resume-lost','reject':'resume-apierror'}.get(recovery_mode,'ok')
                         result=run(command)
                         self.assertEqual(result.returncode,0 if recovery_mode=='ok' else 1,result.stderr)
@@ -288,7 +335,7 @@ class Put(unittest.TestCase):
             serial=0
             def run(args,code=0):
                 result=subprocess.run([BINARY,*args],env=env,capture_output=True,timeout=15)
-                self.assertEqual(result.returncode,code,result.stderr)
+                if code is not None: self.assertEqual(result.returncode,code,result.stderr)
                 self.assertNotIn(TOKEN,result.stderr.decode());self.assertNotIn(b'AddressSanitizer',result.stderr)
                 self.assertNotIn(b'runtime error:',result.stderr);return result
             def write(command,cap,*args,code=0,state=None):
@@ -358,6 +405,8 @@ class Put(unittest.TestCase):
                         s.mode='ok';cap=scan();s.intent=saved/'intent.json'
                         original=s.intent.read_bytes();count=len(s.sent)
                         command=['intent','--resume-directory','--state-dir',str(saved),'--capture',str(cap),'--token-file',str(token)]
+                        if metadata_resume.startswith('retry:'):
+                            self.retry_add(lambda args:run(args,code=None),command,s,saved,metadata_resume[6:]);return
                         if metadata_resume=='pending':
                             mid=next(mid for mid,msg in s.messages.items() if json.loads(msg.get('caption','{}')).get('object_id')==ROOT)
                             del s.messages[mid]
@@ -843,6 +892,12 @@ class Put(unittest.TestCase):
         for case in ('missing','commit-uncertain','duplicate','staging','log','origin','cleanup','pin','reject'):
             with self.subTest(case=case): self.upload_recovery(case)
     def test_resume_replacement_upload(self): self.upload_recovery(replace=True)
+    def test_retry_rejected_put_add(self):
+        for case in ('400','403','429','twice','then-lost','bad-log','wrong-operation','orphan-rejection','confirmed','500','http500','mismatch','nodescription','result','badretry','no-retry'):
+            with self.subTest(case=case): self.exercise(mode='edit',recover=True,recovery_mode='retry:'+case)
+    def test_retry_rejected_mkdir_add(self):
+        for case in ('400','429','then-lost','500'):
+            with self.subTest(case=case): self.directories(mode='mkdir-pin',metadata_resume='retry:'+case)
     def test_resume_mkdir_directory(self):
         self.directories(metadata_resume='ok')
         for mode in ('mkdir-lost-child','mkdir-response','mkdir-pin','mkdir-lost-parent','mkdir-edit'):

@@ -239,8 +239,12 @@ static int api_result(response *r, long http, int mutating, const char *token, c
         }
         if (e) {
             e->api_code = (int)code;
-            /* 5xx after a mutating request does not prove that nothing happened. */
-            e->outcome_unknown = mutating && (code >= 500 || http >= 500);
+            /* Release no send barrier for inconsistent or incomplete failure envelopes. */
+            int retry_valid=!parameters || (cJSON_IsObject(parameters) &&
+                (!cJSON_HasObjectItem(parameters,"retry_after") ||
+                 (!tgfs_bot_integer(parameters,"retry_after",&retry) && retry>0 && retry<=UINT_MAX)));
+            e->outcome_unknown = mutating && !(code>=400 && code<500 && http==code &&
+                json_string(root,"description") && !cJSON_HasObjectItem(root,"result") && retry_valid);
             if (!tgfs_bot_integer(parameters, "retry_after", &retry) && retry > 0 && retry <= UINT_MAX)
                 e->retry_after = (unsigned)retry;
         }
