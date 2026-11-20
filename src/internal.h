@@ -5,6 +5,7 @@
 #include "tgfs/bot_api.h"
 #include <stdint.h>
 
+#define TGFS_BOT_MAX_EXACT_ID 4503599627370495LL
 #define TGFS_MAX_JSON (8U * 1024U * 1024U)
 #define TGFS_MAX_CHUNK 20971520U
 #define TGFS_MAX_RECORDS 65536

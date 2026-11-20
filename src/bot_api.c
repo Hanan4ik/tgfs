@@ -14,7 +14,6 @@
 
 #define API_LIMIT (1024U * 1024U)
 #define TOKEN_LIMIT 256
-#define MAX_EXACT_ID 4503599627370495LL
 
 struct tgfs_bot {
     CURL *curl;
@@ -40,7 +39,7 @@ int tgfs_bot_integer(const cJSON *object, const char *key, long long *out)
 {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(object, key);
     if (!out || !cJSON_IsNumber(v) || !isfinite(v->valuedouble) ||
-        fabs(v->valuedouble) > (double)MAX_EXACT_ID || floor(v->valuedouble) != v->valuedouble) return -1;
+        fabs(v->valuedouble) > (double)TGFS_BOT_MAX_EXACT_ID || floor(v->valuedouble) != v->valuedouble) return -1;
     *out = (long long)v->valuedouble;
     return 0;
 }
@@ -48,7 +47,7 @@ int tgfs_bot_integer(const cJSON *object, const char *key, long long *out)
 int tgfs_bot_channel_id(const char *s, long long *out)
 {
     uint64_t n;
-    if (!s || !out || s[0] != '-' || decimal(s + 1, &n) || !n || n > MAX_EXACT_ID) return -1;
+    if (!s || !out || s[0] != '-' || decimal(s + 1, &n) || !n || n > TGFS_BOT_MAX_EXACT_ID) return -1;
     *out = -(long long)n;
     return 0;
 }
