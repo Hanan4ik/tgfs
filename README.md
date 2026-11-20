@@ -43,6 +43,8 @@ make test
 
 [Ограниченный ремонт backlinks](docs/BACKLINK_REPAIR.md): `tgfs intent --repair-backlinks`.
 
+[Продолжение unlink](docs/UNLINK.md) — `tgfs intent --resume-unlink`.
+
 [Восстановление публикации имени](docs/RESUME_DIRECTORY.md): `tgfs intent --resume-directory`.
 
 [Завершение подтверждённого put](docs/FINALIZE_PUT.md): `tgfs intent --finalize`.

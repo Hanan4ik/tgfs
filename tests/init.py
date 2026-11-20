@@ -42,9 +42,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         assert p['message_id']==7
         assert json.loads(s.intent.read_text())['phase']=='pin_pending'
         s.pinned=True
+        if s.mode=='lost-pin':
+            self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
         return self.reply(True)
 class Init(unittest.TestCase):
-    def run_init(self,mode='ok'):
+    def run_init(self,mode='ok',finish=None):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);token=root/'token';token.write_text(TOKEN);token.chmod(0o600)
             server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
@@ -62,9 +64,25 @@ class Init(unittest.TestCase):
                     retry=subprocess.run(args,env=env,capture_output=True,text=True,timeout=10)
                     self.assertEqual(retry.returncode,1)
                     self.assertEqual(server.calls.count('sendMessage'),count)
+                if finish:
+                    finalize=args.copy();finalize[finalize.index('--new-volume')]='--finalize-existing'
+                    if finish=='foreign': server.text=server.text.replace(intent['root_object_id'],str(uuid.uuid4()))
+                    if finish=='absent': server.pinned=False
+                    original=server.intent.read_bytes()
+                    for _ in range(2):
+                        start=len(server.calls)
+                        check=subprocess.run(finalize,env=env,capture_output=True,text=True,timeout=10)
+                        self.assertEqual(check.returncode,0 if finish=='ok' else 1,check.stderr)
+                        self.assertEqual(server.calls[start:],[] if mode=='lost' else ['getChat'])
+                        if finish=='ok': self.assertEqual(json.loads(server.intent.read_text())['phase'],'complete')
+                        else: self.assertEqual(server.intent.read_bytes(),original)
                 return p.returncode,out,intent,server.text,server.calls
             finally:
                 server.shutdown();server.server_close();worker.join()
+    def test_finalize_existing(self):
+        for mode,finish in (('ok','ok'),('lost-pin','ok'),('lost-pin','foreign'),('lost-pin','absent'),('lost','blocked')):
+            with self.subTest(mode=mode,finish=finish): self.run_init(mode,finish)
+
     def test_success(self):
         rc,out,intent,text,calls=self.run_init()
         self.assertEqual(rc,0,out)

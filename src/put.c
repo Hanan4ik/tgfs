@@ -211,6 +211,18 @@ static cJSON *addition(const char *operation,const char *name,const char *object
 invalid:
     cJSON_Delete(entry);cJSON_Delete(ops);cJSON_Delete(body);return NULL;
 }
+static int create_recovery_log(int dir,tgfs_error *e)
+{
+    int fd=openat(dir,"backlink-repair.log",O_RDWR|O_CREAT|O_EXCL|O_APPEND|O_NOFOLLOW|O_CLOEXEC,0600);
+    struct stat st;
+    if(fd<0 || fstat(fd,&st) || !S_ISREG(st.st_mode) || st.st_nlink!=1 || st.st_uid!=geteuid() ||
+        (st.st_mode&0077) || flock(fd,LOCK_EX|LOCK_NB) || fsync(dir)) {
+        if(fd>=0) close(fd);
+        return fail(e,"cannot create and lock private recovery journal");
+    }
+    return fd;
+}
+
 static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *name,const char *parent_path,
                const char *state,size_t chunk_size,int replace,tgfs_error *e)
 {
@@ -238,12 +250,7 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
         fail(e,"cannot generate publication IDs or SHA-256");goto done;
     }
     dir=stage_open(state,e);if(dir<0) goto done;
-    logfd=openat(dir,"backlink-repair.log",O_RDWR|O_CREAT|O_EXCL|O_APPEND|O_NOFOLLOW|O_CLOEXEC,0600);
-    struct stat logstat;
-    if(logfd<0 || fstat(logfd,&logstat) || !S_ISREG(logstat.st_mode) || logstat.st_nlink!=1 ||
-        logstat.st_uid!=geteuid() || (logstat.st_mode&0077) || flock(logfd,LOCK_EX|LOCK_NB) || fsync(dir)) {
-        fail(e,"cannot create and lock private put recovery journal");goto done;
-    }
+    logfd=create_recovery_log(dir,e);if(logfd<0) goto done;
     if(write_file(dir,"data.bin",bytes,size,e)) goto done;
     intent=cJSON_CreateObject();parts=cJSON_CreateArray();captions=cJSON_CreateArray();
     commit=envelope("FILE_COMMIT",object);body=cJSON_CreateObject();
@@ -433,7 +440,7 @@ usage:
 
 static int make_directory(tgfs_bot *bot,const cJSON *journal,const char *path,const char *state,tgfs_error *e)
 {
-    int rc=-1,dir=-1;char *split=strdup(path);
+    int rc=-1,dir=-1,logfd=-1;char *split=strdup(path);
     cJSON *intent=NULL,*child=NULL,*empty=NULL,*parent_caption=NULL,*body=NULL;
     long long child_id=0,parent_id=0,channel;size_t child_size=0,parent_size=0;
     if(!split) return fail(e,"out of memory");
@@ -455,6 +462,7 @@ static int make_directory(tgfs_bot *bot,const cJSON *journal,const char *path,co
         fail(e,"cannot prepare directory publication");goto done;
     }
     dir=stage_open(state,e);if(dir<0) goto done;
+    logfd=create_recovery_log(dir,e);if(logfd<0) goto done;
     intent=cJSON_CreateObject();child=envelope("DIRECTORY",object);empty=cJSON_CreateObject();
     parent_caption=envelope("DIRECTORY",parent);body=addition(operation,name,object);
     if(!intent || !child || !empty || !parent_caption || !body || caption_parent(child,parent) ||
@@ -474,8 +482,15 @@ static int make_directory(tgfs_bot *bot,const cJSON *journal,const char *path,co
     if(!sent && (uint64_t)child_id<=boundary) sent=fail(e,"non-increasing child directory ID");
     if(child_id>0 && add_id(intent,"child_message_id",child_id)) {fail(e,"out of memory");goto done;}
     if(sent) {tgfs_error saved=*e;persist(dir,intent,"child_response_uncertain",e);*e=saved;goto done;}
-    if(persist(dir,intent,"child_sent",e) || check_pin(bot,journal,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
-    sent=upload_json(bot,chat,channel,"directory.json",body,parent_caption,&parent_id,&parent_size,e,NULL);
+    if(persist(dir,intent,"child_sent",e) || check_pin(bot,journal,e) ||
+        upload_log_event(logfd,"directory_send_pending",operation,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
+    tgfs_bot_error rejection;
+    sent=upload_json(bot,chat,channel,"directory.json",body,parent_caption,&parent_id,&parent_size,e,&rejection);
+    if(sent && upload_rejected(&rejection)) {
+        tgfs_error saved=*e;
+        if(!upload_rejection(logfd,"directory_send_rejected",operation,operation,&rejection,e)) *e=saved;
+        goto done;
+    }
     (void)parent_size;
     if(!sent && parent_id<=child_id) sent=fail(e,"non-increasing parent directory ID");
     if(parent_id>0 && add_id(intent,"directory_message_id",parent_id)) {fail(e,"out of memory");goto done;}
@@ -488,12 +503,13 @@ static int make_directory(tgfs_bot *bot,const cJSON *journal,const char *path,co
 done:
     if(rc && intent) fprintf(stderr,"mkdir state: phase=%s child_id=%lld directory_id=%lld\n",
         json_string(intent,"phase")?json_string(intent,"phase"):"preparing",child_id,parent_id);
+    if(logfd>=0) close(logfd);
     if(dir>=0) close(dir);
     free(split);cJSON_Delete(intent);cJSON_Delete(child);cJSON_Delete(empty);cJSON_Delete(parent_caption);cJSON_Delete(body);return rc;
 }
 static int unlink_file(tgfs_bot *bot,const cJSON *journal,const char *path,const char *state,tgfs_error *e)
 {
-    int rc=-1,dir=-1;char *split=strdup(path);
+    int rc=-1,dir=-1,logfd=-1;char *split=strdup(path);
     cJSON *observed=NULL,*intent=NULL,*caption=NULL,*body=NULL;
     long long channel,directory_id=0;size_t document_size=0;uint64_t boundary;
     if(!split) return fail(e,"out of memory");
@@ -505,6 +521,7 @@ static int unlink_file(tgfs_bot *bot,const cJSON *journal,const char *path,const
         tgfs_bot_channel_id(chat,&channel) || check_pin(bot,journal,e)) goto done;
     if(json_decimal(journal,"boundary_id",&boundary) || uuid_new(operation)) {fail(e,"cannot prepare unlink");goto done;}
     dir=stage_open(state,e);if(dir<0) goto done;
+    logfd=create_recovery_log(dir,e);if(logfd<0) goto done;
     intent=cJSON_CreateObject();caption=envelope("DIRECTORY",parent);body=cJSON_CreateObject();
     cJSON *ops=body?cJSON_AddArrayToObject(body,"operations"):NULL;
     cJSON *entry=ops?cJSON_CreateObject():NULL;
@@ -519,8 +536,15 @@ static int unlink_file(tgfs_bot *bot,const cJSON *journal,const char *path,const
         !cJSON_AddItemToObject(intent,"observed_adds",cJSON_Duplicate(observed,1)) ||
         !cJSON_AddItemToObject(intent,"directory_caption",cJSON_Duplicate(caption,1)) ||
         !cJSON_AddItemToObject(intent,"directory_document",cJSON_Duplicate(body,1))) {fail(e,"cannot allocate unlink intent");goto done;}
-    if(persist(dir,intent,"prepared",e) || check_pin(bot,journal,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
-    int sent=upload_json(bot,chat,channel,"directory.json",body,caption,&directory_id,&document_size,e,NULL);
+    if(persist(dir,intent,"prepared",e) || check_pin(bot,journal,e) ||
+        upload_log_event(logfd,"directory_send_pending",operation,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
+    tgfs_bot_error rejection;
+    int sent=upload_json(bot,chat,channel,"directory.json",body,caption,&directory_id,&document_size,e,&rejection);
+    if(sent && upload_rejected(&rejection)) {
+        tgfs_error saved=*e;
+        if(!upload_rejection(logfd,"directory_send_rejected",operation,operation,&rejection,e)) *e=saved;
+        goto done;
+    }
     if(!sent && (uint64_t)directory_id<=boundary) sent=fail(e,"non-increasing DIRECTORY ID");
     if(directory_id>0 && add_id(intent,"directory_message_id",directory_id)) {fail(e,"out of memory");goto done;}
     if(sent) {tgfs_error saved=*e;persist(dir,intent,"directory_response_uncertain",e);*e=saved;goto done;}
@@ -529,6 +553,7 @@ static int unlink_file(tgfs_bot *bot,const cJSON *journal,const char *path,const
 done:
     if(rc && intent) fprintf(stderr,"unlink state: phase=%s directory_id=%lld\n",
         json_string(intent,"phase")?json_string(intent,"phase"):"preparing",directory_id);
+    if(logfd>=0) close(logfd);
     if(dir>=0) close(dir);
     free(split);cJSON_Delete(observed);cJSON_Delete(intent);cJSON_Delete(caption);cJSON_Delete(body);return rc;
 }

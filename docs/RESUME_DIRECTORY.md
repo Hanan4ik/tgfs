@@ -112,10 +112,11 @@ DIRECTORY должен уже присутствовать в новом capture
 дочерний документ; сохранённый child_message_id, если он есть, обязан совпадать.
 Сам дочерний документ повторно не отправляется, data.bin не нужен.
 
-Разрешены только child_send_pending, child_response_uncertain и child_sent:
-это фазы до первой попытки ADD в исходном writer. directory_send_pending и
-более поздние фазы при ненаблюдённом ADD блокируются, как и любой прежний
-recovery directory_send_pending без подтверждённого отказа.
+Для mkdir фазы child_send_pending, child_response_uncertain и child_sent
+предшествуют первой попытке ADD. В directory_send_pending продолжение возможно
+только с парой pending/rejected для исходного UUID ADD и после срока ожидания.
+Первоначальный mkdir держит общую с recovery блокировку до завершения. Если
+дочерний документ отсутствует в capture, публикация родительского ADD блокируется.
 Если исходная ADD уже наблюдалась, возвращается already_observed без отправки.
 
 Перед публикацией проверяются сохранённый path (включая вложенный каталог и
