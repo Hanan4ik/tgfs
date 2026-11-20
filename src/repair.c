@@ -201,8 +201,26 @@ done:
     return rc;
 }
 
+typedef struct {
+    const char *pending;
+    const char *rejected;
+    const char *confirmed;
+    const char *ids;
+    const char *result;
+    const char *next_step;
+} directory_stage;
+
+static const directory_stage add_or_remove = {
+    "directory_send_pending","directory_send_rejected","directory_publication_confirmed",
+    "directory_ids","directory_resume","capture_after_directory_publication"
+};
+static const directory_stage mkdir_child = {
+    "child_send_pending","child_send_rejected","child_publication_confirmed",
+    "child_ids","child_resume","capture_after_child_publication"
+};
+
 /* A durable pending record is a send barrier, even after a lost response or crash. */
-static int directory_attempted(int fd,const char *operation,int require_rejection,tgfs_error *e)
+static int directory_attempted(int fd,const directory_stage *stage,const char *operation,int require_rejection,tgfs_error *e)
 {
     struct stat st;
     if(fstat(fd,&st) || st.st_size>TGFS_MAX_JSON) return fail(e,"recovery log too large or unreadable");
@@ -215,12 +233,12 @@ static int directory_attempted(int fd,const char *operation,int require_rejectio
         cJSON *entry=json_parse_bytes((const unsigned char *)line,(size_t)n,e);
         if(!entry) {found=-1;break;}
         const char *event=json_string(entry,"event");
-        if(same(event,"directory_send_pending")) {
+        if(same(event,stage->pending)) {
             if(found || !same(json_string(entry,"message_id"),operation)) {cJSON_Delete(entry);fail(e,"conflicting DIRECTORY attempts in recovery log");found=-1;break;}
             found=1;
         }
-        if(same(event,"directory_publication_confirmed")) found=2;
-        if(same(event,"directory_send_rejected")) {
+        if(same(event,stage->confirmed)) found=2;
+        if(same(event,stage->rejected)) {
             size_t http,api;uint64_t when;
             if(found!=1 || !same(json_string(entry,"message_id"),operation) ||
                 ((require_rejection || cJSON_HasObjectItem(entry,"operation_id")) && !same(json_string(entry,"operation_id"),operation)) || json_count(entry,"http_status",&http) ||
@@ -242,7 +260,7 @@ static int directory_attempted(int fd,const char *operation,int require_rejectio
     return found;
 }
 static int publish_directory(tgfs_bot *bot,const cJSON *journal,const cJSON *body,const cJSON *caption,
-    const char *operation,cJSON *report,int fd,tgfs_error *e)
+    const directory_stage *stage,const char *operation,cJSON *report,int fd,tgfs_error *e)
 {
     /* Validate the pin again immediately before publication. */
     cJSON *p=params(json_string(journal,"storage_chat_id")),*out=NULL;
@@ -257,7 +275,7 @@ static int publish_directory(tgfs_bot *bot,const cJSON *journal,const cJSON *bod
     cJSON_Delete(header);cJSON_Delete(out);if(!good) return fail(e,"pinned SUPERBLOCK differs from capture");
     char *text=cJSON_PrintUnformatted(caption),*document=cJSON_PrintUnformatted(body);
     if(!text || !document) {free(text);free(document);return fail(e,"out of memory");}
-    if(log_event(fd,"directory_send_pending",operation,e)) {free(text);free(document);return -1;}
+    if(log_event(fd,stage->pending,operation,e)) {free(text);free(document);return -1;}
 #ifndef TGFS_TESTING
     struct timespec pause={1,100000000};
     while(nanosleep(&pause,&pause)) if(errno!=EINTR) {free(text);free(document);return fail(e,"recovery pacing failed");}
@@ -267,7 +285,7 @@ static int publish_directory(tgfs_bot *bot,const cJSON *journal,const cJSON *bod
     if(rc) {
         fail(e,"%s [http=%ld api=%d outcome_unknown=%d retry_after=%u]",b.message,b.http_status,b.api_code,b.outcome_unknown,b.retry_after);
         tgfs_error saved=*e;
-        if(upload_rejection(fd,"directory_send_rejected",operation,operation,&b,e)) {free(text);free(document);cJSON_Delete(out);return -1;}
+        if(upload_rejection(fd,stage->rejected,operation,operation,&b,e)) {free(text);free(document);cJSON_Delete(out);return -1;}
         *e=saved;
     }
     long long channel,returned_channel,returned_size;mid=0;
@@ -281,14 +299,14 @@ static int publish_directory(tgfs_bot *bot,const cJSON *journal,const cJSON *bod
     free(text);free(document);cJSON_Delete(out);
     if(rc) return -1;
     char id[32];snprintf(id,sizeof(id),"%lld",mid);
-    if(log_event(fd,"directory_publication_confirmed",id,e)) return -1;
+    if(log_event(fd,stage->confirmed,id,e)) return -1;
     cJSON *value=cJSON_CreateString(id);
-    if(!value || !cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(report,"directory_ids"),value)) {cJSON_Delete(value);return fail(e,"out of memory");}
-    if(!cJSON_AddStringToObject(report,"directory_resume","published")) return fail(e,"out of memory");
+    if(!value || !cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(report,stage->ids),value)) {cJSON_Delete(value);return fail(e,"out of memory");}
+    if(!cJSON_AddStringToObject(report,stage->result,"published")) return fail(e,"out of memory");
     cJSON_ReplaceItemInObjectCaseSensitive(report,"scope",cJSON_CreateString("capture_plus_recovery_response"));
-    cJSON_ReplaceItemInObjectCaseSensitive(report,"publication",cJSON_CreateString("confirmed"));
+    if(stage==&add_or_remove) cJSON_ReplaceItemInObjectCaseSensitive(report,"publication",cJSON_CreateString("confirmed"));
     cJSON_ReplaceItemInObjectCaseSensitive(report,"resumed",cJSON_CreateBool(1));
-    cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("capture_after_directory_publication"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString(stage->next_step));
     return 0;
 }
 
@@ -298,19 +316,22 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
     if(!mkdir && (!same(json_string(intent,"kind"),"put") || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(intent,"replace")) ||
         !cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"commit_ids")) || !same(json_string(report,"staging"),"verified")))
         return fail(e,"directory resume requires a verified new-file put with confirmed FILE_COMMIT");
-    if(mkdir && !cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"child_ids")))
-        return fail(e,"mkdir resume requires a confirmed child DIRECTORY");
+    const cJSON *children=cJSON_GetObjectItemCaseSensitive(report,"child_ids");
+    int missing_child=mkdir && !cJSON_GetArraySize(children);
+    const char *phase=json_string(intent,"phase");
+    if(missing_child && (!same(phase,"child_send_pending") || cJSON_HasObjectItem(intent,"child_message_id") ||
+        cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"directory_ids"))))
+        return fail(e,"mkdir resume requires a confirmed or explicitly rejected child DIRECTORY");
     const char *blocked[]={"unobserved_part_indexes","ambiguous_part_indexes","unobserved_known_ids"};
     for(size_t i=0;i<3;i++) if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,blocked[i]))) return fail(e,"directory resume blocked by missing or ambiguous parts");
     if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"directory_ids")))
         return cJSON_AddStringToObject(report,"directory_resume","already_observed")?0:fail(e,"out of memory");
-    const char *phase=json_string(intent,"phase");
     int initial_pending=same(phase,"directory_send_pending");
     if(!initial_pending && (mkdir ? (!same(phase,"child_sent") && !same(phase,"child_send_pending") && !same(phase,"child_response_uncertain")) :
         (!same(phase,"backlinks_pending") && !same(phase,"commit_send_pending") && !same(phase,"commit_response_uncertain"))))
         return fail(e,"ADD may already have been attempted; directory resume is blocked");
     if(cJSON_HasObjectItem(intent,"directory_message_id")) return fail(e,"saved ADD message requires captured publication");
-    int attempted=directory_attempted(fd,json_string(intent,"add_operation_id"),initial_pending,e);if(attempted<0) return -1;
+    int attempted=directory_attempted(fd,&add_or_remove,json_string(intent,"add_operation_id"),initial_pending,e);if(attempted<0) return -1;
     if(attempted) return fail(e,"recovery log contains a previous ADD attempt; use a newer capture, never resend blindly");
     const char *path=json_string(intent,"parent_path"),*name=json_string(intent,"name"),*operation=json_string(intent,"add_operation_id");
     char mkdir_path[4097];
@@ -338,13 +359,6 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
         return fail(e,"saved ADD/caption destination disagrees with intent and captured parent");
     const char *source_id;
     if(mkdir) {
-        const cJSON *children=cJSON_GetObjectItemCaseSensitive(report,"child_ids");
-        if(cJSON_GetArraySize(children)!=1) return fail(e,"mkdir resume requires one confirmed child DIRECTORY");
-        source_id=cJSON_GetArrayItem(children,0)->valuestring;
-        const char *known=json_string(intent,"child_message_id");
-        if((cJSON_GetObjectItemCaseSensitive(intent,"child_message_id") && !same(known,source_id)) ||
-            cJSON_GetObjectItemCaseSensitive(intent,"directory_message_id"))
-            return fail(e,"saved mkdir message IDs disagree with captured pre-ADD state");
         const cJSON *cc=cJSON_GetObjectItemCaseSensitive(intent,"child_caption");
         const cJSON *cb=cJSON_GetObjectItemCaseSensitive(intent,"child_document");
         if(!same(json_string(cc,"object_id"),json_string(intent,"object_id")) ||
@@ -353,6 +367,23 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
             !cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(cc,"next_message")) || directory_operations_valid(cb,e) ||
             cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(cb,"operations")))
             return fail(e,"saved child DIRECTORY disagrees with mkdir intent");
+        if(missing_child) {
+            const char *object=json_string(intent,"object_id");
+            const cJSON *record;
+            cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(journal,"records")) {
+                const cJSON *captured=cJSON_GetObjectItemCaseSensitive(record,"record");
+                if(same(json_string(captured,"object_id"),object))
+                    return fail(e,"capture already contains the saved child object UUID");
+            }
+            int child_attempted=directory_attempted(fd,&mkdir_child,object,1,e);
+            if(child_attempted<0) return -1;
+            if(child_attempted) return fail(e,"previous child DIRECTORY may have been published; use a newer capture");
+            return publish_directory(bot,journal,cb,cc,&mkdir_child,object,report,fd,e);
+        }
+        if(cJSON_GetArraySize(children)!=1) return fail(e,"mkdir resume requires one confirmed child DIRECTORY");
+        source_id=cJSON_GetArrayItem(children,0)->valuestring;
+        if(cJSON_HasObjectItem(intent,"child_message_id") && !same(json_string(intent,"child_message_id"),source_id))
+            return fail(e,"saved mkdir message IDs disagree with captured pre-ADD state");
     } else {
         if(repair_backlinks(bot,journal,intent,report,fd,e)) return -1;
         source_id=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(report,"commit_ids"),0)->valuestring;
@@ -362,7 +393,7 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
     int good=json_semantic_equal(fresh,cJSON_GetObjectItemCaseSensitive(record,"record")) &&
         (!mkdir || cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(fresh,"next_message")));cJSON_Delete(fresh);
     if(!good) return fail(e,"fresh source metadata or navigation differs from capture");
-    return publish_directory(bot,journal,body,caption,operation,report,fd,e);
+    return publish_directory(bot,journal,body,caption,&add_or_remove,operation,report,fd,e);
 }
 
 int resume_unlink(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *intent,cJSON *report,int fd,tgfs_error *e)
@@ -374,7 +405,7 @@ int resume_unlink(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *inten
         return cJSON_AddStringToObject(report,"directory_resume","already_observed")?0:fail(e,"out of memory");
     if(!same(json_string(intent,"phase"),"directory_send_pending") || cJSON_HasObjectItem(intent,"directory_message_id"))
         return fail(e,"unlink resume requires a rejected initial REMOVE");
-    int attempted=directory_attempted(fd,operation,1,e);
+    int attempted=directory_attempted(fd,&add_or_remove,operation,1,e);
     if(attempted<0) return -1;
     if(attempted) return fail(e,"previous REMOVE may have been published; use a newer capture");
     const char *saved=json_string(intent,"path");char path[4097];
@@ -395,7 +426,7 @@ int resume_unlink(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *inten
         cJSON_Compare(observed,cJSON_GetObjectItemCaseSensitive(intent,"observed_adds"),1);
     cJSON_Delete(observed);
     if(!valid || directory_operations_valid(body,e)) return fail(e,"saved REMOVE disagrees with captured target or observed ADDs");
-    return publish_directory(bot,journal,body,caption,operation,report,fd,e);
+    return publish_directory(bot,journal,body,caption,&add_or_remove,operation,report,fd,e);
 }
 
 static int finish_local_intent(const char *state,const cJSON *intent,const char *commit_id,const char *directory_id,int logfd,tgfs_error *e)

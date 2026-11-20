@@ -551,7 +551,7 @@ void tgfs_intent_help(FILE *stream)
           "Reconcile put/mkdir/unlink intent with a newer completed capture; default is read-only.\n"
           "  --resume-upload          Reuse verified parts, send unattempted parts and FILE_COMMIT.\n"
           "  --finalize               Verify put/mkdir/unlink publication, repair supported navigation, persist complete.\n"
-          "  --resume-directory       Publish a verified pending or rejected ADD for create put or mkdir.\n"
+          "  --resume-directory       Resume verified create put or mkdir DIRECTORY publication.\n"
           "  --resume-unlink          Resume an explicitly rejected REMOVE for the same observed ADDs.\n"
           "  --repair-backlinks       Explicitly repair verified CHUNK navigation; logs/locks state-dir.\n"
           "  --state-dir DIRECTORY    Existing private directory containing intent.json.\n"

@@ -50,6 +50,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 command,env=s.lock_probe;s.lock_probe=None
                 s.lock_probe_result=subprocess.run(command,env=env,capture_output=True,timeout=5)
                 assert b'cannot exclusively lock private backlink-repair.log' in s.lock_probe_result.stderr
+            if s.mode.startswith('mkdir-child-') and expected=='child_send_pending':
+                pending=json.loads((s.intent.parent/'backlink-repair.log').read_text().splitlines()[-1])
+                assert pending==dict(event='child_send_pending',message_id=intent['object_id'])
+                s.mode='reject-'+s.mode.removeprefix('mkdir-child-')
             if s.mode.startswith('mkdir-parent-') and expected=='directory_send_pending':
                 assert intent['kind']=='mkdir'
                 pending=json.loads((s.intent.parent/'backlink-repair.log').read_text().splitlines()[-1])
@@ -447,9 +451,14 @@ class Put(unittest.TestCase):
                     expected={'mkdir-lost-child':'child_response_uncertain','mkdir-response':'child_response_uncertain',
                         'mkdir-lost-parent':'directory_response_uncertain','mkdir-pin':'child_sent',
                         'mkdir-edit':'published_navigation_pending','mkdir-parent-400':'directory_send_pending',
-                        'mkdir-parent-429':'directory_send_pending','mkdir-parent-500':'directory_response_uncertain'}[mode]
+                        'mkdir-parent-429':'directory_send_pending','mkdir-parent-500':'directory_response_uncertain',
+                        'mkdir-child-400':'child_send_pending','mkdir-child-429':'child_send_pending',
+                        'mkdir-child-500':'child_response_uncertain'}[mode]
                     self.assertEqual(directory['phase'],expected)
-                    self.assertEqual(len(s.sent),(2 if metadata_resume=='nested' else 0)+(1 if mode.startswith('mkdir-parent-') or mode in ('mkdir-lost-child','mkdir-response','mkdir-pin') else 2))
+                    sent_count=2
+                    if mode.startswith('mkdir-child-'): sent_count=0
+                    elif mode.startswith('mkdir-parent-') or mode in ('mkdir-lost-child','mkdir-response','mkdir-pin'): sent_count=1
+                    self.assertEqual(len(s.sent),(2 if metadata_resume=='nested' else 0)+sent_count)
                     before=len(s.sent);saved=s.intent.parent
                     write('mkdir',capture,'--path','/documents',state=saved,code=1)
                     self.assertEqual(len(s.sent),before)
@@ -457,6 +466,45 @@ class Put(unittest.TestCase):
                         s.mode='ok';cap=scan();s.intent=saved/'intent.json'
                         original=s.intent.read_bytes();count=len(s.sent)
                         command=['intent','--resume-directory','--state-dir',str(saved),'--capture',str(cap),'--token-file',str(token)]
+                        if mode.startswith('mkdir-child-'):
+                            log=saved/'backlink-repair.log'
+                            events=[json.loads(line) for line in log.read_text().splitlines()]
+                            if mode=='mkdir-child-500':
+                                self.assertEqual(events[-1]['event'],'child_send_pending')
+                                start=len(s.calls);run(command,code=1)
+                                self.assertNotIn('sendDocument',s.calls[start:]);return
+                            self.assertEqual([event['event'] for event in events],['child_send_pending','child_send_rejected'])
+                            self.assertEqual(events[-1]['operation_id'],directory['object_id'])
+                            if metadata_resume=='wrong-child':
+                                events[-1]['operation_id']=directory['add_operation_id']
+                                log.write_text(''.join(json.dumps(event)+'\n' for event in events))
+                                start=len(s.calls);run(command,code=1)
+                                self.assertNotIn('sendDocument',s.calls[start:]);return
+                            if mode=='mkdir-child-429':
+                                start=len(s.calls);result=run(command,code=1)
+                                self.assertIn(b'cooldown',result.stderr)
+                                self.assertNotIn('sendDocument',s.calls[start:])
+                                time.sleep(max(0,int(events[-1]['retry_not_before'])-time.time()+1.05))
+                            if metadata_resume=='child-lost': s.mode='resume-lost'
+                            child_result=run(command,code=1 if metadata_resume=='child-lost' else 0)
+                            s.mode='ok'
+                            self.assertEqual(s.sent[count:],['DIRECTORY'])
+                            if metadata_resume!='child-lost':
+                                report=json.loads(child_result.stdout)
+                                self.assertEqual(report['child_resume'],'published')
+                                self.assertEqual(report['next_step'],'capture_after_child_publication')
+                                self.assertEqual(report['publication'],'not_observed')
+                                self.assertEqual(len(report['child_ids']),1)
+                                self.assertEqual(report['directory_ids'],[])
+                            self.assertEqual(s.intent.read_bytes(),original)
+                            start=len(s.calls);run(command,code=1)
+                            self.assertNotIn('sendDocument',s.calls[start:])
+                            cap=scan();command[command.index('--capture')+1]=str(cap)
+                            self.assertEqual(json.loads(run(command).stdout)['directory_resume'],'published')
+                            self.assertEqual(s.sent[count:],['DIRECTORY','DIRECTORY'])
+                            final=scan();finish_metadata(saved,final)
+                            self.assertEqual(read(final,'ls',mkdir_path.rstrip('/')),b'')
+                            return
                         if mode.startswith('mkdir-parent-'):
                             log=saved/'backlink-repair.log'
                             events=[json.loads(line) for line in log.read_text().splitlines()]
@@ -1117,6 +1165,11 @@ class Put(unittest.TestCase):
     def test_retry_rejected_mkdir_add(self):
         for case in ('400','429','then-lost','500'):
             with self.subTest(case=case): self.directories(mode='mkdir-pin',metadata_resume='retry:'+case)
+    def test_initial_mkdir_child_recovery(self):
+        for mode,case in (('400','nested'),('400','child-lost'),('400','wrong-child'),('429','ok'),('500','blocked')):
+            with self.subTest(mode=mode,case=case):
+                self.directories(mode='mkdir-child-'+mode,metadata_resume=case)
+
     def test_initial_mkdir_add_recovery(self):
         for case in ('nested','lost','legacy','duplicate','conflict'):
             with self.subTest(case=case): self.directories(mode='mkdir-parent-400',metadata_resume=case)
