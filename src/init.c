@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <limits.h>
+#include <time.h>
 #include <unistd.h>
 
 static int same(const char *a, const char *b) { return a && b && !strcmp(a,b); }
@@ -32,12 +33,7 @@ static int persist(int dir,cJSON *intent,const char *phase,long long id)
         !cJSON_AddStringToObject(intent,"superblock_message_id",text)) return -1;
     char *raw=cJSON_PrintUnformatted(intent);
     if (!raw) return -1;
-    int fd=openat(dir,"intent.tmp",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
-    if (fd<0) { free(raw); return -1; }
-    size_t size=strlen(raw),done=0; int rc=0;
-    while(done<size) { ssize_t n=write(fd,raw+done,size-done); if(n<=0) {rc=-1;break;} done+=(size_t)n; }
-    if(fsync(fd)) rc=-1;
-    if(close(fd)) rc=-1;
+    int rc=stage_intent_at(dir,"intent.tmp",raw,NULL);
     free(raw);
     if (!rc && (renameat(dir,"intent.tmp",dir,"intent.json") || fsync(dir))) rc=-1;
     return rc;
@@ -55,16 +51,64 @@ static void header_text(char text[320],long long id,const char *uuid)
     snprintf(text,320,"{\"magic\":\"TGFS\",\"format_version\":1,\"type\":\"SUPERBLOCK\",\"start_id\":\"%lld\",\"root_object_id\":\"%s\",\"next_message\":null}",id,uuid);
 }
 
+static int lock_state(const char *state)
+{
+    int dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(dir<0) return -1;
+    struct stat st;
+    if(fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077) || flock(dir,LOCK_EX|LOCK_NB)) {
+        close(dir);
+        return -1;
+    }
+    return dir;
+}
+
+static cJSON *load_intent(int dir)
+{
+    struct stat st;
+    if(fstatat(dir,"intent.json",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) || st.st_nlink!=1 ||
+        st.st_uid!=geteuid() || (st.st_mode&0077)) return NULL;
+    tgfs_error e={0};
+    return json_load_at(dir,"intent.json",&e);
+}
+
+static int save_send_rejection(int dir,cJSON *intent,const tgfs_bot_error *api)
+{
+    time_t now=time(NULL);
+    if(now<0) return -1;
+    char deadline[32];
+    snprintf(deadline,sizeof(deadline),"%llu",api->retry_after?(unsigned long long)now+api->retry_after:0);
+    if(!cJSON_AddNumberToObject(intent,"send_http_status",api->http_status) ||
+        !cJSON_AddStringToObject(intent,"send_retry_not_before",deadline)) return -1;
+    return persist(dir,intent,"send_rejected",0);
+}
+
+static const char *resume_send_error(const cJSON *intent,const char *chat,long long bot_id)
+{
+    uint64_t mid,saved_bot,deadline;
+    size_t status;
+    if(!same(json_string(intent,"phase"),"send_rejected") ||
+        !same(json_string(intent,"storage_chat_id"),chat) || !uuid_valid(json_string(intent,"root_object_id")) ||
+        json_decimal(intent,"initializer_bot_id",&saved_bot) || saved_bot!=(uint64_t)bot_id ||
+        json_decimal(intent,"superblock_message_id",&mid) || mid ||
+        json_count(intent,"send_http_status",&status) || status<400 || status>=500 ||
+        json_decimal(intent,"send_retry_not_before",&deadline) || (status==429 && !deadline))
+        return "resume-send requires a confirmed sendMessage rejection for this bot and channel";
+    if(deadline) {
+        time_t now=time(NULL);
+        if(now<0 || (uint64_t)now<=deadline) return "sendMessage retry cooldown active";
+    }
+    return NULL;
+}
+
 static int finalize_existing(const char *state,const char *chat,long long chat_id,tgfs_bot *bot,tgfs_bot_error *api,const char **error)
 {
-    int dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC),rc=-1;
-    struct stat st;cJSON *intent=NULL,*out=NULL;tgfs_error e={0};
+    int dir=lock_state(state),rc=-1;
+    cJSON *intent=NULL,*out=NULL;
     *error="cannot lock private initializer state";
-    if(dir<0 || fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077) || flock(dir,LOCK_EX|LOCK_NB)) goto done;
+    if(dir<0) goto done;
     *error="invalid initializer intent";
-    if(fstatat(dir,"intent.json",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) || st.st_nlink!=1 ||
-        st.st_uid!=geteuid() || (st.st_mode&0077)) goto done;
-    intent=json_load_at(dir,"intent.json",&e);
+    intent=load_intent(dir);
     if(!intent) goto done;
     const char *phase=json_string(intent,"phase"),*root=json_string(intent,"root_object_id");
     uint64_t mid;
@@ -91,23 +135,25 @@ void tgfs_init_help(FILE *stream)
     fputs("usage: tgfs init (--new-volume | --finalize-existing) --token-file PATH --storage-chat-id ID --state-dir DIRECTORY [options]\n"
           "Create and pin a SUPERBLOCK in a channel explicitly confirmed to be uninitialized.\n"
           "  --new-volume             Assert no existing TGFS volume, including unpinned headers.\n"
+          "  --resume-send            With --new-volume, retry an explicitly rejected first send.\n"
           "  --finalize-existing      Verify matching pinned header and complete existing local intent.\n"
-          "  --state-dir DIRECTORY    New directory for creation, existing private directory for finalization.\n"
+          "  --state-dir DIRECTORY    New directory for creation, existing private directory for recovery.\n"
           "  --token-file PATH        Owner-only bot token file.\n"
           "  --storage-chat-id ID     Full negative Bot API channel ID.\n"
           "  --proxy URL | --direct   Same routing options as probe.\n"
           "  --timeout-seconds N      1..300 seconds, default 60.\n"
           "  -h, --help               Show help without network.\n"
           "Refuses any existing pin; run only one initializer for the channel.\n"
-          "On failure preserve the state directory: automatic retry/resume is not implemented.\n",stream);
+          "On failure preserve the state directory. Resume requires a confirmed rejection.\n",stream);
 }
 int tgfs_init_main(int argc,char **argv)
 {
     const char *token=NULL,*chat=NULL,*state=NULL,*proxy=NULL,*timeout_text=NULL;
-    int confirmed=0,finalize=0;
+    int confirmed=0,finalize=0,resume_send=0;
     if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_init_help(stdout);return 0;}
     for(int i=2;i<argc;i++) {
         const char **slot=NULL;
+        if(same(argv[i],"--resume-send")) {if(resume_send) goto usage;resume_send=1;continue;}
         if(same(argv[i],"--finalize-existing")) {if(finalize) goto usage;finalize=1;continue;}
         if(same(argv[i],"--new-volume")) {if(confirmed) goto usage; confirmed=1;continue;}
         if(same(argv[i],"--direct")) {if(proxy) goto usage;proxy="";continue;}
@@ -120,7 +166,7 @@ int tgfs_init_main(int argc,char **argv)
         *slot=argv[++i];
     }
     long long chat_id,bot_id=0,id=0; uint64_t timeout=60;
-    if(confirmed+finalize!=1 || !token || !state || !*state || tgfs_bot_channel_id(chat,&chat_id) ||
+    if(confirmed+finalize!=1 || (resume_send && !confirmed) || !token || !state || !*state || tgfs_bot_channel_id(chat,&chat_id) ||
         (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300))) goto usage;
     tgfs_bot *bot=NULL; tgfs_bot_error e={0};
     cJSON *out=NULL,*p=NULL,*intent=NULL; char *header=NULL;
@@ -132,6 +178,18 @@ int tgfs_init_main(int argc,char **argv)
     if(request(bot,"getMe",cJSON_CreateObject(),&out,&e)) goto done;
     if(tgfs_bot_integer(out,"id",&bot_id) || bot_id<=0 ||
         !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(out,"is_bot"))) {local="invalid bot identity";goto done;}
+    stage="resume send";
+    char uuid[37];
+    if(resume_send) {
+        dir=lock_state(state);
+        if(dir<0) {local="cannot lock private initializer state";goto done;}
+        intent=load_intent(dir);
+        local=resume_send_error(intent,chat,bot_id);
+        if(local) goto done;
+        snprintf(uuid,sizeof(uuid),"%s",json_string(intent,"root_object_id"));
+        cJSON_DeleteItemFromObjectCaseSensitive(intent,"send_http_status");
+        cJSON_DeleteItemFromObjectCaseSensitive(intent,"send_retry_not_before");
+    }
     stage="getChat";
     if(request(bot,"getChat",params(chat),&out,&e)) goto done;
     long long returned;
@@ -150,36 +208,45 @@ int tgfs_init_main(int argc,char **argv)
         local="bot needs channel administrator post/edit rights";goto done;
     }
     stage="intent";
-    if(mkdir(state,0700)) {local="state directory must not already exist; preserve existing intents";goto done;}
-    char *parent=strdup(state);
-    if (!parent) {local="out of memory";goto done;}
-    char *slash=strrchr(parent,'/');
-    if(slash) { if(slash==parent) slash[1]=0; else *slash=0; }
-    else { free(parent); parent=strdup("."); }
-    int parentfd=parent?open(parent,O_RDONLY|O_DIRECTORY|O_CLOEXEC):-1;
-    free(parent);
-    if(parentfd<0) {local="cannot open state parent directory";goto done;}
-    int synced=fsync(parentfd);close(parentfd);
-    if(synced) {local="cannot persist state directory entry";goto done;}
-    dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
-    if(dir<0 || flock(dir,LOCK_EX|LOCK_NB)) {local="cannot lock state directory";goto done;}
-    unsigned char bytes[16]; char uuid[37];
-    if(RAND_bytes(bytes,16)!=1) {local="UUID randomness unavailable";goto done;}
-    bytes[6]=(unsigned char)((bytes[6]&15)|64); bytes[8]=(unsigned char)((bytes[8]&63)|128);
-    snprintf(uuid,sizeof(uuid),"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-        bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],
-        bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15]);
-    intent=cJSON_CreateObject();
-    if(!intent || !cJSON_AddStringToObject(intent,"storage_chat_id",chat) ||
-        !cJSON_AddStringToObject(intent,"root_object_id",uuid) || persist(dir,intent,"send_pending",0)) {
-        local="cannot persist initialization intent";goto done;
+    if(!resume_send) {
+        if(mkdir(state,0700)) {local="state directory must not already exist; preserve existing intents";goto done;}
+        char *parent=strdup(state);
+        if (!parent) {local="out of memory";goto done;}
+        char *slash=strrchr(parent,'/');
+        if(slash) { if(slash==parent) slash[1]=0; else *slash=0; }
+        else { free(parent); parent=strdup("."); }
+        int parentfd=parent?open(parent,O_RDONLY|O_DIRECTORY|O_CLOEXEC):-1;
+        free(parent);
+        if(parentfd<0) {local="cannot open state parent directory";goto done;}
+        int synced=fsync(parentfd);close(parentfd);
+        if(synced) {local="cannot persist state directory entry";goto done;}
+        dir=lock_state(state);
+        if(dir<0) {local="cannot lock state directory";goto done;}
+        unsigned char bytes[16];
+        if(RAND_bytes(bytes,16)!=1) {local="UUID randomness unavailable";goto done;}
+        bytes[6]=(unsigned char)((bytes[6]&15)|64); bytes[8]=(unsigned char)((bytes[8]&63)|128);
+        snprintf(uuid,sizeof(uuid),"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],
+            bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15]);
+        char bot_text[32];snprintf(bot_text,sizeof(bot_text),"%lld",bot_id);
+        intent=cJSON_CreateObject();
+        if(!intent || !cJSON_AddStringToObject(intent,"storage_chat_id",chat) ||
+            !cJSON_AddStringToObject(intent,"initializer_bot_id",bot_text) || !cJSON_AddStringToObject(intent,"root_object_id",uuid)) {
+            local="cannot persist initialization intent";goto done;
+        }
     }
+    if(persist(dir,intent,"send_pending",0)) {local="cannot persist send barrier";goto done;}
     stage="sendMessage"; p=params(chat);
     char placeholder[128]; snprintf(placeholder,sizeof(placeholder),"TGFS_INIT_PENDING %s",uuid);
     if(!p || !cJSON_AddStringToObject(p,"text",placeholder) || !cJSON_AddBoolToObject(p,"disable_notification",1)) {
         local="out of memory";goto done;
     }
-    {cJSON *q=p;p=NULL;if(request(bot,"sendMessage",q,&out,&e)) goto done;}
+    cJSON *send=p;p=NULL;
+    if(request(bot,"sendMessage",send,&out,&e)) {
+        if(upload_rejected(&e) && save_send_rejection(dir,intent,&e))
+            local="cannot persist confirmed sendMessage rejection";
+        goto done;
+    }
     if(!message_is(out,chat_id,0,placeholder) || tgfs_bot_integer(out,"message_id",&id)) {
         local="unexpected placeholder response; inspect channel before recovery";goto done;
     }
