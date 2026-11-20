@@ -187,6 +187,7 @@ void tgfs_init_help(FILE *stream)
           "  --new-volume             Assert no existing TGFS volume, including unpinned headers.\n"
           "  --resume-send            With --new-volume, retry an explicitly rejected first send.\n"
           "  --resume-header          Inspect the saved message and continue editing or pinning.\n"
+          "  --message-id ID          Candidate placeholder ID for --resume-header after a lost send response.\n"
           "  --service-chat-id ID     Separate private service channel for --resume-header.\n"
           "  --finalize-existing      Verify matching pinned header and complete existing local intent.\n"
           "  --state-dir DIRECTORY    New directory for creation, existing private directory for recovery.\n"
@@ -200,7 +201,7 @@ void tgfs_init_help(FILE *stream)
 }
 int tgfs_init_main(int argc,char **argv)
 {
-    const char *token=NULL,*chat=NULL,*state=NULL,*service=NULL,*proxy=NULL,*timeout_text=NULL;
+    const char *token=NULL,*chat=NULL,*state=NULL,*service=NULL,*proxy=NULL,*timeout_text=NULL,*message_id=NULL;
     int confirmed=0,finalize=0,resume_send=0,resume_header=0;
     if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_init_help(stdout);return 0;}
     for(int i=2;i<argc;i++) {
@@ -213,20 +214,22 @@ int tgfs_init_main(int argc,char **argv)
         if(same(argv[i],"--token-file")) slot=&token;
         else if(same(argv[i],"--storage-chat-id")) slot=&chat;
         else if(same(argv[i],"--service-chat-id")) slot=&service;
+        else if(same(argv[i],"--message-id")) slot=&message_id;
         else if(same(argv[i],"--state-dir")) slot=&state;
         else if(same(argv[i],"--proxy")) slot=&proxy;
         else if(same(argv[i],"--timeout-seconds")) slot=&timeout_text;
         if(!slot || *slot || i+1>=argc) goto usage;
         *slot=argv[++i];
     }
-    long long chat_id,service_id=0,bot_id=0,id=0; uint64_t timeout=60;
+    long long chat_id,service_id=0,bot_id=0,id=0; uint64_t timeout=60,candidate=0;
     if(confirmed+finalize+resume_header!=1 || (resume_send && !confirmed) || !token || !state || !*state || tgfs_bot_channel_id(chat,&chat_id) ||
         (resume_header ? (tgfs_bot_channel_id(service,&service_id) || service_id==chat_id) : service!=NULL) ||
+        (message_id && (!resume_header || decimal(message_id,&candidate) || !candidate || candidate>TGFS_BOT_MAX_EXACT_ID)) ||
         (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300))) goto usage;
     tgfs_bot *bot=NULL; tgfs_bot_error e={0};
     cJSON *out=NULL,*p=NULL,*intent=NULL;
     char uuid[37],placeholder[128],header[320];
-    int pin_unknown=0,header_observed=0;
+    int pin_unknown=0,header_observed=0,recover_send=0;
     const char *stage="client",*local=NULL;
     int dir=-1,rc=1;
     if(tgfs_bot_open(token,(unsigned)timeout,&bot,&e) || tgfs_bot_set_proxy(bot,proxy,&e)) goto done;
@@ -248,14 +251,21 @@ int tgfs_init_main(int argc,char **argv)
         } else {
             const char *phase=json_string(intent,"phase");
             uint64_t saved_id,saved_bot;
+            recover_send=same(phase,"send_pending");
             if(!same(json_string(intent,"storage_chat_id"),chat) || !uuid_valid(json_string(intent,"root_object_id")) ||
-                json_decimal(intent,"superblock_message_id",&saved_id) || !saved_id || saved_id>TGFS_BOT_MAX_EXACT_ID ||
+                json_decimal(intent,"superblock_message_id",&saved_id) || saved_id>TGFS_BOT_MAX_EXACT_ID ||
                 (cJSON_HasObjectItem(intent,"initializer_bot_id") &&
                  (json_decimal(intent,"initializer_bot_id",&saved_bot) || saved_bot!=(uint64_t)bot_id)) ||
-                (!same(phase,"edit_pending") && !same(phase,"pin_ready") && !same(phase,"pin_pending") && !same(phase,"pin_rejected"))) {
-                local="resume-header requires a saved edit or pin intent for this bot and channel";goto done;
+                (!recover_send && !same(phase,"edit_pending") && !same(phase,"pin_ready") &&
+                 !same(phase,"pin_pending") && !same(phase,"pin_rejected"))) {
+                local="resume-header requires a saved send, edit or pin intent for this bot and channel";goto done;
             }
-            id=(long long)saved_id;
+            if(recover_send ? (saved_id || !candidate) : (!saved_id || (candidate && candidate!=saved_id))) {
+                local=recover_send?"send_pending with no saved ID requires --message-id":
+                    "candidate message ID differs from saved init message ID";
+                goto done;
+            }
+            id=(long long)(recover_send?candidate:saved_id);
             pin_unknown=same(phase,"pin_pending");
         }
         snprintf(uuid,sizeof(uuid),"%s",json_string(intent,"root_object_id"));
@@ -268,7 +278,7 @@ int tgfs_init_main(int argc,char **argv)
     }
     if(resume_header) header_text(header,id,uuid);
     if(cJSON_HasObjectItem(out,"pinned_message")) {
-        if(resume_header && message_is(cJSON_GetObjectItemCaseSensitive(out,"pinned_message"),chat_id,id,header))
+        if(resume_header && !recover_send && message_is(cJSON_GetObjectItemCaseSensitive(out,"pinned_message"),chat_id,id,header))
             goto complete;
         local="channel already has a pin; initialization refused";goto done;
     }
@@ -297,6 +307,10 @@ int tgfs_init_main(int argc,char **argv)
         snprintf(placeholder,sizeof(placeholder),"TGFS_INIT_PENDING %s",uuid);
         header_observed=inspect_header(bot,chat,chat_id,service,service_id,id,placeholder,header,&e,&local);
         if(header_observed<0) goto done;
+        if(recover_send) {
+            if(header_observed) {local="unknown send requires the original placeholder text";goto done;}
+            if(persist(dir,intent,"edit_pending",id)) {local="cannot persist verified placeholder ID";goto done;}
+        }
         if(!header_observed && !same(json_string(intent,"phase"),"edit_pending")) {
             local="saved pin intent requires the complete header";goto done;
         }
