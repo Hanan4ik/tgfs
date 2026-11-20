@@ -1,5 +1,6 @@
 """Captured journal -> real curl -> metadata merge -> lazy verified cat."""
 import copy
+import hashlib
 import http.server
 import json
 import os
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 
 BINARY=str(Path(sys.argv.pop(1)).resolve())
 EXAMPLE=Path(__file__).resolve().parent.parent/'examples/directory-merge'
@@ -36,7 +38,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         fid=self.path.rsplit('/',1)[-1]
         self.server.downloads.append(fid)
         data=self.server.payloads[fid]
-        if (self.server.mode=='corrupt' and fid=='file_101') or (self.server.mode=='latecorrupt' and fid=='file_102'): data=b'X'+data[1:]
+        if ((self.server.mode=='corrupt' and fid=='file_101') or (self.server.mode=='latecorrupt' and fid=='file_102')
+            or (self.server.mode=='gc-corrupt' and fid=='file_113')):
+            data=b'X'+data[1:]
         self.reply(data)
 class Remote(unittest.TestCase):
     def run_read(self,command='ls',path='/documents',mode='ok'):
@@ -51,7 +55,6 @@ class Remote(unittest.TestCase):
             storage_chat_id=str(STORAGE),scan_completed=True,gap_policy='forward_400_is_gap',
             coverage_verified=False,unavailable_ids=['2'],records=records)
         if mode in ('multipart','latecorrupt'):
-            import hashlib
             chunk=next(r for r in records if r['message_id']=='101')
             extra=copy.deepcopy(chunk);extra['message_id']='102';extra['document']['file_id']='file_102'
             parts=[]
@@ -67,7 +70,6 @@ class Remote(unittest.TestCase):
             commit['document']['file_size']=len(payloads['file_110'])
             records.append(extra);records.sort(key=lambda r:int(r['message_id']))
         if mode=='remove':
-            import uuid
             observed=json.loads(payloads['file_20'])['operations'][0]['operation_id']
             r=copy.deepcopy(next(r for r in records if r['message_id']=='20'))
             r['message_id']='40';r['document']['file_id']='file_40'
@@ -75,6 +77,38 @@ class Remote(unittest.TestCase):
                 name='notes.txt',observed_adds=[observed])])).encode()
             r['document']['file_size']=len(payloads['file_40'])
             records.append(r);records.sort(key=lambda r:int(r['message_id']))
+        if mode.startswith('gc-'):
+            original_commit=next(r for r in records if r['message_id']=='110')
+            original_chunk=next(r for r in records if r['message_id']=='101')
+            if mode=='gc-bad-full-hash':
+                original_commit['record']['file_sha256']='0'*64
+                original_chunk['record']['file_sha256']='0'*64
+            retry=copy.deepcopy(original_commit)
+            retry['message_id']='111';retry['document']['file_id']='file_111'
+            payloads['file_111']=payloads['file_110']
+            records.append(retry)
+            if mode!='gc-retry-only':
+                other=copy.deepcopy(original_commit)
+                other['message_id']='140';other['document']['file_id']='file_140'
+                other['record'].update(object_id=str(uuid.uuid4()),operation_id=str(uuid.uuid4()),
+                    version_id=str(uuid.uuid4()),part_count=2)
+                parts=[]
+                for index,data in enumerate((b'hel',b'lo\n')):
+                    mid=str(112+index);fid='file_'+mid
+                    chunk=copy.deepcopy(original_chunk)
+                    chunk['message_id']=mid
+                    part_hash=hashlib.sha256(data).hexdigest()
+                    chunk['record'].update(object_id=other['record']['object_id'],version_id=other['record']['version_id'],
+                        offset=str(index*3),part_size='3',part_sha256=part_hash,part_count=2,file_commit_id='140')
+                    chunk['document'].update(file_id=fid,file_size=len(data),file_name='renamed.bin.'+str(index))
+                    parts.append(dict(message_id=mid,offset=str(index*3),part_size='3',part_sha256=part_hash))
+                    if mode!='gc-missing' or index==0:
+                        records.append(chunk)
+                        payloads[fid]=data
+                payloads['file_140']=json.dumps(dict(parts=parts)).encode()
+                other['document']['file_size']=len(payloads['file_140'])
+                records.append(other)
+            records.sort(key=lambda r:int(r['message_id']))
         if mode=='badjson': payloads['file_10']=b'NOT JSON';records[0]['document']['file_size']=8
         if mode=='duplicate': records.append(copy.deepcopy(records[-1]))
         if mode=='incomplete': journal['scan_completed']=False
@@ -87,7 +121,9 @@ class Remote(unittest.TestCase):
             server.calls=[];server.downloads=[];server.payloads=payloads;server.mode=mode
             t=threading.Thread(target=server.serve_forever,kwargs=dict(poll_interval=.01),daemon=True);t.start()
             try:
-                p=subprocess.run([BINARY,'read','--no-cache','--capture',str(root),'--token-file',str(token),command,path],
+                common=['--capture',str(root),'--token-file',str(token)]
+                args=['gc-plan',*common] if command=='gc-plan' else ['read','--no-cache',*common,command,path]
+                p=subprocess.run([BINARY,*args],
                     env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{server.server_port}'),
                     capture_output=True,timeout=10)
                 err=p.stderr.decode()
@@ -118,6 +154,33 @@ class Remote(unittest.TestCase):
         self.assertIn('file_102',files)
         rc,out,err,_=self.run_read('cat','/documents/hello.txt','latecorrupt')
         self.assertEqual(rc,1,err);self.assertEqual(out,b'hel');self.assertIn('SHA-256',err)
+    def test_gc_plan_verifies_distinct_layouts(self):
+        rc,out,err,files=self.run_read('gc-plan',mode='gc-duplicates')
+        self.assertEqual(rc,0,err)
+        report=json.loads(out)
+        self.assertEqual(report['scope'],'provided_capture_only')
+        self.assertEqual(report['boundary_id'],'200')
+        self.assertFalse(report['coverage_verified'])
+        self.assertEqual(len(report['groups']),1)
+        group=report['groups'][0]
+        self.assertEqual(group['file_sha256'],hashlib.sha256(b'hello\n').hexdigest())
+        self.assertEqual(group['file_size'],'6')
+        self.assertEqual({c['commit_id']:c['chunk_ids'] for c in group['verified_commits']},
+                         {'110':['101'],'140':['112','113']})
+        for fid in ('file_101','file_112','file_113'): self.assertEqual(files.count(fid),1)
+
+    def test_gc_plan_retries_and_incomplete_copies(self):
+        for mode in ('ok','gc-retry-only','empty'):
+            with self.subTest(mode=mode):
+                rc,out,err,files=self.run_read('gc-plan',mode=mode)
+                self.assertEqual(rc,0,err);self.assertEqual(json.loads(out)['groups'],[])
+                self.assertNotIn('file_101',files)
+        for mode,expected in (('gc-corrupt','SHA-256 mismatch'),('gc-bad-full-hash','whole-file SHA-256 mismatch'),
+                              ('gc-missing','missing CHUNK'),('incomplete','incomplete journal')):
+            with self.subTest(mode=mode):
+                rc,out,err,_=self.run_read('gc-plan',mode=mode)
+                self.assertEqual(rc,1,err);self.assertEqual(out,b'');self.assertIn(expected,err)
+
     def test_failures(self):
         for mode,expected in [('corrupt','SHA-256'),('fileid','getFile metadata'),('size','getFile metadata'),('path','invalid relative'),
                               ('badjson','invalid JSON'),('duplicate','duplicate or unsorted'),
