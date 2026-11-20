@@ -46,7 +46,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 assert 'directory_send_pending' in (s.intent.parent/'backlink-repair.log').read_text()
             else: assert intent['phase']==expected
             if intent.get('kind') not in ('mkdir','unlink'): assert (s.intent.parent/'data.bin').read_bytes()==s.input_data
-            if s.mode.startswith('reject-') and (not getattr(s,'reject_kind',None) or kind==s.reject_kind):
+            if getattr(s,'lock_probe',None):
+                command,env=s.lock_probe;s.lock_probe=None
+                s.lock_probe_result=subprocess.run(command,env=env,capture_output=True,timeout=5)
+                assert b'cannot exclusively lock private backlink-repair.log' in s.lock_probe_result.stderr
+            if s.mode.startswith('reject-') and (not getattr(s,'reject_kind',None) or kind==s.reject_kind) and (kind!='CHUNK' or not hasattr(s,'reject_offset') or record['offset']==s.reject_offset):
                 case=s.mode[7:];code=429 if case in ('429','badretry','no-retry') else 403 if case=='403' else 500 if case=='500' else 400
                 http=500 if case=='http500' else 403 if case=='mismatch' else code
                 error=dict(ok=False,error_code=code,description=TOKEN)
@@ -793,13 +797,13 @@ class Put(unittest.TestCase):
                             self.assertNotIn('AddressSanitizer',log.read_text());self.assertNotIn('runtime error:',log.read_text())
             finally:
                 s.shutdown();s.server_close();t.join()
-    def upload_recovery(self,case='ok',replace=False,retry=None):
+    def upload_recovery(self,case='ok',replace=False,retry=None,writer_retry=None,empty_writer=False):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
                 storage_chat_id=str(STORAGE),service_chat_id=str(SERVICE),superblock=SB,boundary_id='2',records=[])
             (capture/'journal.json').write_text(json.dumps(journal))
-            data=b'abcdefgh';source=root/'source';source.write_bytes(data)
+            data=b'' if empty_writer else b'abcdefgh';source=root/'source';source.write_bytes(data)
             token=root/'token';token.write_text(TOKEN);token.chmod(0o600)
             state=root/'state'
             s=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
@@ -828,13 +832,32 @@ class Put(unittest.TestCase):
                     capture=scan('base');state=root/'replacement';s.intent=state/'intent.json'
                     args[args.index('--capture')+1]=str(capture);args[args.index('--state-dir')+1]=str(state);args+=['--replace']
                     s.mode='lost'
-                result=run(args);self.assertEqual(result.returncode,1,result.stderr)
+                if writer_retry:
+                    phase,reason=writer_retry.split(':',1)
+                    s.reject_kind='CHUNK' if phase=='chunk' else 'FILE_COMMIT'
+                    s.mode='reject-'+('400' if reason in ('twice','then-lost','staging','manifest','wrong-op','orphan','bad-log','old-pending','missing-known','pin','origin','cleanup','lock','later') else reason)
+                    if reason=='later': s.reject_offset='3'
+                    if reason=='lock':
+                        s.lock_probe=([BINARY,'intent','--resume-upload','--state-dir',str(state),'--capture',str(capture),'--token-file',str(token)],env)
+                result=run(args)
+                if writer_retry:
+                    if writer_retry.endswith(':log-write'): self.assertNotEqual(result.returncode,0,result.stderr)
+                    else: self.assertEqual(result.returncode,1,result.stderr)
+                    s.mode='ok';cap=scan('writer-rejected')
+                    cmd=['intent','--resume-upload','--state-dir',str(state),'--capture',str(cap),'--token-file',str(token)]
+                    if reason=='lock':
+                        self.assertEqual(s.lock_probe_result.returncode,1,s.lock_probe_result.stderr);reason='400'
+                    if reason=='later': reason='400'
+                    self.retry_upload(run,scan,cmd,s,state,phase,reason,data,replace,initial_result=result)
+                    return
+                self.assertEqual(result.returncode,1,result.stderr)
                 saved=json.loads(s.intent.read_text());original_ids={k:saved[k] for k in ('object_id','version_id','operation_id')}
                 first=s.next-1
                 if case in ('prepared','empty'):
                     # Model a crash before the first request, using an explicitly constructed saved state.
                     del s.messages[first];s.sent.pop();saved['phase']='prepared';saved['parts']=[]
                     saved.pop('last_attempted_part',None)
+                    (state/'backlink-repair.log').write_text('')
                     if case=='empty':
                         import hashlib
                         data=b'';s.input_data=data;(state/'data.bin').write_bytes(data)
@@ -902,10 +925,10 @@ class Put(unittest.TestCase):
                 self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,data)
             finally:
                 s.shutdown();s.server_close();t.join()
-    def retry_upload(self,run,scan,cmd,s,state,phase,case,data,replace):
+    def retry_upload(self,run,scan,cmd,s,state,phase,case,data,replace,initial_result=None):
         s.reject_kind='CHUNK' if phase=='chunk' else 'FILE_COMMIT'
         s.mode='reject-'+('400' if case in ('twice','then-lost','staging','manifest','wrong-op','orphan','bad-log','old-pending','missing-known','pin','origin','cleanup') else case)
-        result=run(cmd)
+        result=run(cmd) if initial_result is None else initial_result
         if case=='log-write':
             self.assertNotEqual(result.returncode,0,result.stderr);before=list(s.sent)
             s.mode='ok';cap=scan('after-log-failure');cmd[cmd.index('--capture')+1]=str(cap)
@@ -916,7 +939,7 @@ class Put(unittest.TestCase):
         rejected=[event for event in events if event['event']=='upload_'+phase+'_rejected']
         safe=case in ('400','403','429','twice','then-lost','staging','manifest','wrong-op','orphan','bad-log','old-pending','missing-known','pin','origin','cleanup')
         self.assertEqual(bool(rejected),safe);before=list(s.sent)
-        saved=json.loads(s.intent.read_text());self.assertEqual(saved['phase'],phase+'_send_pending')
+        saved=json.loads(s.intent.read_text());self.assertEqual(saved['phase'],phase+('_response_uncertain' if initial_result is not None and not safe else '_send_pending'))
         ids={key:saved[key] for key in ('object_id','version_id','operation_id')}
         s.mode='ok';cap=scan('retry-capture');cmd[cmd.index('--capture')+1]=str(cap)
         if case=='429':
@@ -970,6 +993,18 @@ class Put(unittest.TestCase):
         self.assertTrue(json.loads(result.stdout)['finalized'])
         result=run(['read','--no-cache','--capture',str(cap),'--token-file',cmd[-1],'cat','/hello.txt'])
         self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,data)
+    def test_put_records_chunk_rejections(self):
+        for reason in ('400','403','429','twice','then-lost','wrong-op','bad-log','staging','pin','lock','later','500','mismatch','nodescription','result','badretry','no-retry'):
+            with self.subTest(reason=reason): self.upload_recovery(writer_retry='chunk:'+reason)
+        self.upload_recovery(replace=True,writer_retry='chunk:400')
+    def test_put_records_commit_rejections(self):
+        for reason in ('400','403','429','twice','then-lost','manifest','wrong-op','bad-log','staging','origin','500','http500','mismatch','nodescription','result','badretry','no-retry'):
+            with self.subTest(reason=reason): self.upload_recovery(writer_retry='commit:'+reason)
+        self.upload_recovery(replace=True,writer_retry='commit:400')
+        self.upload_recovery(empty_writer=True,writer_retry='commit:400')
+    def test_put_rejection_journal_write_failure(self):
+        for phase in ('chunk','commit'):
+            with self.subTest(phase=phase): self.upload_recovery(writer_retry=phase+':log-write')
     def test_retry_upload_rejection_write_failure(self):
         for phase in ('chunk','commit'):
             with self.subTest(phase=phase): self.upload_recovery(retry=phase+':log-write')

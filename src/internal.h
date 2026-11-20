@@ -56,6 +56,7 @@ int finalize_metadata(struct tgfs_bot *bot, const char *state, const cJSON *jour
 int upload_log_event(int fd, const char *event, const char *id, tgfs_error *e);
 int upload_attempts(int fd, const char *operation, unsigned char attempted[4096], int *commit_attempted, tgfs_error *e);
 int upload_request_event(int fd, const char *event, const char *id, const char *operation, tgfs_error *e);
+int upload_rejected(const tgfs_bot_error *b);
 int upload_rejection(int fd, const char *event, const char *id, const char *operation, const tgfs_bot_error *b, tgfs_error *e);
 int verify_upload_part(struct tgfs_bot *bot, const cJSON *journal, const cJSON *record, int fd, tgfs_error *e);
 int resume_upload(struct tgfs_bot *bot, tgfs *fs, const char *state, const cJSON *journal, const cJSON *intent, cJSON *report, int fd, tgfs_error *e);
