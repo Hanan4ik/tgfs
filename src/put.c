@@ -338,8 +338,14 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
         if(edit(bot,chat,channel,(long long)mid,filename,(size_t)part_size,caption,e)) goto done;
     }
     if(!replace) {
-        if(check_pin(bot,journal,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
-        int published=upload_json(bot,chat,channel,"directory.json",directory_body,directory,&directory_id,&directory_size,e,NULL);
+        if(check_pin(bot,journal,e) || upload_log_event(logfd,"directory_send_pending",add,e) ||
+            persist(dir,intent,"directory_send_pending",e)) goto done;
+        int published=upload_json(bot,chat,channel,"directory.json",directory_body,directory,&directory_id,&directory_size,e,&rejection);
+        if(published && upload_rejected(&rejection)) {
+            tgfs_error saved=*e;
+            if(!upload_rejection(logfd,"directory_send_rejected",add,add,&rejection,e)) *e=saved;
+            goto done;
+        }
         (void)directory_size;
         if(!published && directory_id<=commit_id) published=fail(e,"non-increasing directory ID");
         if(directory_id>0 && add_id(intent,"directory_message_id",directory_id)) {fail(e,"out of memory");goto done;}
