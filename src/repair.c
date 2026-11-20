@@ -433,7 +433,7 @@ static int finish_local_intent(const char *state,const cJSON *intent,const char 
 {
     int dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);struct stat st;
     if(dir<0) return fail(e,"cannot reopen intent directory");
-    cJSON *current=NULL,*finished=NULL;char *raw=NULL;int fd=-1,rc=-1;
+    cJSON *current=NULL,*finished=NULL;char *raw=NULL;int rc=-1;
     if(fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {fail(e,"intent directory changed permissions");goto done;}
     const char *kind=json_string(intent,"kind");
     const char *primary=same(kind,"put")?"file_commit_id":same(kind,"mkdir")?"child_message_id":NULL;
@@ -451,34 +451,12 @@ static int finish_local_intent(const char *state,const cJSON *intent,const char 
     if(!cJSON_AddStringToObject(finished,"phase","complete") || (primary && !cJSON_AddStringToObject(finished,primary,commit_id)) ||
         (directory_id && !cJSON_AddStringToObject(finished,"directory_message_id",directory_id))) {fail(e,"out of memory");goto done;}
     raw=cJSON_PrintUnformatted(finished);if(!raw) {fail(e,"out of memory");goto done;}
-    fd=openat(dir,"intent.finalize.tmp",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
-    size_t offset=0,length=strlen(raw);
-    if(fd<0 && errno==EEXIST) {
-        /* A crash can leave the complete, unpublished result. Reuse only its exact bytes. */
-        fd=openat(dir,"intent.finalize.tmp",O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC);
-        if(fd<0 || fstat(fd,&st) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() ||
-            (st.st_mode&07777)!=0600 || st.st_nlink!=1 || st.st_size!=(off_t)length) {
-            fail(e,"unexpected intent.finalize.tmp; preserve existing recovery file");goto done;
-        }
-        char buf[4096];
-        while(offset<length) {
-            size_t left=length-offset;
-            ssize_t n=read(fd,buf,left<sizeof(buf)?left:sizeof(buf));
-            if(n<0 && errno==EINTR) continue;
-            if(n<=0 || memcmp(raw+offset,buf,(size_t)n)) {fail(e,"saved finalize file differs from verified intent");goto done;}
-            offset+=(size_t)n;
-        }
-    }
-    if(fd<0) {fail(e,"cannot create intent.finalize.tmp");goto done;}
-    while(offset<length) {ssize_t n=write(fd,raw+offset,length-offset);if(n<0 && errno==EINTR) continue;if(n<=0) {fail(e,"cannot write finalized intent");goto done;}offset+=(size_t)n;}
-    if(fsync(fd)) {fail(e,"cannot persist finalized intent");goto done;}
-    if(close(fd)) {fd=-1;fail(e,"cannot close finalized intent");goto done;}fd=-1;
+    if(stage_intent_at(dir,"intent.finalize.tmp",raw,e)) goto done;
     if(log_event(logfd,"local_complete_pending",commit_id,e)) goto done;
     if(renameat(dir,"intent.finalize.tmp",dir,"intent.json") || fsync(dir)) {fail(e,"cannot publish finalized intent; local outcome may be unknown");goto done;}
     if(log_event(logfd,"local_complete_confirmed",commit_id,e)) goto done;
     rc=1;
 done:
-    if(fd>=0) close(fd);
     close(dir);free(raw);cJSON_Delete(current);cJSON_Delete(finished);return rc;
 }
 int finalize_put(tgfs_bot *bot,const char *state,const cJSON *journal,const cJSON *intent,cJSON *report,int logfd,tgfs_error *e)

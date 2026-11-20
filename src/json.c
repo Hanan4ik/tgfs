@@ -21,6 +21,37 @@ int fail(tgfs_error *e, const char *format, ...)
     return -1;
 }
 
+/* Callers hold their state lock and publish the staged file with renameat. */
+int stage_intent_at(int dirfd,const char *file,const char *raw,tgfs_error *e)
+{
+    size_t offset=0,length=strlen(raw);
+    int fd=openat(dirfd,file,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
+    int existing=fd<0 && errno==EEXIST;
+    if(existing) {
+        fd=openat(dirfd,file,O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC);
+        struct stat st;
+        if(fd<0 || fstat(fd,&st) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() ||
+            (st.st_mode&07777)!=0600 || st.st_nlink!=1 || st.st_size!=(off_t)length) {
+            if(fd>=0) close(fd);
+            return fail(e,"unexpected %s; preserve existing recovery file",file);
+        }
+    }
+    if(fd<0) return fail(e,"cannot create %s",file);
+    while(offset<length) {
+        char buf[4096];
+        size_t left=length-offset;
+        ssize_t n=existing?read(fd,buf,left<sizeof(buf)?left:sizeof(buf)):write(fd,raw+offset,left);
+        if(n<0 && errno==EINTR) continue;
+        if(n<=0 || (existing && memcmp(raw+offset,buf,(size_t)n))) {
+            close(fd);
+            return fail(e,existing?"saved %s differs from verified intent":"cannot write %s",file);
+        }
+        offset+=(size_t)n;
+    }
+    int synced=fsync(fd),closed=close(fd);
+    return synced || closed?fail(e,"cannot persist %s",file):0;
+}
+
 int fail_code(tgfs_error *e,int code,const char *format,...)
 {
     if(e) {
