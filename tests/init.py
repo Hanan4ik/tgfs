@@ -13,6 +13,7 @@ import uuid
 
 BINARY=str(Path(sys.argv.pop(1)).resolve())
 CHAT=-1003916921678
+SERVICE=-1004400939172
 TOKEN='123456:INIT_TEST_TOKEN'
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self,*args): pass
@@ -26,12 +27,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         s.calls.append(method)
         if method=='getMe': return self.reply(dict(id=s.bot_id,is_bot=True))
         if method=='getChat':
+            if int(p['chat_id'])==SERVICE: return self.reply(dict(id=SERVICE,type='channel'))
+            if s.mode=='before-pin' and 'editMessageText' in s.calls:
+                return self.reply(error=dict(ok=False,error_code=503,description='unavailable'),status=503)
             c=dict(id=CHAT,type='channel')
-            if s.mode=='existing': c['pinned_message']=dict(message_id=99,text='other pin')
+            if s.mode=='existing' or (s.mode=='pin-race' and 'deleteMessage' in s.calls): c['pinned_message']=dict(message_id=99,text='other pin')
             elif s.pinned: c['pinned_message']=dict(message_id=7,chat=dict(id=CHAT,type='channel'),text=s.text)
             return self.reply(c)
         if method=='getChatMember':
             return self.reply(dict(user=dict(id=123456),status='administrator',can_post_messages=True,can_edit_messages=s.mode!='rights'))
+        if method=='forwardMessage':
+            assert int(p['chat_id'])==SERVICE and int(p['from_chat_id'])==CHAT and p['message_id']==7
+            if s.mode=='forward-rejected':
+                return self.reply(error=dict(ok=False,error_code=400,description='missing'),status=400)
+            return self.reply(dict(message_id=27,chat=dict(id=SERVICE,type='channel'),text=s.text,
+                forward_origin=dict(type='channel',chat=dict(id=CHAT,type='channel'),
+                                    message_id=8 if s.mode=='wrong-origin' else 7)))
+        if method=='deleteMessage':
+            assert int(p['chat_id'])==SERVICE and p['message_id']==27
+            return self.reply(s.mode!='cleanup-failed')
         if method in ('sendMessage','editMessageText'):
             intent=json.loads(s.intent.read_text())
             assert intent['phase']==('send_pending' if method=='sendMessage' else 'edit_pending')
@@ -43,19 +57,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     error=dict(ok=False,error_code=status,description=TOKEN)
                     if status==429 and s.mode!='reject-429-no-retry': error['parameters']=dict(retry_after=1)
                     return self.reply(error=error,status=status)
+            if method=='editMessageText':
+                assert int(p['chat_id'])==CHAT and p['message_id']==7
+                if s.mode=='edit-rejected':
+                    return self.reply(error=dict(ok=False,error_code=400,description='rejected'),status=400)
             s.text=p['text']
-            if s.mode=='lost' and method=='sendMessage':
+            if (s.mode=='lost' and method=='sendMessage') or (s.mode=='lost-edit' and method=='editMessageText'):
                 self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
             return self.reply(dict(message_id=7,chat=dict(id=CHAT,type='channel'),text=s.text))
         assert method=='pinChatMessage'
         assert p['message_id']==7
         assert json.loads(s.intent.read_text())['phase']=='pin_pending'
+        if s.mode=='pin-rejected':
+            return self.reply(error=dict(ok=False,error_code=429,description='cooldown',parameters=dict(retry_after=1)),status=429)
+        if s.mode=='pin-unknown':
+            self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
         s.pinned=True
         if s.mode=='lost-pin':
             self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
         return self.reply(True)
 class Init(unittest.TestCase):
-    def run_init(self,mode='ok',finish=None,resume=None):
+    def run_init(self,mode='ok',finish=None,resume=None,header_case=None):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);token=root/'token';token.write_text(TOKEN);token.chmod(0o600)
             server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
@@ -73,6 +95,54 @@ class Init(unittest.TestCase):
                     retry=subprocess.run(args,env=env,capture_output=True,text=True,timeout=10)
                     self.assertEqual(retry.returncode,1)
                     self.assertEqual(server.calls.count('sendMessage'),count)
+                if header_case:
+                    self.assertEqual(p.returncode,1,out)
+                    server.mode=header_case if header_case in ('wrong-origin','cleanup-failed','existing','pin-race','forward-rejected') else 'ok'
+                    command=args.copy()
+                    command[command.index('--new-volume')]='--resume-header'
+                    command.extend(['--service-chat-id',str(SERVICE)])
+                    if header_case=='legacy':
+                        intent.pop('initializer_bot_id')
+                        server.intent.write_text(json.dumps(intent))
+                    if header_case=='wrong-text': server.text='another message'
+                    if header_case=='wrong-bot': server.bot_id+=1
+                    if header_case=='pin-rejected':
+                        self.assertEqual(intent['phase'],'pin_rejected')
+                        start=len(server.calls)
+                        early=subprocess.run(command,env=env,capture_output=True,text=True,timeout=10)
+                        self.assertEqual(early.returncode,1,early.stderr)
+                        self.assertIn('pin retry cooldown',early.stderr)
+                        self.assertNotIn('forwardMessage',server.calls[start:])
+                        time.sleep(max(0,int(intent['pin_retry_not_before'])-time.time()+1.05))
+                    original=server.intent.read_bytes()
+                    start=len(server.calls)
+                    result=subprocess.run(command,env=env,capture_output=True,text=True,timeout=10)
+                    for marker in (TOKEN,'AddressSanitizer','runtime error:'): self.assertNotIn(marker,result.stderr)
+                    calls=server.calls[start:]
+                    self.assertNotIn('sendMessage',calls)
+                    if header_case in ('edit','legacy','already-edited','already-pinned','pin-rejected','pin-ready'):
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        final=json.loads(server.intent.read_text())
+                        self.assertEqual(final['phase'],'complete')
+                        self.assertEqual(final['root_object_id'],intent['root_object_id'])
+                        self.assertEqual(final['superblock_message_id'],'7')
+                        self.assertEqual(calls.count('editMessageText'),int(header_case in ('edit','legacy')))
+                        self.assertEqual(calls.count('pinChatMessage'),int(header_case!='already-pinned'))
+                    else:
+                        self.assertEqual(result.returncode,1,result.stderr)
+                        if header_case=='pin-race':
+                            updated=json.loads(server.intent.read_text())
+                            self.assertEqual(updated,dict(json.loads(original),phase='pin_ready'))
+                        else:
+                            self.assertEqual(server.intent.read_bytes(),original)
+                        self.assertNotIn('editMessageText',calls)
+                        self.assertNotIn('pinChatMessage',calls)
+                    if header_case in ('wrong-origin','wrong-text','cleanup-failed','pin-race','edit','legacy','already-edited','pin-rejected','pin-ready'):
+                        self.assertIn('forwardMessage',calls)
+                        self.assertIn('deleteMessage',calls)
+                    if header_case in ('already-pinned','unknown-pin','existing','wrong-bot','unknown-send'):
+                        self.assertNotIn('forwardMessage',calls)
+                    return
                 if finish:
                     finalize=args.copy();finalize[finalize.index('--new-volume')]='--finalize-existing'
                     if finish=='foreign': server.text=server.text.replace(intent['root_object_id'],str(uuid.uuid4()))
@@ -149,6 +219,16 @@ class Init(unittest.TestCase):
                 return p.returncode,out,intent,server.text,server.calls
             finally:
                 server.shutdown();server.server_close();worker.join()
+    def test_resume_header(self):
+        cases=(('edit-rejected','edit'),('edit-rejected','legacy'),('lost-edit','already-edited'),
+               ('lost-pin','already-pinned'),('pin-rejected','pin-rejected'),('pin-unknown','unknown-pin'),
+               ('before-pin','pin-ready'),
+               ('lost','unknown-send'),('lost-edit','wrong-origin'),('lost-edit','wrong-text'),
+               ('lost-edit','cleanup-failed'),('lost-edit','existing'),('lost-edit','pin-race'),
+               ('lost-edit','wrong-bot'),('lost-edit','forward-rejected'))
+        for mode,case in cases:
+            with self.subTest(mode=mode,case=case): self.run_init(mode,header_case=case)
+
     def test_resume_rejected_send(self):
         for mode,resume in (('reject-400','repeat'),('reject-429','cooldown'),('reject-400','lost'),
                             ('reject-403','wrong-bot'),('reject-403','pin'),('reject-500','blocked'),
