@@ -326,3 +326,21 @@ recovery пока не проверен; искусственно вызыват
 
 Проверка: 130 тестовых методов; обычный локальный прогон прошёл
 (126 passed/4 kernel skips без /dev/fuse).
+
+
+## Подтверждённые отказы первоначального put (2026-11-20)
+
+Put/create/replace теперь держит общий с recovery private journal/flock.
+Перед CHUNK/commit сохраняются fsync pending с UUID/индексом и atomic intent.
+Подтверждённые отказы сохраняются rejected-записью; pending-фаза остаётся
+пригодной для проверки и продолжения через --resume-upload. Автоматических
+повторов нет. Unknown/5xx/некорректный Message и сбой append сохраняют барьер;
+старые uncertain intents без evidence разрешения не получают. Проверены
+create/replace/empty, 400/403/429, cooldown, повтор после loss, changed
+staging/manifest/log, отказ поздней части, writer/recovery lock и реальный
+сбой append. Документы: [PUT.md](PUT.md), [RESUME_UPLOAD.md](RESUME_UPLOAD.md).
+Дальше остаются ADD первоначального writer, mkdir/unlink/init recovery,
+local crash-files и cleanup/GC. Живой непустой recovery не заявляется.
+
+Проверка: 133 тестовых метода; обычный локальный прогон прошёл
+(129 passed/4 kernel skips без /dev/fuse).

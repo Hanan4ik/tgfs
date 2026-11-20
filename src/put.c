@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #define PUT_MAX_SIZE (64U*1024U*1024U)
@@ -213,7 +214,7 @@ invalid:
 static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *name,const char *parent_path,
                const char *state,size_t chunk_size,int replace,tgfs_error *e)
 {
-    int rc=-1,dir=-1,parts_attached=0;
+    int rc=-1,dir=-1,logfd=-1,parts_attached=0;
     unsigned char *bytes=NULL;
     size_t size=0,commit_size=0,directory_size=0;
     cJSON *intent=NULL,*parts=NULL,*captions=NULL,*commit=NULL,*body=NULL,*directory=NULL,*directory_body=NULL;
@@ -237,6 +238,12 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
         fail(e,"cannot generate publication IDs or SHA-256");goto done;
     }
     dir=stage_open(state,e);if(dir<0) goto done;
+    logfd=openat(dir,"backlink-repair.log",O_RDWR|O_CREAT|O_EXCL|O_APPEND|O_NOFOLLOW|O_CLOEXEC,0600);
+    struct stat logstat;
+    if(logfd<0 || fstat(logfd,&logstat) || !S_ISREG(logstat.st_mode) || logstat.st_nlink!=1 ||
+        logstat.st_uid!=geteuid() || (logstat.st_mode&0077) || flock(logfd,LOCK_EX|LOCK_NB) || fsync(dir)) {
+        fail(e,"cannot create and lock private put recovery journal");goto done;
+    }
     if(write_file(dir,"data.bin",bytes,size,e)) goto done;
     intent=cJSON_CreateObject();parts=cJSON_CreateArray();captions=cJSON_CreateArray();
     commit=envelope("FILE_COMMIT",object);body=cJSON_CreateObject();
@@ -276,11 +283,19 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
         }
         if(!cJSON_AddItemToArray(captions,caption)) {cJSON_Delete(caption);cJSON_Delete(part);fail(e,"out of memory");goto done;}
         cJSON_DeleteItemFromObjectCaseSensitive(intent,"last_attempted_part");
-        if(!cJSON_AddNumberToObject(intent,"last_attempted_part",(double)i) || !cJSON_AddNumberToObject(intent,"pending_part",(double)i) || persist(dir,intent,"chunk_send_pending",e)) {
+        char index[32];snprintf(index,sizeof(index),"%zu",i);
+        if(!cJSON_AddNumberToObject(intent,"last_attempted_part",(double)i) || !cJSON_AddNumberToObject(intent,"pending_part",(double)i) ||
+            upload_request_event(logfd,"upload_chunk_pending",index,operation,e) || persist(dir,intent,"chunk_send_pending",e)) {
             cJSON_Delete(part);goto done;
         }
         long long id=0;
-        int uploaded=upload(bot,chat,channel,filename,bytes+offset,length,caption,&id,e,NULL);
+        tgfs_bot_error rejection;
+        int uploaded=upload(bot,chat,channel,filename,bytes+offset,length,caption,&id,e,&rejection);
+        if(uploaded && upload_rejected(&rejection)) {
+            tgfs_error saved=*e;
+            if(!upload_rejection(logfd,"upload_chunk_rejected",index,operation,&rejection,e)) *e=saved;
+            cJSON_Delete(part);goto done;
+        }
         if(!uploaded && id<=previous) uploaded=fail(e,"non-increasing uploaded message ID");
         if(!uploaded) previous=id;
         /* A known ID is retained even if remaining response metadata mismatched. */
@@ -296,8 +311,15 @@ static int put(tgfs_bot *bot,const cJSON *journal,const char *file,const char *n
     }
     if(replace && check_pin(bot,journal,e)) goto done;
     if(!cJSON_AddItemToObject(body,"parts",cJSON_Duplicate(parts,1)) ||
-        !cJSON_AddItemToObject(intent,"commit_document",cJSON_Duplicate(body,1)) || persist(dir,intent,"commit_send_pending",e)) goto done;
-    int committed=upload_json(bot,chat,channel,"file-commit.json",body,commit,&commit_id,&commit_size,e,NULL);
+        !cJSON_AddItemToObject(intent,"commit_document",cJSON_Duplicate(body,1)) ||
+        upload_request_event(logfd,"upload_commit_pending",operation,operation,e) || persist(dir,intent,"commit_send_pending",e)) goto done;
+    tgfs_bot_error rejection;
+    int committed=upload_json(bot,chat,channel,"file-commit.json",body,commit,&commit_id,&commit_size,e,&rejection);
+    if(committed && upload_rejected(&rejection)) {
+        tgfs_error saved=*e;
+        if(!upload_rejection(logfd,"upload_commit_rejected",operation,operation,&rejection,e)) *e=saved;
+        goto done;
+    }
     if(!committed && commit_id<=previous) committed=fail(e,"non-increasing commit ID");
     if(commit_id>0 && add_id(intent,"file_commit_id",commit_id)) {fail(e,"out of memory");goto done;}
     if(committed) {tgfs_error saved=*e;persist(dir,intent,"commit_response_uncertain",e);*e=saved;goto done;}
@@ -336,6 +358,7 @@ done:
             json_string(intent,"phase")?json_string(intent,"phase"):"preparing",commit_id,directory_id,
             json_string(last,"message_id")?json_string(last,"message_id"):"unknown");
     }
+    if(logfd>=0) close(logfd);
     if(dir>=0) close(dir);
     if(!parts_attached) cJSON_Delete(parts);
     free(bytes);cJSON_Delete(intent);cJSON_Delete(captions);cJSON_Delete(commit);cJSON_Delete(body);

@@ -21,10 +21,14 @@ static int log_event(int fd,const char *event,const char *id,tgfs_error *e)
     return append_log(fd,line,(size_t)n,e);
 }
 /* Only a validated, explicit rejection may release this request's send barrier. */
+int upload_rejected(const tgfs_bot_error *b)
+{
+    return b->kind==TGFS_BOT_API && !b->outcome_unknown && b->http_status>=400 && b->http_status<500 &&
+        b->api_code==b->http_status && (b->api_code!=429 || b->retry_after);
+}
 int upload_rejection(int fd,const char *event,const char *id,const char *operation,const tgfs_bot_error *b,tgfs_error *e)
 {
-    if(b->kind!=TGFS_BOT_API || b->outcome_unknown || b->http_status<400 || b->http_status>=500 ||
-        b->api_code!=b->http_status || (b->api_code==429 && !b->retry_after)) return 0;
+    if(!upload_rejected(b)) return 0;
     time_t now=time(NULL);if(now<0) return fail(e,"cannot timestamp rejected request; send barrier retained");
     uint64_t deadline=b->retry_after?(uint64_t)now+b->retry_after:0;
     char line[320];int n=snprintf(line,sizeof(line),"{\"event\":\"%s\",\"message_id\":\"%s\",\"operation_id\":\"%s\",\"http_status\":%ld,\"api_code\":%d,\"retry_not_before\":\"%llu\"}\n",

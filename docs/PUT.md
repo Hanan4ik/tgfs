@@ -174,3 +174,14 @@ DIRECTORY ADD не нужен. Без флага существующее имя
 Раннее продолжение прерванной загрузки: [--resume-upload](RESUME_UPLOAD.md).
 Новые intents сохраняют last_attempted_part перед каждой попыткой CHUNK;
 неизвестный ответ не разрешает автоматический повтор.
+
+
+## Подтверждённые отказы и локальная блокировка (2026-11-20)
+
+Новый put создаёт owner-only backlink-repair.log и держит общую с recovery
+локальную flock до выхода. Перед CHUNK/FILE_COMMIT в журнале fsync-сохраняется
+pending с исходным operation_id и индексом/commit. Подтверждённый отказ 4xx
+сохраняется как rejected; writer возвращает ошибку с исходной pending-фазой,
+а `--resume-upload` может продолжить после сверки нового capture и cooldown.
+Потерянный ответ/5xx/неполная запись журнала не разрешают слепой повтор.
+Правила и ограничения: [RESUME_UPLOAD.md](RESUME_UPLOAD.md).
