@@ -202,13 +202,13 @@ done:
 }
 
 /* A durable pending record is a send barrier, even after a lost response or crash. */
-static int directory_attempted(int fd,const char *operation,tgfs_error *e)
+static int directory_attempted(int fd,const char *operation,int require_rejection,tgfs_error *e)
 {
     struct stat st;
     if(fstat(fd,&st) || st.st_size>TGFS_MAX_JSON) return fail(e,"recovery log too large or unreadable");
     if(lseek(fd,0,SEEK_SET)<0) return fail(e,"cannot read recovery log");
     FILE *stream=fdopen(dup(fd),"r");if(!stream) return fail(e,"cannot inspect recovery log");
-    char *line=NULL;size_t capacity=0,total=0;ssize_t n;int found=0;uint64_t deadline=0;
+    char *line=NULL;size_t capacity=0,total=0;ssize_t n;int found=0,rejected=0;uint64_t deadline=0;
     while((n=getline(&line,&capacity,stream))>=0) {
         total+=(size_t)n;
         if(total>TGFS_MAX_JSON) {fail(e,"recovery log too large");found=-1;break;}
@@ -222,12 +222,13 @@ static int directory_attempted(int fd,const char *operation,tgfs_error *e)
         if(same(event,"directory_publication_confirmed")) found=2;
         if(same(event,"directory_send_rejected")) {
             size_t http,api;uint64_t when;
-            if(found!=1 || !same(json_string(entry,"message_id"),operation) || json_count(entry,"http_status",&http) ||
+            if(found!=1 || !same(json_string(entry,"message_id"),operation) ||
+                ((require_rejection || cJSON_HasObjectItem(entry,"operation_id")) && !same(json_string(entry,"operation_id"),operation)) || json_count(entry,"http_status",&http) ||
                 json_count(entry,"api_code",&api) || http<400 || http>=500 || api!=http ||
                 json_decimal(entry,"retry_not_before",&when) || (api==429 && !when)) {
                 cJSON_Delete(entry);fail(e,"invalid ADD rejection evidence in recovery log");found=-1;break;
             }
-            found=0;if(when>deadline) deadline=when;
+            found=0;rejected=1;if(when>deadline) deadline=when;
         }
         cJSON_Delete(entry);
     }
@@ -237,6 +238,7 @@ static int directory_attempted(int fd,const char *operation,tgfs_error *e)
         time_t now=time(NULL);
         if(now<0 || (uint64_t)now<=deadline) return fail(e,"ADD retry cooldown active; retry after Unix time %llu",(unsigned long long)deadline);
     }
+    if(!found && require_rejection && !rejected) return fail(e,"missing rejection for initial ADD; directory resume is blocked");
     return found;
 }
 int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *intent,cJSON *report,int fd,tgfs_error *e)
@@ -252,10 +254,12 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
     if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"directory_ids")))
         return cJSON_AddStringToObject(report,"directory_resume","already_observed")?0:fail(e,"out of memory");
     const char *phase=json_string(intent,"phase");
+    int initial_pending=!mkdir && same(phase,"directory_send_pending");
     if(mkdir ? (!same(phase,"child_sent") && !same(phase,"child_send_pending") && !same(phase,"child_response_uncertain")) :
-        (!same(phase,"backlinks_pending") && !same(phase,"commit_send_pending") && !same(phase,"commit_response_uncertain")))
+        (!initial_pending && !same(phase,"backlinks_pending") && !same(phase,"commit_send_pending") && !same(phase,"commit_response_uncertain")))
         return fail(e,"ADD may already have been attempted; directory resume is blocked");
-    int attempted=directory_attempted(fd,json_string(intent,"add_operation_id"),e);if(attempted<0) return -1;
+    if(cJSON_HasObjectItem(intent,"directory_message_id")) return fail(e,"saved ADD message requires captured publication");
+    int attempted=directory_attempted(fd,json_string(intent,"add_operation_id"),initial_pending,e);if(attempted<0) return -1;
     if(attempted) return fail(e,"recovery log contains a previous ADD attempt; use a newer capture, never resend blindly");
     const char *path=json_string(intent,"parent_path"),*name=json_string(intent,"name"),*operation=json_string(intent,"add_operation_id");
     char mkdir_path[4097];

@@ -71,7 +71,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             msg=dict(message_id=mid,chat=dict(id=STORAGE,type='channel'),caption=caption,
                 document=dict(file_id=fid,file_unique_id='unique_'+fid,file_name=filename,file_size=len(raw)))
             s.messages[mid]=msg;s.sent.append(kind)
-            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT') or (s.mode=='unlink-lost' and intent.get('kind')=='unlink') or s.mode=='resume-lost' or (s.mode=='upload-lost-chunk' and kind=='CHUNK') or (s.mode=='upload-lost-commit' and kind=='FILE_COMMIT'):
+            if (s.mode=='lost' and kind=='CHUNK') or (s.mode=='mkdir-lost-child' and expected=='child_send_pending') or (s.mode=='mkdir-lost-parent' and expected=='directory_send_pending') or (s.mode=='replace-lost-chunk' and kind=='CHUNK') or (s.mode=='replace-lost-commit' and kind=='FILE_COMMIT') or (s.mode=='unlink-lost' and intent.get('kind')=='unlink') or (s.mode=='put-lost-add' and kind=='DIRECTORY') or s.mode=='resume-lost' or (s.mode=='upload-lost-chunk' and kind=='CHUNK') or (s.mode=='upload-lost-commit' and kind=='FILE_COMMIT'):
                 self.connection.shutdown(socket.SHUT_RDWR);self.connection.close();return
             if (s.mode=='response' and kind=='CHUNK') or (s.mode=='mkdir-response' and expected=='child_send_pending') or (s.mode=='unlink-response' and intent.get('kind')=='unlink'):
                 msg=copy.deepcopy(msg);msg['document']['file_name']='wrong'
@@ -182,11 +182,12 @@ class Put(unittest.TestCase):
                 return p
             args=['put','--capture',str(capture),'--file',str(source),'--name','hello.txt',
                   '--state-dir',str(state),'--token-file',str(token),'--chunk-bytes','3','--send-interval-ms','0']
+            if mode.startswith('reject-'): s.reject_kind='DIRECTORY'
             try:
                 p=run(args)
                 if mode!='ok':
                     self.assertEqual(p.returncode,1,p.stderr)
-                    self.assertNotIn('DIRECTORY',s.sent)
+                    if mode!='put-lost-add': self.assertNotIn('DIRECTORY',s.sent)
                     if recover:
                         s.mode='ok'
                         def scan_to(name):
@@ -204,6 +205,33 @@ class Put(unittest.TestCase):
                             result=run(other);self.assertEqual(result.returncode,0,result.stderr)
                             s.intent=saved;cap=scan_to('conflict-capture');before=list(s.sent)
                         command=['intent','--resume-directory','--state-dir',str(state),'--capture',str(cap),'--token-file',str(token)]
+                        if mode=='put-lost-add':
+                            stale=command.copy();stale[stale.index('--capture')+1]=str(capture)
+                            self.assertEqual(run(stale).returncode,1)
+                            result=run(command);self.assertEqual(result.returncode,0,result.stderr)
+                            self.assertEqual(json.loads(result.stdout)['directory_resume'],'already_observed')
+                            self.assertEqual(s.sent,before);return
+                        if mode.startswith('reject-'):
+                            events=[json.loads(line) for line in (state/'backlink-repair.log').read_text().splitlines()]
+                            intent=json.loads(before_intent)
+                            if mode in ('reject-500','reject-no-retry'):
+                                self.assertEqual(intent['phase'],'directory_response_uncertain')
+                                self.assertEqual(events[-1]['event'],'directory_send_pending')
+                                self.assertEqual(run(command).returncode,1);self.assertEqual(s.sent,before);return
+                            self.assertEqual(intent['phase'],'directory_send_pending')
+                            self.assertEqual(events[-2]['event'],'directory_send_pending')
+                            self.assertEqual(events[-1]['event'],'directory_send_rejected')
+                            self.assertEqual(events[-1]['operation_id'],intent['add_operation_id'])
+                            if recovery_mode=='wrong-add':
+                                events[-1]['operation_id']=str(uuid.uuid4())
+                                (state/'backlink-repair.log').write_text(''.join(json.dumps(event)+'\n' for event in events))
+                                start=len(s.calls);result=run(command)
+                                self.assertIn(b'invalid ADD rejection evidence',result.stderr)
+                                self.assertNotIn('sendDocument',s.calls[start:]);return
+                            if mode=='reject-429':
+                                result=run(command);self.assertIn(b'cooldown',result.stderr)
+                                self.assertEqual(s.sent,before)
+                                time.sleep(max(0,int(events[-1]['retry_not_before'])-time.time()+1.05))
                         if recovery_mode.startswith('retry:'):
                             self.retry_add(run,command,s,state,recovery_mode[6:]);return
                         s.mode={'lost':'resume-lost','reject':'resume-apierror'}.get(recovery_mode,'ok')
@@ -1056,6 +1084,13 @@ class Put(unittest.TestCase):
         for mode in ('ok','lost','conflict','local','chunk','alias','alias-legacy','alias-capture','alias-corrupt','alias-unique'):
             with self.subTest(mode=mode): self.exercise(mode='edit',recover=True,finalize_case=mode)
     def test_finalize_empty(self): self.exercise(b'',mode='create-pin-after-commit',recover=True,finalize_case='ok')
+    def test_initial_put_add_recovery(self):
+        for mode in ('reject-400','reject-429','reject-500','reject-no-retry','put-lost-add'):
+            with self.subTest(mode=mode): self.exercise(mode=mode,recover=True,finalize_case='ok')
+        self.exercise(b'',mode='reject-403',recover=True,finalize_case='ok')
+        for case in ('lost','wrong-add'):
+            self.exercise(mode='reject-400',recover=True,recovery_mode=case)
+
     def test_resume_directory(self):
         for case in ('ok','lost','reject','phase','conflict','log'):
             with self.subTest(case=case): self.exercise(mode='edit',recover=True,recovery_mode=case)

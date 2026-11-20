@@ -185,3 +185,8 @@ pending с исходным operation_id и индексом/commit. Подтв�
 а `--resume-upload` может продолжить после сверки нового capture и cooldown.
 Потерянный ответ/5xx/неполная запись журнала не разрешают слепой повтор.
 Правила и ограничения: [RESUME_UPLOAD.md](RESUME_UPLOAD.md).
+
+При создании файла writer также сохраняет pending перед DIRECTORY ADD. После
+подтверждённого отказа он записывает rejected с add_operation_id. С новым
+capture публикацию имени можно продолжить через
+[--resume-directory](RESUME_DIRECTORY.md). CHUNK и FILE_COMMIT уже опубликованы.
