@@ -14,6 +14,8 @@ void tgfs_mkdir_help(FILE *stream);
 int tgfs_mkdir_main(int argc, char **argv);
 void tgfs_put_help(FILE *stream);
 int tgfs_put_main(int argc, char **argv);
+void tgfs_gc_plan_help(FILE *stream);
+int tgfs_gc_plan_main(int argc, char **argv);
 void tgfs_read_help(FILE *stream);
 int tgfs_read_main(int argc, char **argv);
 int tgfs_scan_main(int argc, char **argv);

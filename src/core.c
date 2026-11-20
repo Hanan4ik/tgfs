@@ -575,13 +575,8 @@ int tgfs_file_read(tgfs_file *file,uint64_t offset,void *buffer,size_t capacity,
     *length=copied;return 0;
 }
 
-int tgfs_cat(tgfs *fs, const char *path, FILE *output, tgfs_error *e)
+static int stream_commit(tgfs *fs,message *commit,FILE *output,tgfs_error *e)
 {
-    const char *id = resolve(fs, path, e);
-    if (!id) return -1;
-    if (directory_known(fs, id)) return fail_code(e, EISDIR, "cannot read a directory as a file");
-    message *commit = selected_commit(fs, id, e);
-    if (!commit) return -1;
     const cJSON *parts = cJSON_GetObjectItemCaseSensitive(commit->body, "parts");
     /* Check every reference before emitting a prefix. Byte checks remain streaming. */
     const cJSON *p; size_t index = 0;
@@ -615,7 +610,7 @@ int tgfs_cat(tgfs *fs, const char *path, FILE *output, tgfs_error *e)
         if (!EVP_DigestUpdate(full, bytes, length)) {
             free(bytes); fail(e, "SHA-256 update failed"); goto done;
         }
-        if (fwrite(bytes, 1, length, output) != length) {
+        if (output && fwrite(bytes, 1, length, output) != length) {
             free(bytes); fail(e, "cannot write file output"); goto done;
         }
         free(bytes);
@@ -627,9 +622,117 @@ int tgfs_cat(tgfs *fs, const char *path, FILE *output, tgfs_error *e)
     if (!same(hash, json_string(commit->caption, "file_sha256"))) {
         fail(e, "whole-file SHA-256 mismatch"); goto done;
     }
-    if (fflush(output)) { fail(e, "cannot flush file output"); goto done; }
+    if (output && fflush(output)) { fail(e, "cannot flush file output"); goto done; }
     result = 0;
 done:
     EVP_MD_CTX_free(full);
+    return result;
+}
+
+int tgfs_cat(tgfs *fs, const char *path, FILE *output, tgfs_error *e)
+{
+    const char *id = resolve(fs, path, e);
+    if (!id) return -1;
+    if (directory_known(fs, id)) return fail_code(e, EISDIR, "cannot read a directory as a file");
+    message *commit = selected_commit(fs, id, e);
+    if (!commit) return -1;
+    return stream_commit(fs,commit,output,e);
+}
+
+typedef struct {
+    message *commit;
+    uint64_t size;
+    const char *hash;
+    const char *operation;
+} duplicate_commit;
+
+static int duplicate_commit_order(const void *left,const void *right)
+{
+    const duplicate_commit *a=left,*b=right;
+    int hash=strcmp(a->hash,b->hash);
+    if(hash) return hash;
+    if(a->size!=b->size) return a->size<b->size?-1:1;
+    int operation=strcmp(a->operation,b->operation);
+    return operation?operation:by_id(a->commit,b->commit);
+}
+
+static int same_parts(const message *a,const message *b)
+{
+    const cJSON *part_a=cJSON_GetObjectItemCaseSensitive(a->body,"parts")->child;
+    const cJSON *part_b=cJSON_GetObjectItemCaseSensitive(b->body,"parts")->child;
+    while(part_a && part_b) {
+        uint64_t id_a,id_b;
+        if(json_decimal(part_a,"message_id",&id_a) || json_decimal(part_b,"message_id",&id_b) || id_a!=id_b) return 0;
+        part_a=part_a->next;
+        part_b=part_b->next;
+    }
+    return !part_a && !part_b;
+}
+
+static int report_verified_commit(cJSON *group,tgfs *fs,message *commit,tgfs_error *e)
+{
+    tgfs_error verify={0};
+    if(stream_commit(fs,commit,NULL,&verify))
+        return fail(e,"FILE_COMMIT %" PRIu64 ": %s",commit->id,verify.message);
+    cJSON *entry=cJSON_CreateObject();
+    if(!entry || !cJSON_AddItemToArray(group,entry)) {
+        cJSON_Delete(entry);
+        return fail(e,"out of memory");
+    }
+    char id[32];snprintf(id,sizeof(id),"%" PRIu64,commit->id);
+    cJSON *parts=cJSON_AddArrayToObject(entry,"chunk_ids");
+    if(!parts || !cJSON_AddStringToObject(entry,"commit_id",id) ||
+        !cJSON_AddStringToObject(entry,"object_id",commit->object_id) ||
+        !cJSON_AddStringToObject(entry,"version_id",json_string(commit->caption,"version_id")))
+        return fail(e,"out of memory");
+    const cJSON *part;
+    cJSON_ArrayForEach(part,cJSON_GetObjectItemCaseSensitive(commit->body,"parts")) {
+        cJSON *value=cJSON_CreateString(json_string(part,"message_id"));
+        if(!value || !cJSON_AddItemToArray(parts,value)) {cJSON_Delete(value);return fail(e,"out of memory");}
+    }
+    return 0;
+}
+
+int tgfs_duplicate_groups(tgfs *fs,cJSON *groups,tgfs_error *e)
+{
+    duplicate_commit *commits=calloc(fs->count?fs->count:1,sizeof(*commits));
+    if(!commits) return fail(e,"out of memory");
+    size_t count=0;
+    for(size_t i=0;i<fs->count;i++) {
+        message *commit=&fs->messages[i];
+        if(!same(commit->type,"FILE_COMMIT")) continue;
+        uint64_t size;
+        if(json_decimal(commit->caption,"file_size",&size)) {free(commits);return fail(e,"invalid FILE_COMMIT size");}
+        if(!size) continue;
+        commits[count++]=(duplicate_commit){commit,size,json_string(commit->caption,"file_sha256"),
+            json_string(commit->caption,"operation_id")};
+    }
+    qsort(commits,count,sizeof(*commits),duplicate_commit_order);
+    int result=-1;
+    for(size_t start=0;start<count;) {
+        size_t end=start+1;
+        int distinct_parts=0;
+        while(end<count && commits[start].size==commits[end].size && same(commits[start].hash,commits[end].hash)) {
+            if(!distinct_parts && !same_parts(commits[start].commit,commits[end].commit)) distinct_parts=1;
+            end++;
+        }
+        if(distinct_parts) {
+            cJSON *group=cJSON_CreateObject();
+            if(!group || !cJSON_AddItemToArray(groups,group)) {cJSON_Delete(group);fail(e,"out of memory");goto done;}
+            char size[32];snprintf(size,sizeof(size),"%" PRIu64,commits[start].size);
+            cJSON *members=cJSON_AddArrayToObject(group,"verified_commits");
+            if(!members || !cJSON_AddStringToObject(group,"file_sha256",commits[start].hash) ||
+                !cJSON_AddStringToObject(group,"file_size",size)) {fail(e,"out of memory");goto done;}
+            for(size_t i=start;i<end;i++) {
+                /* A retry of the same operation points to the same CHUNKs. Verify the first publication. */
+                if(i>start && same(commits[i-1].operation,commits[i].operation)) continue;
+                if(report_verified_commit(members,fs,commits[i].commit,e)) goto done;
+            }
+        }
+        start=end;
+    }
+    result=0;
+done:
+    free(commits);
     return result;
 }

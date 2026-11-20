@@ -653,3 +653,60 @@ done:
 usage:
     tgfs_intent_help(stderr);return 2;
 }
+
+void tgfs_gc_plan_help(FILE *stream)
+{
+    fputs("usage: tgfs gc-plan --capture DIRECTORY --token-file PATH [--proxy URL | --direct] [--timeout-seconds N]\n"
+          "List content duplicates verified from a completed capture. Reads metadata and CHUNK bytes.\n"
+          "Result is advisory and scoped to the capture. No messages are deleted.\n",stream);
+}
+
+int tgfs_gc_plan_main(int argc,char **argv)
+{
+    tgfs_remote_options options={.no_cache=1,.timeout=60};
+    const char *timeout_text=NULL;
+    if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_gc_plan_help(stdout);return 0;}
+    for(int i=2;i<argc;i++) {
+        const char **slot=NULL;
+        if(same(argv[i],"--direct")) {if(options.proxy) goto usage;options.proxy="";continue;}
+        if(same(argv[i],"--capture")) slot=&options.capture;
+        else if(same(argv[i],"--token-file")) slot=&options.token_file;
+        else if(same(argv[i],"--proxy")) slot=&options.proxy;
+        else if(same(argv[i],"--timeout-seconds")) slot=&timeout_text;
+        if(!slot || *slot || i+1>=argc) goto usage;
+        *slot=argv[++i];
+    }
+    uint64_t timeout=60;
+    if(!options.capture || !options.token_file || (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300)))
+        goto usage;
+    options.timeout=(unsigned)timeout;
+    tgfs_error e={0};
+    tgfs_remote_session *session=NULL;
+    cJSON *report=NULL;
+    char *json=NULL;
+    int result=1;
+    if(tgfs_remote_open(&options,&session,&e)) goto done;
+    const cJSON *journal=session->journal;
+    const cJSON *superblock=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
+    report=cJSON_CreateObject();
+    cJSON *groups=report?cJSON_AddArrayToObject(report,"groups"):NULL;
+    if(!groups || !cJSON_AddStringToObject(report,"schema","TGFS_DUPLICATE_REPORT_V1") ||
+        !cJSON_AddStringToObject(report,"scope","provided_capture_only") ||
+        !cJSON_AddStringToObject(report,"storage_chat_id",json_string(journal,"storage_chat_id")) ||
+        !cJSON_AddStringToObject(report,"root_object_id",json_string(superblock,"root_object_id")) ||
+        !cJSON_AddStringToObject(report,"boundary_id",json_string(journal,"boundary_id")) ||
+        !cJSON_AddBoolToObject(report,"coverage_verified",cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(journal,"coverage_verified")))) {
+        fail(&e,"out of memory");goto done;
+    }
+    if(tgfs_duplicate_groups(session->fs,groups,&e)) goto done;
+    json=cJSON_PrintUnformatted(report);
+    if(!json) {fail(&e,"out of memory");goto done;}
+    if(puts(json)<0 || fflush(stdout)) {fail(&e,"cannot write duplicate report");goto done;}
+    result=0;
+done:
+    if(result) fprintf(stderr,"FAIL gc-plan: %s\n",e.message);
+    free(json);cJSON_Delete(report);tgfs_remote_close(session);
+    return result;
+usage:
+    tgfs_gc_plan_help(stderr);return 2;
+}

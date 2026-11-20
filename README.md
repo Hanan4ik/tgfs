@@ -43,6 +43,8 @@ make test
 
 [Ограниченный ремонт backlinks](docs/BACKLINK_REPAIR.md): `tgfs intent --repair-backlinks`.
 
+[Отчёт о совпадающем содержимом](docs/GC_PLAN.md) — `tgfs gc-plan`.
+
 [Продолжение unlink](docs/UNLINK.md) — `tgfs intent --resume-unlink`.
 
 [Восстановление публикации имени](docs/RESUME_DIRECTORY.md): `tgfs intent --resume-directory`.

@@ -12,6 +12,7 @@
 
 int fail_code(tgfs_error *e, int code, const char *format, ...);
 int fail(tgfs_error *e, const char *format, ...);
+int tgfs_duplicate_groups(tgfs *fs, cJSON *groups, tgfs_error *e);
 int stage_intent_at(int dirfd, const char *file, const char *raw, tgfs_error *e);
 cJSON *json_load_at(int dirfd, const char *file, tgfs_error *e);
 cJSON *json_parse_bytes(const unsigned char *raw, size_t length, tgfs_error *e);
