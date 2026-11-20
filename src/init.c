@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <limits.h>
 #include <unistd.h>
 
 static int same(const char *a, const char *b) { return a && b && !strcmp(a,b); }
@@ -48,12 +50,49 @@ static int message_is(const cJSON *m,long long chat,long long id,const char *tex
         !tgfs_bot_integer(c,"id",&cid) && cid==chat && same(json_string(c,"type"),"channel") &&
         same(json_string(m,"text"),text);
 }
+static void header_text(char text[320],long long id,const char *uuid)
+{
+    snprintf(text,320,"{\"magic\":\"TGFS\",\"format_version\":1,\"type\":\"SUPERBLOCK\",\"start_id\":\"%lld\",\"root_object_id\":\"%s\",\"next_message\":null}",id,uuid);
+}
+
+static int finalize_existing(const char *state,const char *chat,long long chat_id,tgfs_bot *bot,tgfs_bot_error *api,const char **error)
+{
+    int dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC),rc=-1;
+    struct stat st;cJSON *intent=NULL,*out=NULL;tgfs_error e={0};
+    *error="cannot lock private initializer state";
+    if(dir<0 || fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077) || flock(dir,LOCK_EX|LOCK_NB)) goto done;
+    *error="invalid initializer intent";
+    if(fstatat(dir,"intent.json",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) || st.st_nlink!=1 ||
+        st.st_uid!=geteuid() || (st.st_mode&0077)) goto done;
+    intent=json_load_at(dir,"intent.json",&e);
+    if(!intent) goto done;
+    const char *phase=json_string(intent,"phase"),*root=json_string(intent,"root_object_id");
+    uint64_t mid;
+    if(!same(json_string(intent,"storage_chat_id"),chat) || !uuid_valid(root) ||
+        (!same(phase,"pin_pending") && !same(phase,"complete")) || json_decimal(intent,"superblock_message_id",&mid) ||
+        !mid || mid>LLONG_MAX) goto done;
+    char text[320];header_text(text,(long long)mid,root);
+    *error=NULL;
+    if(request(bot,"getChat",params(chat),&out,api)) goto done;
+    long long returned;
+    *error="pinned SUPERBLOCK differs from saved initialization";
+    if(tgfs_bot_integer(out,"id",&returned) || returned!=chat_id || !same(json_string(out,"type"),"channel") ||
+        !message_is(cJSON_GetObjectItemCaseSensitive(out,"pinned_message"),chat_id,(long long)mid,text)) goto done;
+    *error="cannot persist completed initialization";
+    if(!same(phase,"complete") && persist(dir,intent,"complete",(long long)mid)) goto done;
+    if(fsync(dir)) goto done;
+    printf("OK init verified storage=%lld start_id=%llu root_object_id=%s\n",chat_id,(unsigned long long)mid,root);rc=0;
+done:
+    cJSON_Delete(out);cJSON_Delete(intent);if(dir>=0) close(dir);return rc;
+}
+
 void tgfs_init_help(FILE *stream)
 {
-    fputs("usage: tgfs init --new-volume --token-file PATH --storage-chat-id ID --state-dir DIRECTORY [options]\n"
+    fputs("usage: tgfs init (--new-volume | --finalize-existing) --token-file PATH --storage-chat-id ID --state-dir DIRECTORY [options]\n"
           "Create and pin a SUPERBLOCK in a channel explicitly confirmed to be uninitialized.\n"
           "  --new-volume             Assert no existing TGFS volume, including unpinned headers.\n"
-          "  --state-dir DIRECTORY    New local intent directory; must not already exist.\n"
+          "  --finalize-existing      Verify matching pinned header and complete existing local intent.\n"
+          "  --state-dir DIRECTORY    New directory for creation, existing private directory for finalization.\n"
           "  --token-file PATH        Owner-only bot token file.\n"
           "  --storage-chat-id ID     Full negative Bot API channel ID.\n"
           "  --proxy URL | --direct   Same routing options as probe.\n"
@@ -65,10 +104,11 @@ void tgfs_init_help(FILE *stream)
 int tgfs_init_main(int argc,char **argv)
 {
     const char *token=NULL,*chat=NULL,*state=NULL,*proxy=NULL,*timeout_text=NULL;
-    int confirmed=0;
+    int confirmed=0,finalize=0;
     if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_init_help(stdout);return 0;}
     for(int i=2;i<argc;i++) {
         const char **slot=NULL;
+        if(same(argv[i],"--finalize-existing")) {if(finalize) goto usage;finalize=1;continue;}
         if(same(argv[i],"--new-volume")) {if(confirmed) goto usage; confirmed=1;continue;}
         if(same(argv[i],"--direct")) {if(proxy) goto usage;proxy="";continue;}
         if(same(argv[i],"--token-file")) slot=&token;
@@ -80,13 +120,14 @@ int tgfs_init_main(int argc,char **argv)
         *slot=argv[++i];
     }
     long long chat_id,bot_id=0,id=0; uint64_t timeout=60;
-    if(!confirmed || !token || !state || !*state || tgfs_bot_channel_id(chat,&chat_id) ||
+    if(confirmed+finalize!=1 || !token || !state || !*state || tgfs_bot_channel_id(chat,&chat_id) ||
         (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300))) goto usage;
     tgfs_bot *bot=NULL; tgfs_bot_error e={0};
     cJSON *out=NULL,*p=NULL,*intent=NULL; char *header=NULL;
     const char *stage="client",*local=NULL;
     int dir=-1,rc=1;
     if(tgfs_bot_open(token,(unsigned)timeout,&bot,&e) || tgfs_bot_set_proxy(bot,proxy,&e)) goto done;
+    if(finalize) {stage="finalize existing";rc=finalize_existing(state,chat,chat_id,bot,&e,&local)?1:0;goto done;}
     stage="getMe";
     if(request(bot,"getMe",cJSON_CreateObject(),&out,&e)) goto done;
     if(tgfs_bot_integer(out,"id",&bot_id) || bot_id<=0 ||
@@ -121,7 +162,7 @@ int tgfs_init_main(int argc,char **argv)
     int synced=fsync(parentfd);close(parentfd);
     if(synced) {local="cannot persist state directory entry";goto done;}
     dir=open(state,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
-    if(dir<0) {local="cannot open state directory";goto done;}
+    if(dir<0 || flock(dir,LOCK_EX|LOCK_NB)) {local="cannot lock state directory";goto done;}
     unsigned char bytes[16]; char uuid[37];
     if(RAND_bytes(bytes,16)!=1) {local="UUID randomness unavailable";goto done;}
     bytes[6]=(unsigned char)((bytes[6]&15)|64); bytes[8]=(unsigned char)((bytes[8]&63)|128);
@@ -143,8 +184,7 @@ int tgfs_init_main(int argc,char **argv)
         local="unexpected placeholder response; inspect channel before recovery";goto done;
     }
     if(persist(dir,intent,"edit_pending",id)) {local="cannot persist source message ID";goto done;}
-    char text[320];
-    snprintf(text,sizeof(text),"{\"magic\":\"TGFS\",\"format_version\":1,\"type\":\"SUPERBLOCK\",\"start_id\":\"%lld\",\"root_object_id\":\"%s\",\"next_message\":null}",id,uuid);
+    char text[320];header_text(text,id,uuid);
     header=strdup(text);
     if(!header) {local="out of memory";goto done;}
     stage="editMessageText";p=params(chat);

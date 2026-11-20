@@ -50,6 +50,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 command,env=s.lock_probe;s.lock_probe=None
                 s.lock_probe_result=subprocess.run(command,env=env,capture_output=True,timeout=5)
                 assert b'cannot exclusively lock private backlink-repair.log' in s.lock_probe_result.stderr
+            if s.mode.startswith('mkdir-parent-') and expected=='directory_send_pending':
+                assert intent['kind']=='mkdir'
+                pending=json.loads((s.intent.parent/'backlink-repair.log').read_text().splitlines()[-1])
+                assert pending==dict(event='directory_send_pending',message_id=intent['add_operation_id'])
+                s.mode='reject-'+s.mode.removeprefix('mkdir-parent-')
+            if s.mode=='unlink-reject' and intent.get('kind')=='unlink': s.mode='reject-400'
             if s.mode.startswith('reject-') and (not getattr(s,'reject_kind',None) or kind==s.reject_kind) and (kind!='CHUNK' or not hasattr(s,'reject_offset') or record['offset']==s.reject_offset):
                 case=s.mode[7:];code=429 if case in ('429','badretry','no-retry') else 403 if case=='403' else 500 if case=='500' else 400
                 http=500 if case=='http500' else 403 if case=='mismatch' else code
@@ -226,7 +232,7 @@ class Put(unittest.TestCase):
                                 events[-1]['operation_id']=str(uuid.uuid4())
                                 (state/'backlink-repair.log').write_text(''.join(json.dumps(event)+'\n' for event in events))
                                 start=len(s.calls);result=run(command)
-                                self.assertIn(b'invalid ADD rejection evidence',result.stderr)
+                                self.assertIn(b'invalid DIRECTORY rejection evidence',result.stderr)
                                 self.assertNotIn('sendDocument',s.calls[start:]);return
                             if mode=='reject-429':
                                 result=run(command);self.assertIn(b'cooldown',result.stderr)
@@ -266,6 +272,11 @@ class Put(unittest.TestCase):
                             if finalize_case=='chunk':
                                 part_id=int(json.loads(original_intent)['parts'][0]['message_id']);bad=json.loads(s.messages[part_id]['caption'])
                                 bad['part_sha256']='0'*64;s.messages[part_id]['caption']=json.dumps(bad)
+                            if finalize_case=='crash-file':
+                                # Capture exact C serialization and recreate a stop just before rename.
+                                first=run(finalize_command);self.assertEqual(first.returncode,0,first.stderr)
+                                s.intent.rename(state/'intent.finalize.tmp');s.intent.write_bytes(original_intent);s.intent.chmod(0o600)
+                                start=len(s.calls)
                             if finalize_case=='local':
                                 temp=state/'intent.finalize.tmp';temp.write_text('preserve');temp.chmod(0o600)
                             if finalize_case=='alias-capture':
@@ -275,7 +286,7 @@ class Put(unittest.TestCase):
                             s.mode={'alias-capture':'file-alias','lost':'repair-lost-edit','alias':'file-alias','alias-legacy':'file-alias-missing-unique',
                                 'alias-corrupt':'file-alias-corrupt','alias-unique':'file-alias-unique-conflict'}.get(finalize_case,'ok')
                             calls=len(s.calls);result=run(finalize_command)
-                            self.assertEqual(result.returncode,0 if finalize_case in ('ok','alias','alias-legacy','alias-capture') else 1,result.stderr)
+                            self.assertEqual(result.returncode,0 if finalize_case in ('ok','crash-file','alias','alias-legacy','alias-capture') else 1,result.stderr)
                             s.mode='ok'
                             if finalize_case in ('conflict','local','chunk','alias-corrupt','alias-unique'):
                                 if finalize_case=='alias-corrupt': self.assertIn(b'document bytes differ',result.stderr)
@@ -287,6 +298,9 @@ class Put(unittest.TestCase):
                             if finalize_case=='lost':
                                 self.assertEqual(s.intent.read_bytes(),original_intent)
                                 result=run(finalize_command);self.assertEqual(result.returncode,0,result.stderr)
+                            if finalize_case=='crash-file':
+                                self.assertFalse((state/'intent.finalize.tmp').exists())
+                                self.assertNotIn('editMessageCaption',s.calls[start:]);self.assertNotIn('sendDocument',s.calls[start:])
                             completed=json.loads(s.intent.read_text());self.assertEqual(completed['phase'],'complete')
                             self.assertEqual(s.intent.stat().st_mode&0o777,0o600)
                             self.assertTrue(json.loads(result.stdout)['finalized'])
@@ -432,9 +446,10 @@ class Put(unittest.TestCase):
                     self.assertIsNotNone(directory)
                     expected={'mkdir-lost-child':'child_response_uncertain','mkdir-response':'child_response_uncertain',
                         'mkdir-lost-parent':'directory_response_uncertain','mkdir-pin':'child_sent',
-                        'mkdir-edit':'published_navigation_pending'}[mode]
+                        'mkdir-edit':'published_navigation_pending','mkdir-parent-400':'directory_send_pending',
+                        'mkdir-parent-429':'directory_send_pending','mkdir-parent-500':'directory_response_uncertain'}[mode]
                     self.assertEqual(directory['phase'],expected)
-                    self.assertEqual(len(s.sent),(2 if metadata_resume=='nested' else 0)+(1 if mode in ('mkdir-lost-child','mkdir-response','mkdir-pin') else 2))
+                    self.assertEqual(len(s.sent),(2 if metadata_resume=='nested' else 0)+(1 if mode.startswith('mkdir-parent-') or mode in ('mkdir-lost-child','mkdir-response','mkdir-pin') else 2))
                     before=len(s.sent);saved=s.intent.parent
                     write('mkdir',capture,'--path','/documents',state=saved,code=1)
                     self.assertEqual(len(s.sent),before)
@@ -442,6 +457,23 @@ class Put(unittest.TestCase):
                         s.mode='ok';cap=scan();s.intent=saved/'intent.json'
                         original=s.intent.read_bytes();count=len(s.sent)
                         command=['intent','--resume-directory','--state-dir',str(saved),'--capture',str(cap),'--token-file',str(token)]
+                        if mode.startswith('mkdir-parent-'):
+                            log=saved/'backlink-repair.log'
+                            events=[json.loads(line) for line in log.read_text().splitlines()]
+                            if mode=='mkdir-parent-500':
+                                self.assertEqual(events[-1]['event'],'directory_send_pending')
+                                start=len(s.calls);run(command,code=1)
+                                self.assertNotIn('sendDocument',s.calls[start:]);return
+                            self.assertEqual(events[-1]['operation_id'],directory['add_operation_id'])
+                            self.assertEqual(events[-1]['event'],'directory_send_rejected')
+                            if metadata_resume=='legacy':
+                                log.write_text('');start=len(s.calls);run(command,code=1)
+                                self.assertNotIn('sendDocument',s.calls[start:]);return
+                            if mode=='mkdir-parent-429':
+                                start=len(s.calls);result=run(command,code=1)
+                                self.assertIn(b'cooldown',result.stderr)
+                                self.assertNotIn('sendDocument',s.calls[start:])
+                                time.sleep(max(0,int(events[-1]['retry_not_before'])-time.time()+1.05))
                         if metadata_resume.startswith('retry:'):
                             self.retry_add(lambda args:run(args,code=None),command,s,saved,metadata_resume[6:]);return
                         if metadata_resume=='pending':
@@ -718,8 +750,9 @@ class Put(unittest.TestCase):
                     self.assertEqual(len(removed_intent['observed_adds']),2)
                     self.assertNotIn(removed,removed_intent['observed_adds'])
                     phase='prepared' if unlink_mode=='unlink-pin' else ('directory_response_uncertain' if unlink_mode.startswith('unlink-') else 'complete')
+                    if unlink_mode in ('unlink-apierror','unlink-reject'): phase='directory_send_pending'
                     self.assertEqual(removed_intent['phase'],phase)
-                    if unlink_mode not in ('unlink-pin','unlink-apierror'):
+                    if unlink_mode not in ('unlink-pin','unlink-apierror','unlink-reject'):
                         self.assertEqual(s.sent[before:],['DIRECTORY'])
                         msg=s.messages[int(removed_intent.get('directory_message_id',max(s.messages)))]
                         if unlink_mode=='unlink-lost': self.assertNotIn('directory_message_id',removed_intent)
@@ -734,6 +767,32 @@ class Put(unittest.TestCase):
                     self.assertEqual(len(s.sent),count)
                     inject_ops([copy.deepcopy(original_add)]) # Retry of the old ADD cannot resurrect the name.
                     final=scan()
+                    if metadata_resume:
+                        if metadata_resume=='changed':
+                            inject_ops([dict(original_add,operation_id=str(uuid.uuid4()))]);final=scan()
+                        if metadata_resume=='recreated':
+                            write('unlink',final,'--path','/documents/sub/multi.txt')
+                            write('put',scan(),'--parent','/documents/sub','--name','multi.txt','--file',str(source))
+                            final=scan();s.intent=saved/'intent.json'
+                        cmd=['intent','--resume-unlink','--state-dir',str(saved),'--capture',str(final),'--token-file',str(token)]
+                        start=len(s.calls)
+                        if metadata_resume in ('changed','recreated','cooldown','prepared'):
+                            result=run(cmd,code=1);self.assertNotIn('sendDocument',s.calls[start:])
+                            if metadata_resume=='cooldown': self.assertIn(b'cooldown',result.stderr)
+                            self.assertEqual(read(final,'cat','/documents/sub/multi.txt'),expected_data);return
+                        if unlink_mode=='unlink-lost':
+                            self.assertEqual(json.loads(run(cmd).stdout)['directory_resume'],'already_observed')
+                            self.assertNotIn('sendDocument',s.calls[start:]);return
+                        if metadata_resume=='lost': s.mode='resume-lost'
+                        run(cmd,code=1 if metadata_resume=='lost' else 0);s.mode='ok'
+                        self.assertEqual(s.sent[count:],['DIRECTORY'])
+                        msg=s.messages[max(mid for mid,m in s.messages.items() if 'document' in m)]
+                        self.assertEqual(json.loads(s.files[msg['document']['file_id']]),removed_intent['directory_document'])
+                        start=len(s.calls);run(cmd,code=1);self.assertNotIn('sendDocument',s.calls[start:])
+                        final=scan();cmd[cmd.index('--capture')+1]=str(final)
+                        self.assertEqual(json.loads(run(cmd).stdout)['directory_resume'],'already_observed')
+                        self.assertNotIn(b'multi.txt',read(final,'ls','/documents/sub'))
+                        finish_metadata(saved,final);return
                     if diagnose: check_intent(saved,final,'not_observed' if unlink_mode in ('unlink-pin','unlink-apierror') else 'confirmed')
                     if metadata_finish: finish_metadata(saved,final,1 if unlink_mode in ('unlink-pin','unlink-apierror') else 0)
                     file_exists=unlink_mode in ('unlink-pin','unlink-apierror','concurrent')
@@ -1058,6 +1117,12 @@ class Put(unittest.TestCase):
     def test_retry_rejected_mkdir_add(self):
         for case in ('400','429','then-lost','500'):
             with self.subTest(case=case): self.directories(mode='mkdir-pin',metadata_resume='retry:'+case)
+    def test_initial_mkdir_add_recovery(self):
+        for case in ('nested','lost','legacy','duplicate','conflict'):
+            with self.subTest(case=case): self.directories(mode='mkdir-parent-400',metadata_resume=case)
+        for mode in ('mkdir-parent-429','mkdir-parent-500'):
+            with self.subTest(mode=mode): self.directories(mode=mode,metadata_resume='ok')
+
     def test_resume_mkdir_directory(self):
         self.directories(metadata_resume='ok')
         for mode in ('mkdir-lost-child','mkdir-response','mkdir-pin','mkdir-lost-parent','mkdir-edit'):
@@ -1081,7 +1146,7 @@ class Put(unittest.TestCase):
         self.directories(replace=True,diagnose=True,finish_replace='conflict')
         self.directories(replace=True,diagnose=True,finish_replace='invalid')
     def test_finalize_put(self):
-        for mode in ('ok','lost','conflict','local','chunk','alias','alias-legacy','alias-capture','alias-corrupt','alias-unique'):
+        for mode in ('ok','lost','conflict','local','crash-file','chunk','alias','alias-legacy','alias-capture','alias-corrupt','alias-unique'):
             with self.subTest(mode=mode): self.exercise(mode='edit',recover=True,finalize_case=mode)
     def test_finalize_empty(self): self.exercise(b'',mode='create-pin-after-commit',recover=True,finalize_case='ok')
     def test_initial_put_add_recovery(self):
@@ -1108,6 +1173,12 @@ class Put(unittest.TestCase):
     def test_unlink_and_observed_adds(self):
         for mode in ('ok','recreate','concurrent','legacy'):
             with self.subTest(mode=mode): self.directories(unlink=True,unlink_mode=mode)
+    def test_resume_unlink(self):
+        for mode,case in (('unlink-reject','ok'),('unlink-reject','lost'),('unlink-reject','changed'),
+                          ('unlink-reject','recreated'),('unlink-apierror','cooldown'),('unlink-lost','observed'),('unlink-pin','prepared')):
+            with self.subTest(mode=mode,case=case):
+                self.directories(unlink=True,unlink_mode=mode,metadata_resume=case)
+
     def test_unlink_failures(self):
         for mode in ('unlink-lost','unlink-response','unlink-apierror','unlink-pin'):
             with self.subTest(mode=mode): self.directories(unlink=True,unlink_mode=mode)

@@ -118,3 +118,13 @@ make
 - Всего 110 тестов; локально 106 passed/4 kernel skips (нет /dev/fuse),
   ASan/UBSan с detect_leaks=0 из-за ptrace. Живой Telegram unlink пока ожидает
   подтверждения пользователя; HTTP double не заменяет живую проверку.
+
+## Продолжение после явного отказа
+
+После нового scan запустите `tgfs intent --resume-unlink` с теми же
+`--state-dir`, `--token-file` и новым `--capture`. Уже наблюдаемый REMOVE
+возвращает `directory_resume=already_observed`. Для отправки требуются
+сохранённая пара pending/rejected с UUID операции, истёкший cooldown,
+тот же родитель, объект и набор исходных observed_adds. Изменение цели или
+неизвестный исход блокирует отправку. Команда возвращает `published` после
+подтверждения. Затем выполните новый scan и `intent --finalize`.

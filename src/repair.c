@@ -216,7 +216,7 @@ static int directory_attempted(int fd,const char *operation,int require_rejectio
         if(!entry) {found=-1;break;}
         const char *event=json_string(entry,"event");
         if(same(event,"directory_send_pending")) {
-            if(found || !same(json_string(entry,"message_id"),operation)) {cJSON_Delete(entry);fail(e,"conflicting ADD attempts in recovery log");found=-1;break;}
+            if(found || !same(json_string(entry,"message_id"),operation)) {cJSON_Delete(entry);fail(e,"conflicting DIRECTORY attempts in recovery log");found=-1;break;}
             found=1;
         }
         if(same(event,"directory_publication_confirmed")) found=2;
@@ -226,7 +226,7 @@ static int directory_attempted(int fd,const char *operation,int require_rejectio
                 ((require_rejection || cJSON_HasObjectItem(entry,"operation_id")) && !same(json_string(entry,"operation_id"),operation)) || json_count(entry,"http_status",&http) ||
                 json_count(entry,"api_code",&api) || http<400 || http>=500 || api!=http ||
                 json_decimal(entry,"retry_not_before",&when) || (api==429 && !when)) {
-                cJSON_Delete(entry);fail(e,"invalid ADD rejection evidence in recovery log");found=-1;break;
+                cJSON_Delete(entry);fail(e,"invalid DIRECTORY rejection evidence in recovery log");found=-1;break;
             }
             found=0;rejected=1;if(when>deadline) deadline=when;
         }
@@ -236,11 +236,62 @@ static int directory_attempted(int fd,const char *operation,int require_rejectio
     free(line);fclose(stream);
     if(!found && deadline) {
         time_t now=time(NULL);
-        if(now<0 || (uint64_t)now<=deadline) return fail(e,"ADD retry cooldown active; retry after Unix time %llu",(unsigned long long)deadline);
+        if(now<0 || (uint64_t)now<=deadline) return fail(e,"DIRECTORY retry cooldown active; retry after Unix time %llu",(unsigned long long)deadline);
     }
-    if(!found && require_rejection && !rejected) return fail(e,"missing rejection for initial ADD; directory resume is blocked");
+    if(!found && require_rejection && !rejected) return fail(e,"missing rejection for initial DIRECTORY request; directory resume is blocked");
     return found;
 }
+static int publish_directory(tgfs_bot *bot,const cJSON *journal,const cJSON *body,const cJSON *caption,
+    const char *operation,cJSON *report,int fd,tgfs_error *e)
+{
+    /* Validate the pin again immediately before publication. */
+    cJSON *p=params(json_string(journal,"storage_chat_id")),*out=NULL;
+    if(call(bot,"getChat",p,&out,0,e)) return -1;
+    const cJSON *pin=cJSON_GetObjectItemCaseSensitive(out,"pinned_message");const char *raw=json_string(pin,"text");
+    cJSON *header=raw?json_parse_bytes((const unsigned char *)raw,strlen(raw),e):NULL;
+    uint64_t start;long long mid,expected_channel,actual_channel,pin_channel;
+    int good=header && !tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&expected_channel) &&
+        !tgfs_bot_integer(out,"id",&actual_channel) && actual_channel==expected_channel && same(json_string(out,"type"),"channel") &&
+        !tgfs_bot_integer(cJSON_GetObjectItemCaseSensitive(pin,"chat"),"id",&pin_channel) && pin_channel==expected_channel && !json_decimal(cJSON_GetObjectItemCaseSensitive(journal,"superblock"),"start_id",&start) &&
+        !tgfs_bot_integer(pin,"message_id",&mid) && mid==(long long)start && json_semantic_equal(header,cJSON_GetObjectItemCaseSensitive(journal,"superblock"));
+    cJSON_Delete(header);cJSON_Delete(out);if(!good) return fail(e,"pinned SUPERBLOCK differs from capture");
+    char *text=cJSON_PrintUnformatted(caption),*document=cJSON_PrintUnformatted(body);
+    if(!text || !document) {free(text);free(document);return fail(e,"out of memory");}
+    if(log_event(fd,"directory_send_pending",operation,e)) {free(text);free(document);return -1;}
+#ifndef TGFS_TESTING
+    struct timespec pause={1,100000000};
+    while(nanosleep(&pause,&pause)) if(errno!=EINTR) {free(text);free(document);return fail(e,"recovery pacing failed");}
+#endif
+    tgfs_bot_error b;out=NULL;
+    int rc=tgfs_bot_send_document(bot,json_string(journal,"storage_chat_id"),"directory.json",document,strlen(document),text,&out,&b);
+    if(rc) {
+        fail(e,"%s [http=%ld api=%d outcome_unknown=%d retry_after=%u]",b.message,b.http_status,b.api_code,b.outcome_unknown,b.retry_after);
+        tgfs_error saved=*e;
+        if(upload_rejection(fd,"directory_send_rejected",operation,operation,&b,e)) {free(text);free(document);cJSON_Delete(out);return -1;}
+        *e=saved;
+    }
+    long long channel,returned_channel,returned_size;mid=0;
+    const cJSON *chat=cJSON_GetObjectItemCaseSensitive(out,"chat"),*doc=cJSON_GetObjectItemCaseSensitive(out,"document");
+    uint64_t boundary;json_decimal(journal,"boundary_id",&boundary);
+    if(!rc && (tgfs_bot_integer(out,"message_id",&mid) || mid<=(long long)boundary ||
+        tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&channel) || tgfs_bot_integer(chat,"id",&returned_channel) || channel!=returned_channel ||
+        !same(json_string(chat,"type"),"channel") || !same(json_string(out,"caption"),text) ||
+        !same(json_string(doc,"file_name"),"directory.json") || !json_string(doc,"file_id") ||
+        tgfs_bot_integer(doc,"file_size",&returned_size) || returned_size!=(long long)strlen(document))) rc=fail(e,"resumed DIRECTORY response mismatch; outcome may be unknown");
+    free(text);free(document);cJSON_Delete(out);
+    if(rc) return -1;
+    char id[32];snprintf(id,sizeof(id),"%lld",mid);
+    if(log_event(fd,"directory_publication_confirmed",id,e)) return -1;
+    cJSON *value=cJSON_CreateString(id);
+    if(!value || !cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(report,"directory_ids"),value)) {cJSON_Delete(value);return fail(e,"out of memory");}
+    if(!cJSON_AddStringToObject(report,"directory_resume","published")) return fail(e,"out of memory");
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"scope",cJSON_CreateString("capture_plus_recovery_response"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"publication",cJSON_CreateString("confirmed"));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"resumed",cJSON_CreateBool(1));
+    cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("capture_after_directory_publication"));
+    return 0;
+}
+
 int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *intent,cJSON *report,int fd,tgfs_error *e)
 {
     int mkdir=same(json_string(intent,"kind"),"mkdir");
@@ -254,9 +305,9 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
     if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"directory_ids")))
         return cJSON_AddStringToObject(report,"directory_resume","already_observed")?0:fail(e,"out of memory");
     const char *phase=json_string(intent,"phase");
-    int initial_pending=!mkdir && same(phase,"directory_send_pending");
-    if(mkdir ? (!same(phase,"child_sent") && !same(phase,"child_send_pending") && !same(phase,"child_response_uncertain")) :
-        (!initial_pending && !same(phase,"backlinks_pending") && !same(phase,"commit_send_pending") && !same(phase,"commit_response_uncertain")))
+    int initial_pending=same(phase,"directory_send_pending");
+    if(!initial_pending && (mkdir ? (!same(phase,"child_sent") && !same(phase,"child_send_pending") && !same(phase,"child_response_uncertain")) :
+        (!same(phase,"backlinks_pending") && !same(phase,"commit_send_pending") && !same(phase,"commit_response_uncertain"))))
         return fail(e,"ADD may already have been attempted; directory resume is blocked");
     if(cJSON_HasObjectItem(intent,"directory_message_id")) return fail(e,"saved ADD message requires captured publication");
     int attempted=directory_attempted(fd,json_string(intent,"add_operation_id"),initial_pending,e);if(attempted<0) return -1;
@@ -311,52 +362,40 @@ int resume_directory(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *in
     int good=json_semantic_equal(fresh,cJSON_GetObjectItemCaseSensitive(record,"record")) &&
         (!mkdir || cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(fresh,"next_message")));cJSON_Delete(fresh);
     if(!good) return fail(e,"fresh source metadata or navigation differs from capture");
-    /* Validate the pin again immediately before publication. */
-    cJSON *p=params(json_string(journal,"storage_chat_id")),*out=NULL;
-    if(call(bot,"getChat",p,&out,0,e)) return -1;
-    const cJSON *pin=cJSON_GetObjectItemCaseSensitive(out,"pinned_message");const char *raw=json_string(pin,"text");
-    cJSON *header=raw?json_parse_bytes((const unsigned char *)raw,strlen(raw),e):NULL;
-    uint64_t start;long long mid,expected_channel,actual_channel,pin_channel;
-    good=header && !tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&expected_channel) &&
-        !tgfs_bot_integer(out,"id",&actual_channel) && actual_channel==expected_channel && same(json_string(out,"type"),"channel") &&
-        !tgfs_bot_integer(cJSON_GetObjectItemCaseSensitive(pin,"chat"),"id",&pin_channel) && pin_channel==expected_channel && !json_decimal(cJSON_GetObjectItemCaseSensitive(journal,"superblock"),"start_id",&start) &&
-        !tgfs_bot_integer(pin,"message_id",&mid) && mid==(long long)start && json_semantic_equal(header,cJSON_GetObjectItemCaseSensitive(journal,"superblock"));
-    cJSON_Delete(header);cJSON_Delete(out);if(!good) return fail(e,"pinned SUPERBLOCK differs from capture");
-    char *text=cJSON_PrintUnformatted(caption),*document=cJSON_PrintUnformatted(body);
-    if(!text || !document) {free(text);free(document);return fail(e,"out of memory");}
-    if(log_event(fd,"directory_send_pending",operation,e)) {free(text);free(document);return -1;}
-#ifndef TGFS_TESTING
-    struct timespec pause={1,100000000};
-    while(nanosleep(&pause,&pause)) if(errno!=EINTR) {free(text);free(document);return fail(e,"recovery pacing failed");}
-#endif
-    tgfs_bot_error b;out=NULL;
-    int rc=tgfs_bot_send_document(bot,json_string(journal,"storage_chat_id"),"directory.json",document,strlen(document),text,&out,&b);
-    if(rc) {
-        fail(e,"%s [http=%ld api=%d outcome_unknown=%d retry_after=%u]",b.message,b.http_status,b.api_code,b.outcome_unknown,b.retry_after);
-        tgfs_error saved=*e;
-        if(upload_rejection(fd,"directory_send_rejected",operation,operation,&b,e)) {free(text);free(document);cJSON_Delete(out);return -1;}
-        *e=saved;
-    }
-    long long channel,returned_channel,returned_size;mid=0;
-    const cJSON *chat=cJSON_GetObjectItemCaseSensitive(out,"chat"),*doc=cJSON_GetObjectItemCaseSensitive(out,"document");
-    uint64_t boundary;json_decimal(journal,"boundary_id",&boundary);
-    if(!rc && (tgfs_bot_integer(out,"message_id",&mid) || mid<=(long long)boundary ||
-        tgfs_bot_channel_id(json_string(journal,"storage_chat_id"),&channel) || tgfs_bot_integer(chat,"id",&returned_channel) || channel!=returned_channel ||
-        !same(json_string(chat,"type"),"channel") || !same(json_string(out,"caption"),text) ||
-        !same(json_string(doc,"file_name"),"directory.json") || !json_string(doc,"file_id") ||
-        tgfs_bot_integer(doc,"file_size",&returned_size) || returned_size!=(long long)strlen(document))) rc=fail(e,"resumed ADD response mismatch; outcome may be unknown");
-    free(text);free(document);cJSON_Delete(out);
-    if(rc) return -1;
-    char id[32];snprintf(id,sizeof(id),"%lld",mid);
-    if(log_event(fd,"directory_publication_confirmed",id,e)) return -1;
-    cJSON *value=cJSON_CreateString(id);
-    if(!value || !cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(report,"directory_ids"),value)) {cJSON_Delete(value);return fail(e,"out of memory");}
-    if(!cJSON_AddStringToObject(report,"directory_resume","published")) return fail(e,"out of memory");
-    cJSON_ReplaceItemInObjectCaseSensitive(report,"scope",cJSON_CreateString("capture_plus_recovery_response"));
-    cJSON_ReplaceItemInObjectCaseSensitive(report,"publication",cJSON_CreateString("confirmed"));
-    cJSON_ReplaceItemInObjectCaseSensitive(report,"resumed",cJSON_CreateBool(1));
-    cJSON_ReplaceItemInObjectCaseSensitive(report,"next_step",cJSON_CreateString("capture_after_directory_publication"));
-    return 0;
+    return publish_directory(bot,journal,body,caption,operation,report,fd,e);
+}
+
+int resume_unlink(tgfs_bot *bot,tgfs *fs,const cJSON *journal,const cJSON *intent,cJSON *report,int fd,tgfs_error *e)
+{
+    const char *operation=json_string(intent,"remove_operation_id");
+    if(!same(json_string(intent,"kind"),"unlink") || !uuid_valid(operation))
+        return fail(e,"unlink resume requires a saved REMOVE operation");
+    if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(report,"directory_ids")))
+        return cJSON_AddStringToObject(report,"directory_resume","already_observed")?0:fail(e,"out of memory");
+    if(!same(json_string(intent,"phase"),"directory_send_pending") || cJSON_HasObjectItem(intent,"directory_message_id"))
+        return fail(e,"unlink resume requires a rejected initial REMOVE");
+    int attempted=directory_attempted(fd,operation,1,e);
+    if(attempted<0) return -1;
+    if(attempted) return fail(e,"previous REMOVE may have been published; use a newer capture");
+    const char *saved=json_string(intent,"path");char path[4097];
+    if(!saved || saved[0]!='/' || strlen(saved)>=sizeof(path)) return fail(e,"invalid saved unlink path");
+    strcpy(path,saved);char *slash=strrchr(path,'/');const char *name=slash+1;*slash=0;
+    char object[37],parent[37],grandparent[37];cJSON *observed=NULL;
+    if(unlink_target(fs,path[0]?path:"/",name,object,parent,grandparent,&observed,e)) return -1;
+    const cJSON *body=cJSON_GetObjectItemCaseSensitive(intent,"directory_document"),*caption=cJSON_GetObjectItemCaseSensitive(intent,"directory_caption");
+    const cJSON *ops=cJSON_GetObjectItemCaseSensitive(body,"operations"),*op=cJSON_GetArrayItem(ops,0);
+    size_t format;
+    int valid=same(object,json_string(intent,"object_id")) && same(parent,json_string(intent,"parent_id")) &&
+        same(parent,json_string(caption,"object_id")) && same(json_string(caption,"type"),"DIRECTORY") &&
+        same(json_string(caption,"magic"),"TGFS") && !json_count(caption,"format_version",&format) && format==1 &&
+        cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(caption,"next_message")) &&
+        (grandparent[0]?same(json_string(caption,"parent_id"),grandparent):cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(caption,"parent_id"))) &&
+        cJSON_GetArraySize(ops)==1 && same(json_string(op,"action"),"REMOVE") && same(json_string(op,"name"),name) &&
+        same(json_string(op,"operation_id"),operation) && cJSON_Compare(observed,cJSON_GetObjectItemCaseSensitive(op,"observed_adds"),1) &&
+        cJSON_Compare(observed,cJSON_GetObjectItemCaseSensitive(intent,"observed_adds"),1);
+    cJSON_Delete(observed);
+    if(!valid || directory_operations_valid(body,e)) return fail(e,"saved REMOVE disagrees with captured target or observed ADDs");
+    return publish_directory(bot,journal,body,caption,operation,report,fd,e);
 }
 
 static int finish_local_intent(const char *state,const cJSON *intent,const char *commit_id,const char *directory_id,int logfd,tgfs_error *e)
@@ -382,8 +421,24 @@ static int finish_local_intent(const char *state,const cJSON *intent,const char 
         (directory_id && !cJSON_AddStringToObject(finished,"directory_message_id",directory_id))) {fail(e,"out of memory");goto done;}
     raw=cJSON_PrintUnformatted(finished);if(!raw) {fail(e,"out of memory");goto done;}
     fd=openat(dir,"intent.finalize.tmp",O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
-    if(fd<0) {fail(e,"cannot create intent.finalize.tmp; preserve any existing recovery file");goto done;}
     size_t offset=0,length=strlen(raw);
+    if(fd<0 && errno==EEXIST) {
+        /* A crash can leave the complete, unpublished result. Reuse only its exact bytes. */
+        fd=openat(dir,"intent.finalize.tmp",O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC);
+        if(fd<0 || fstat(fd,&st) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() ||
+            (st.st_mode&07777)!=0600 || st.st_nlink!=1 || st.st_size!=(off_t)length) {
+            fail(e,"unexpected intent.finalize.tmp; preserve existing recovery file");goto done;
+        }
+        char buf[4096];
+        while(offset<length) {
+            size_t left=length-offset;
+            ssize_t n=read(fd,buf,left<sizeof(buf)?left:sizeof(buf));
+            if(n<0 && errno==EINTR) continue;
+            if(n<=0 || memcmp(raw+offset,buf,(size_t)n)) {fail(e,"saved finalize file differs from verified intent");goto done;}
+            offset+=(size_t)n;
+        }
+    }
+    if(fd<0) {fail(e,"cannot create intent.finalize.tmp");goto done;}
     while(offset<length) {ssize_t n=write(fd,raw+offset,length-offset);if(n<0 && errno==EINTR) continue;if(n<=0) {fail(e,"cannot write finalized intent");goto done;}offset+=(size_t)n;}
     if(fsync(fd)) {fail(e,"cannot persist finalized intent");goto done;}
     if(close(fd)) {fd=-1;fail(e,"cannot close finalized intent");goto done;}fd=-1;
