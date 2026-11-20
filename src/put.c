@@ -477,14 +477,19 @@ static int make_directory(tgfs_bot *bot,const cJSON *journal,const char *path,co
         !cJSON_AddItemToObject(intent,"directory_document",cJSON_Duplicate(body,1))) {
         fail(e,"cannot allocate directory intent");goto done;
     }
-    if(persist(dir,intent,"child_send_pending",e)) goto done;
-    int sent=upload_json(bot,chat,channel,"directory.json",empty,child,&child_id,&child_size,e,NULL);
+    if(upload_log_event(logfd,"child_send_pending",object,e) || persist(dir,intent,"child_send_pending",e)) goto done;
+    tgfs_bot_error rejection;
+    int sent=upload_json(bot,chat,channel,"directory.json",empty,child,&child_id,&child_size,e,&rejection);
+    if(sent && upload_rejected(&rejection)) {
+        tgfs_error saved=*e;
+        if(!upload_rejection(logfd,"child_send_rejected",object,object,&rejection,e)) *e=saved;
+        goto done;
+    }
     if(!sent && (uint64_t)child_id<=boundary) sent=fail(e,"non-increasing child directory ID");
     if(child_id>0 && add_id(intent,"child_message_id",child_id)) {fail(e,"out of memory");goto done;}
     if(sent) {tgfs_error saved=*e;persist(dir,intent,"child_response_uncertain",e);*e=saved;goto done;}
     if(persist(dir,intent,"child_sent",e) || check_pin(bot,journal,e) ||
         upload_log_event(logfd,"directory_send_pending",operation,e) || persist(dir,intent,"directory_send_pending",e)) goto done;
-    tgfs_bot_error rejection;
     sent=upload_json(bot,chat,channel,"directory.json",body,parent_caption,&parent_id,&parent_size,e,&rejection);
     if(sent && upload_rejected(&rejection)) {
         tgfs_error saved=*e;

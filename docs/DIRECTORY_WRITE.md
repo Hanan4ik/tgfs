@@ -105,7 +105,7 @@ parent_id, а также caption операции DIRECTORY для диагно�
 
 | Phase mkdir | Смысл |
 | --- | --- |
-| child_send_pending | Намерение сохранено до отправки пустого DIRECTORY |
+| child_send_pending | Намерение сохранено до отправки пустого DIRECTORY. Подтверждённый отказ записывается в журнал, продолжение через --resume-directory |
 | child_response_uncertain | Ответ потерян или metadata не совпали; дочерний объект мог появиться |
 | child_sent | Исходный ID дочернего DIRECTORY сохранён, имя ещё не опубликовано |
 | directory_send_pending | Намерение ADD сохранено перед отправкой родителя |
