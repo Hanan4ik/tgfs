@@ -167,3 +167,6 @@ kernel mount/unmount, в обычной сборке и ASan/UBSan.
 пустой файл и EROFS. Размер multipart=11, локальный inode=5, права0444;
 время epoch0 отображается как 03:00 при часовом поясе +0300.
 Основание API: [libfuse operations](https://libfuse.github.io/doxygen/structfuse__operations.html).
+
+При монтировании capture параметр `--open-files-dir` включает запись
+ссылок открытых файлов для [gc-plan](GC_PLAN.md#открытые-файлы-монтирования).

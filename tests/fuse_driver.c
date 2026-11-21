@@ -56,7 +56,24 @@ int main(int argc,char **argv)
     cJSON *result=cJSON_CreateObject();const char *path="/documents/hello.txt";
     struct fuse_file_info fi={.flags=O_RDONLY};
     unsigned char buffer[64]={0};
-    if(!strcmp(argv[2],"basic")) {
+    if(!strcmp(argv[2],"retain-open")) {
+        const char *registry=getenv("TGFS_DRIVER_OPEN_FILES");
+        if(!session || !registry || tgfs_fuse_track_open_files(v,registry,tgfs_remote_journal(session),&e)) {
+            fprintf(stderr,"driver open files: %s\n",e.message);
+            number(result,"tracking",-1);
+        } else {
+            struct fuse_file_info second={.flags=O_RDONLY};
+            number(result,"open",ops->open(path,&fi));
+            number(result,"second_open",ops->open(path,&second));
+            number(result,"first_release",ops->release(path,&fi));
+            puts("ready");fflush(stdout);
+            if(getchar()!=EOF) {
+                int n=ops->read(path,(char *)buffer,6,0,&second);
+                number(result,"read",n);bytes_result(result,"hex",buffer,n);
+                number(result,"release",ops->release(path,&second));
+            }
+        }
+    } else if(!strcmp(argv[2],"basic")) {
         struct stat st;
         number(result,"root_rc",ops->getattr("/",&st,NULL));number(result,"root_inode",(long long)st.st_ino);
         number(result,"root_links",(long long)st.st_nlink);number(result,"root_mode",st.st_mode&0777);

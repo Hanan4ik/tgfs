@@ -43,6 +43,7 @@ void tgfs_mount_help(FILE *stream)
           "  --timeout-seconds N      1..300, default 60.\n"
           "  --cache-dir DIRECTORY    Private SQLite cache, as in read.\n"
           "  --cache-limit-mib N      1..4096, default 256.\n"
+          "  --open-files-dir DIR     New private directory for captured open-file references.\n"
           "  --offline                Capture mode uses cached metadata/parts only.\n"
           "  --refresh-cache          Refresh metadata; fetched parts replace cache entries.\n"
           "  --no-cache               Temporary metadata and one RAM chunk only.\n"
@@ -52,7 +53,7 @@ void tgfs_mount_help(FILE *stream)
 }
 int tgfs_mount_main(int argc,char **argv)
 {
-    const char *point=NULL,*snapshot=NULL,*capture=NULL,*token=NULL,*proxy=NULL,*cache_dir=NULL,*timeout_text=NULL,*limit_text=NULL;
+    const char *point=NULL,*snapshot=NULL,*capture=NULL,*token=NULL,*proxy=NULL,*cache_dir=NULL,*timeout_text=NULL,*limit_text=NULL,*open_files=NULL;
     int offline=0,refresh=0,no_cache=0,stats=0;
     if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_mount_help(stdout);return 0;}
     for(int i=2;i<argc;i++) {
@@ -63,6 +64,7 @@ int tgfs_mount_main(int argc,char **argv)
         if(same(argv[i],"--no-cache")) {if(no_cache) goto usage;no_cache=1;continue;}
         if(same(argv[i],"--cache-stats")) {if(stats) goto usage;stats=1;continue;}
         if(same(argv[i],"--mountpoint")) slot=&point;
+        else if(same(argv[i],"--open-files-dir")) slot=&open_files;
         else if(same(argv[i],"--snapshot")) slot=&snapshot;
         else if(same(argv[i],"--capture")) slot=&capture;
         else if(same(argv[i],"--token-file")) slot=&token;
@@ -75,7 +77,7 @@ int tgfs_mount_main(int argc,char **argv)
     }
     uint64_t timeout=60,limit=256;
     if(!point || (!!snapshot==!!capture) || (capture && !token) ||
-        (snapshot && (token || proxy || cache_dir || timeout_text || limit_text || offline || refresh || no_cache || stats)) ||
+        (snapshot && (open_files || token || proxy || cache_dir || timeout_text || limit_text || offline || refresh || no_cache || stats)) ||
         (offline && refresh) || (no_cache && (offline || refresh || cache_dir || limit_text)) ||
         (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300)) ||
         (limit_text && (decimal(limit_text,&limit) || !limit || limit>4096 || limit>SIZE_MAX/(1024U*1024U)))) goto usage;
@@ -90,6 +92,13 @@ int tgfs_mount_main(int argc,char **argv)
         fs=tgfs_remote_fs(session);
     }
     v=tgfs_fuse_view_new(fs,&e);if(!v) goto done;
+    if(open_files) {
+        if(tgfs_fuse_track_open_files(v,open_files,tgfs_remote_journal(session),&e)) goto done;
+        /* The registry must stay outside the directory that FUSE will cover. */
+        char *checked=mount_directory(absolute,&e);
+        if(!checked) goto done;
+        free(checked);
+    }
     if(stats && session) tgfs_remote_report(session,stderr);
     char *fuse_argv[]={"tgfs","-f","-s","-o","ro,default_permissions,nodev,nosuid",absolute,NULL};
     rc=fuse_main(6,fuse_argv,tgfs_fuse_operations(),v) ? 1 : 0;

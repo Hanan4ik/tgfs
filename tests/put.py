@@ -906,10 +906,10 @@ class Put(unittest.TestCase):
                 original=json.loads(s.messages[int(directory['child_message_id'])]['caption'])
                 self.assertEqual(original,child)
                 if mount:
-                    point=root/'mnt';point.mkdir();log=root/'mount.log'
+                    point=root/'mnt';point.mkdir();log=root/'mount.log';registry=root/'open-files'
                     with log.open('wb') as stream:
                         proc=subprocess.Popen([BINARY,'mount','--capture',str(final),'--token-file',str(token),
-                            '--mountpoint',str(point),'--no-cache'],env=env,stdout=stream,stderr=stream)
+                            '--mountpoint',str(point),'--no-cache','--open-files-dir',str(registry)],env=env,stdout=stream,stderr=stream)
                         try:
                             end=time.monotonic()+15
                             while proc.poll() is None and not os.path.ismount(point) and time.monotonic()<end: time.sleep(.05)
@@ -924,6 +924,15 @@ class Put(unittest.TestCase):
                             if file_exists:
                                 with (point/'documents/sub/multi.txt').open('rb',buffering=0) as f:
                                     self.assertEqual(os.pread(f.fileno(),5,2),expected_data[2:7])
+                                    refs=json.loads((registry/'open-files.json').read_text())['files']
+                                    self.assertTrue(refs)
+                                    if not replace:
+                                        self.assertIn(dict(commit_id=file['file_commit_id'],
+                                            chunk_ids=[p['message_id'] for p in file['parts']]),refs)
+                            end=time.monotonic()+5
+                            while json.loads((registry/'open-files.json').read_text())['files'] and time.monotonic()<end:
+                                time.sleep(.02)
+                            self.assertEqual(json.loads((registry/'open-files.json').read_text())['files'],[])
                             with self.assertRaises(OSError) as caught: (point/'documents/new').mkdir()
                             self.assertEqual(caught.exception.errno,errno.EROFS)
                         finally:
