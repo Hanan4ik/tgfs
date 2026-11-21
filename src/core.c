@@ -518,6 +518,24 @@ void tgfs_file_close(tgfs_file *file)
     if(file) {free(file->parts);EVP_MD_CTX_free(file->sequential);free(file);}
 }
 void tgfs_file_attr(const tgfs_file *file,tgfs_attr *attr) {*attr=file->attr;}
+cJSON *tgfs_file_references(const tgfs_file *file)
+{
+    cJSON *refs=cJSON_CreateObject();
+    char commit_id[32];
+    snprintf(commit_id,sizeof(commit_id),"%" PRIu64,file->commit->id);
+    if(!refs) return NULL;
+    cJSON *chunks=cJSON_AddArrayToObject(refs,"chunk_ids");
+    if(!chunks || !cJSON_AddStringToObject(refs,"commit_id",commit_id)) goto invalid;
+    for(size_t i=0;i<file->count;i++) {
+        const char *id=json_string(file->parts[i].metadata,"message_id");
+        cJSON *value=cJSON_CreateString(id);
+        if(!value || !cJSON_AddItemToArray(chunks,value)) {cJSON_Delete(value);goto invalid;}
+    }
+    return refs;
+invalid:
+    cJSON_Delete(refs);return NULL;
+}
+
 static int part_bytes(tgfs_file *file,file_part *part,tgfs_error *e)
 {
     tgfs *fs=file->fs;

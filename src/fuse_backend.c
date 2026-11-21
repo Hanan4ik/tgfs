@@ -1,13 +1,20 @@
 #include "fuse_backend.h"
 #include "internal.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 typedef struct open_file { uint64_t id;tgfs_file *file;struct open_file *next; } open_file;
-struct tgfs_fuse_view {tgfs *fs;open_file *files;uint64_t next_handle;};
+struct tgfs_fuse_view {
+    tgfs *fs;
+    open_file *files;
+    uint64_t next_handle;
+    int open_files_dir;
+    cJSON *open_files_identity;
+};
 #ifdef TGFS_TESTING
 static tgfs_fuse_view *test_context;
 void tgfs_fuse_test_context(tgfs_fuse_view *v) {test_context=v;}
@@ -27,12 +34,64 @@ tgfs_fuse_view *tgfs_fuse_view_new(tgfs *fs,tgfs_error *e)
     if(tgfs_list(fs,"/",ignore_entry,NULL,e)) return NULL;
     tgfs_fuse_view *v=calloc(1,sizeof(*v));
     if(!v) {fail_code(e,ENOMEM,"out of memory opening mount view");return NULL;}
-    v->fs=fs;v->next_handle=1;return v;
+    v->fs=fs;v->next_handle=1;v->open_files_dir=-1;return v;
 }
+static int publish_open_files(tgfs_fuse_view *v,tgfs_error *e)
+{
+    if(v->open_files_dir<0) return 0;
+    cJSON *report=cJSON_Duplicate(v->open_files_identity,1);
+    cJSON *files=report?cJSON_AddArrayToObject(report,"files"):NULL;
+    char *raw=NULL;
+    int rc=-1;
+    if(!files) {fail(e,"out of memory recording open files");goto done;}
+    for(const open_file *file=v->files;file;file=file->next) {
+        cJSON *refs=tgfs_file_references(file->file);
+        if(!refs || !cJSON_AddItemToArray(files,refs)) {
+            cJSON_Delete(refs);fail(e,"out of memory recording open files");goto done;
+        }
+    }
+    raw=cJSON_PrintUnformatted(report);
+    if(!raw || strlen(raw)>TGFS_MAX_JSON) {fail(e,"cannot encode open files within size limit");goto done;}
+    int dir=v->open_files_dir;
+    if(stage_intent_at(dir,"open-files.tmp",raw,e) ||
+        renameat(dir,"open-files.tmp",dir,"open-files.json")) {
+        unlinkat(dir,"open-files.tmp",0);
+        fail(e,"cannot publish open-file references");goto done;
+    }
+    if(fsync(dir)) {fail(e,"cannot sync open-file references");goto done;}
+    rc=0;
+done:
+    free(raw);cJSON_Delete(report);return rc;
+}
+
+int tgfs_fuse_track_open_files(tgfs_fuse_view *v,const char *path,const cJSON *journal,tgfs_error *e)
+{
+    const cJSON *sb=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
+    cJSON *identity=cJSON_CreateObject();
+    if(!identity || !cJSON_AddStringToObject(identity,"schema","TGFS_OPEN_FILES_V1") ||
+        !cJSON_AddStringToObject(identity,"storage_chat_id",json_string(journal,"storage_chat_id")) ||
+        !cJSON_AddStringToObject(identity,"root_object_id",json_string(sb,"root_object_id")) ||
+        !cJSON_AddStringToObject(identity,"start_id",json_string(sb,"start_id")) ||
+        !cJSON_AddStringToObject(identity,"boundary_id",json_string(journal,"boundary_id"))) {
+        cJSON_Delete(identity);return fail(e,"cannot encode mount identity");
+    }
+    if(mkdir(path,0700)) {cJSON_Delete(identity);return fail(e,"open-files-dir must be a new private directory");}
+    int dir=open(path,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(dir<0) {cJSON_Delete(identity);return fail(e,"cannot open open-files-dir");}
+    v->open_files_dir=dir;v->open_files_identity=identity;
+    return publish_open_files(v,e);
+}
+
 void tgfs_fuse_view_close(tgfs_fuse_view *v)
 {
     if(!v) return;
     while(v->files) {open_file *f=v->files;v->files=f->next;tgfs_file_close(f->file);free(f);}
+    if(v->open_files_dir>=0) {
+        tgfs_error e={0};
+        if(publish_open_files(v,&e)) fprintf(stderr,"tgfs open files: %s\n",e.message);
+        close(v->open_files_dir);
+    }
+    cJSON_Delete(v->open_files_identity);
     free(v);
 }
 static open_file *find_file(tgfs_fuse_view *v,uint64_t id)
@@ -66,7 +125,13 @@ static int ro_open(const char *path,struct fuse_file_info *fi)
     if(tgfs_file_open(v->fs,path,&f->file,&e)) {free(f);return error_result(&e);}
     if(fi->flags&O_DIRECTORY) {tgfs_file_close(f->file);free(f);return -ENOTDIR;}
     if(!v->next_handle) {tgfs_file_close(f->file);free(f);return -EMFILE;}
-    f->id=v->next_handle++;f->next=v->files;v->files=f;fi->fh=f->id;
+    f->id=v->next_handle++;f->next=v->files;v->files=f;
+    if(publish_open_files(v,&e)) {
+        v->files=f->next;tgfs_file_close(f->file);free(f);
+        fprintf(stderr,"tgfs open files: %s\n",e.message);
+        return error_result(&e);
+    }
+    fi->fh=f->id;
     fi->direct_io=1;return 0;
 }
 static int ro_read(const char *path,char *buffer,size_t size,off_t offset,struct fuse_file_info *fi)
@@ -85,7 +150,13 @@ static int ro_release(const char *path,struct fuse_file_info *fi)
     (void)path;tgfs_fuse_view *v=view();if(!v || !fi) return -EBADF;
     open_file **p=&v->files;while(*p && (*p)->id!=fi->fh) p=&(*p)->next;
     if(!*p) return -EBADF;
-    open_file *f=*p;*p=f->next;tgfs_file_close(f->file);free(f);fi->fh=0;return 0;
+    open_file *f=*p;*p=f->next;tgfs_file_close(f->file);free(f);fi->fh=0;
+    tgfs_error e={0};
+    if(publish_open_files(v,&e)) {
+        fprintf(stderr,"tgfs open files: %s\n",e.message);
+        return error_result(&e);
+    }
+    return 0;
 }
 static int ro_opendir(const char *path,struct fuse_file_info *fi)
 {

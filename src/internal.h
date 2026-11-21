@@ -12,6 +12,9 @@
 
 int fail_code(tgfs_error *e, int code, const char *format, ...);
 int fail(tgfs_error *e, const char *format, ...);
+struct tgfs_remote_session;
+const cJSON *tgfs_remote_journal(const struct tgfs_remote_session *session);
+cJSON *tgfs_file_references(const tgfs_file *file);
 int tgfs_duplicate_groups(tgfs *fs, cJSON *groups, cJSON *chunk_refs, tgfs_error *e);
 int tgfs_retained_capture_refs(tgfs *fs, const cJSON *chunk_refs, cJSON *retained, tgfs_error *e);
 int stage_intent_at(int dirfd, const char *file, const char *raw, tgfs_error *e);

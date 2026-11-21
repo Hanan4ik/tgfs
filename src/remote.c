@@ -302,6 +302,7 @@ invalid:
     tgfs_remote_close(s);return -1;
 }
 tgfs *tgfs_remote_fs(tgfs_remote_session *s) {return s->fs;}
+const cJSON *tgfs_remote_journal(const tgfs_remote_session *s) {return s->journal;}
 void tgfs_remote_report(tgfs_remote_session *s,FILE *stream)
 {
     fprintf(stream,"cache: index=%s hits=%u downloads=%u\n",s->r.index_hit?"hit":"miss",s->r.hits,s->r.downloads);
@@ -799,9 +800,75 @@ done:
     return rc;
 }
 
+static int validate_open_file(const cJSON *file,uint64_t start,uint64_t boundary,tgfs_error *e)
+{
+    uint64_t commit;
+    const cJSON *chunks=cJSON_GetObjectItemCaseSensitive(file,"chunk_ids"),*chunk;
+    if(json_decimal(file,"commit_id",&commit) || commit<=start || commit>=boundary || !cJSON_IsArray(chunks))
+        return fail(e,"invalid open-file manifest reference");
+    cJSON_ArrayForEach(chunk,chunks) {
+        uint64_t id;
+        if(!cJSON_IsString(chunk) || decimal(chunk->valuestring,&id) || id<=start || id>=commit)
+            return fail(e,"invalid open-file CHUNK reference");
+    }
+    return 0;
+}
+
+static int report_open_files(const cJSON *journal,const char *path,cJSON *mounts,tgfs_error *e)
+{
+    int dir=open(path,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    struct stat st;
+    if(dir<0 || fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {
+        if(dir>=0) close(dir);
+        return fail(e,"retain-open-files requires a private mount state directory: %s",path);
+    }
+    if(fstatat(dir,"open-files.json",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) ||
+        st.st_uid!=geteuid() || (st.st_mode&0077) || st.st_nlink!=1) {
+        close(dir);return fail(e,"open-files.json must be an owner-only regular file: %s",path);
+    }
+    cJSON *saved=json_load_at(dir,"open-files.json",e);
+    close(dir);
+    if(!saved) return -1;
+    const cJSON *sb=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
+    const cJSON *files=cJSON_GetObjectItemCaseSensitive(saved,"files"),*file;
+    uint64_t start,boundary,current_boundary;
+    int rc=-1;
+    if(!same(json_string(saved,"schema"),"TGFS_OPEN_FILES_V1") || !cJSON_IsArray(files) ||
+        json_decimal(saved,"boundary_id",&boundary) || json_decimal(saved,"start_id",&start) ||
+        !start || boundary<=start || boundary>TGFS_BOT_MAX_EXACT_ID) {
+        fail(e,"invalid open-file report: %s",path);goto done;
+    }
+    if(!same(json_string(saved,"storage_chat_id"),json_string(journal,"storage_chat_id")) ||
+        !same(json_string(saved,"root_object_id"),json_string(sb,"root_object_id")) ||
+        !same(json_string(saved,"start_id"),json_string(sb,"start_id"))) {
+        fail(e,"open files belong to a different volume: %s",path);goto done;
+    }
+    if(json_decimal(journal,"boundary_id",&current_boundary) || boundary>current_boundary) {
+        fail(e,"open-file report is newer than current capture: %s",path);goto done;
+    }
+    cJSON_ArrayForEach(file,files) if(validate_open_file(file,start,boundary,e)) goto done;
+    cJSON *entry=cJSON_CreateObject();
+    if(!entry || !cJSON_AddItemToArray(mounts,entry)) {
+        cJSON_Delete(entry);fail(e,"out of memory");goto done;
+    }
+    if(!cJSON_AddStringToObject(entry,"state_dir",path) ||
+        !cJSON_AddStringToObject(entry,"boundary_id",json_string(saved,"boundary_id"))) {
+        fail(e,"out of memory");goto done;
+    }
+    cJSON *owned_files=cJSON_DetachItemFromObjectCaseSensitive(saved,"files");
+    if(!cJSON_AddItemToObject(entry,"files",owned_files)) {
+        cJSON_Delete(owned_files);fail(e,"out of memory");goto done;
+    }
+    rc=0;
+done:
+    cJSON_Delete(saved);
+    return rc;
+}
+
+typedef enum { GC_CAPTURE, GC_INTENT, GC_OPEN_FILES, GC_INPUT_COUNT } gc_input_kind;
 typedef struct {
     const char *path;
-    int is_intent;
+    gc_input_kind kind;
 } gc_input;
 
 void tgfs_gc_plan_help(FILE *stream)
@@ -810,9 +877,10 @@ void tgfs_gc_plan_help(FILE *stream)
           "List content duplicates verified from a completed capture. Reads metadata and CHUNK bytes.\n"
           "  --retain-capture DIRECTORY  Include references from an older capture of this volume; repeatable.\n"
           "  --retain-intent DIRECTORY   Include an unfinished put state directory; repeatable.\n"
+          "  --retain-open-files DIR     Include a mount open-file report; repeatable.\n"
           "  --proxy URL | --direct      Transport routing.\n"
           "  --timeout-seconds N         1..300, default 60.\n"
-          "Result is advisory and scoped to the supplied captures and intents.\n",stream);
+          "Result is advisory and scoped to the supplied captures and local state.\n",stream);
 }
 
 int tgfs_gc_plan_main(int argc,char **argv)
@@ -821,19 +889,20 @@ int tgfs_gc_plan_main(int argc,char **argv)
     const char *timeout_text=NULL;
     gc_input *inputs=NULL;
     size_t input_count=0;
-    int has_captures=0,has_intents=0;
+    int supplied[GC_INPUT_COUNT]={0};
+    const char *input_flags[]={"--retain-capture","--retain-intent","--retain-open-files"};
     if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_gc_plan_help(stdout);return 0;}
     inputs=calloc((size_t)argc,sizeof(*inputs));
     if(!inputs) {fputs("FAIL gc-plan: out of memory\n",stderr);return 1;}
     for(int i=2;i<argc;i++) {
         const char **slot=NULL;
         if(same(argv[i],"--direct")) {if(options.proxy) goto usage;options.proxy="";continue;}
-        int is_intent=same(argv[i],"--retain-intent");
-        if(is_intent || same(argv[i],"--retain-capture")) {
+        gc_input_kind kind=GC_CAPTURE;
+        while(kind<GC_INPUT_COUNT && !same(argv[i],input_flags[kind])) kind++;
+        if(kind<GC_INPUT_COUNT) {
             if(i+1>=argc || !*argv[i+1]) goto usage;
-            inputs[input_count++]=(gc_input){argv[++i],is_intent};
-            has_intents |= is_intent;
-            has_captures |= !is_intent;
+            inputs[input_count++]=(gc_input){argv[++i],kind};
+            supplied[kind]=1;
             continue;
         }
         if(same(argv[i],"--capture")) slot=&options.capture;
@@ -858,8 +927,9 @@ int tgfs_gc_plan_main(int argc,char **argv)
     report=cJSON_CreateObject();
     cJSON *groups=report?cJSON_AddArrayToObject(report,"groups"):NULL;
     if(!groups || !cJSON_AddStringToObject(report,"schema","TGFS_DUPLICATE_REPORT_V1") ||
-        !cJSON_AddStringToObject(report,"scope",has_intents?"provided_captures_and_intents_only":
-            has_captures?"provided_captures_only":"provided_capture_only") ||
+        !cJSON_AddStringToObject(report,"scope",supplied[GC_OPEN_FILES]?"provided_captures_and_local_state_only":
+            supplied[GC_INTENT]?"provided_captures_and_intents_only":
+            supplied[GC_CAPTURE]?"provided_captures_only":"provided_capture_only") ||
         !cJSON_AddStringToObject(report,"storage_chat_id",json_string(journal,"storage_chat_id")) ||
         !cJSON_AddStringToObject(report,"root_object_id",json_string(superblock,"root_object_id")) ||
         !cJSON_AddStringToObject(report,"boundary_id",json_string(journal,"boundary_id")) ||
@@ -869,13 +939,28 @@ int tgfs_gc_plan_main(int argc,char **argv)
     cJSON *chunk_refs=cJSON_AddArrayToObject(report,"chunk_references");
     if(!chunk_refs) {fail(&e,"out of memory");goto done;}
     if(tgfs_duplicate_groups(session->fs,groups,chunk_refs,&e)) goto done;
-    cJSON *captures=has_captures?cJSON_AddArrayToObject(report,"retained_captures"):NULL;
-    cJSON *intents=has_intents?cJSON_AddArrayToObject(report,"retained_intents"):NULL;
-    if((has_captures && !captures) || (has_intents && !intents)) {fail(&e,"out of memory");goto done;}
+    cJSON *retained[GC_INPUT_COUNT]={0};
+    const char *keys[]={"retained_captures","retained_intents","retained_open_files"};
+    for(size_t i=0;i<GC_INPUT_COUNT;i++) {
+        if(supplied[i] && !(retained[i]=cJSON_AddArrayToObject(report,keys[i]))) {
+            fail(&e,"out of memory");goto done;
+        }
+    }
     for(size_t i=0;i<input_count;i++) {
-        int failed=inputs[i].is_intent?report_retained_intent(journal,inputs[i].path,intents,&e):
-            report_retained_capture(session,inputs[i].path,chunk_refs,captures,&e);
-        if(failed) goto done;
+        const char *path=inputs[i].path;
+        switch(inputs[i].kind) {
+        case GC_CAPTURE:
+            if(report_retained_capture(session,path,chunk_refs,retained[GC_CAPTURE],&e)) goto done;
+            break;
+        case GC_INTENT:
+            if(report_retained_intent(journal,path,retained[GC_INTENT],&e)) goto done;
+            break;
+        case GC_OPEN_FILES:
+            if(report_open_files(journal,path,retained[GC_OPEN_FILES],&e)) goto done;
+            break;
+        case GC_INPUT_COUNT:
+            fail(&e,"unsupported gc-plan input");goto done;
+        }
     }
     json=cJSON_PrintUnformatted(report);
     if(!json) {fail(&e,"out of memory");goto done;}

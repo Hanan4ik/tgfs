@@ -1,4 +1,5 @@
 """Exercise the actual FUSE callback table without a kernel mount, plus mount when available."""
+from contextlib import contextmanager
 import copy
 import errno
 import hashlib
@@ -6,6 +7,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import subprocess
@@ -14,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 
 DRIVER=str(Path(sys.argv.pop(1)).resolve())
 BINARY=str(Path(sys.argv.pop(1)).resolve())
@@ -114,7 +117,8 @@ class Fuse(unittest.TestCase):
     def test_empty_file_and_immutable_loaded_view(self):
         r=self.driver('empty');self.assertEqual(r['open'],0);self.assertEqual(r['read'],0);self.assertEqual(r['loads'],[])
         r=self.driver('immutable');self.assertEqual(bytes.fromhex(r['hex']),b'hello\n')
-    def test_remote_session_lifetime_and_offline_parts(self):
+    @contextmanager
+    def remote_session(self):
         capture=self.root/'capture';capture.mkdir();records=[];payloads={}
         for m in sorted(self.doc['messages'],key=lambda r:int(r['message_id'])):
             fid='file_'+m['message_id'];data=(self.snapshot/m['document']).read_bytes();payloads[fid]=data
@@ -128,13 +132,74 @@ class Fuse(unittest.TestCase):
         try:
             env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{server.server_port}',TGFS_DRIVER_CAPTURE=str(capture),
                 TGFS_DRIVER_TOKEN=str(token),TGFS_DRIVER_CACHE=str(self.root/'cache'))
+            yield capture,token,server,env
+        finally:
+            server.shutdown();server.server_close();t.join()
+
+    def test_remote_session_lifetime_and_offline_parts(self):
+        with self.remote_session() as (_,_,server,env):
             r=self.driver('range',0,1,env=env);self.assertEqual(r['read'],1)
             self.assertIn('file_101',server.calls);self.assertNotIn('file_102',server.calls)
             server.calls.clear();env['TGFS_DRIVER_OFFLINE']='1'
             r=self.driver('range',0,1,env=env);self.assertEqual(r['read'],1);self.assertEqual(server.calls,[])
             r=self.driver('range',3,1,env=env);self.assertEqual(r['read'],-errno.EIO);self.assertEqual(server.calls,[])
-        finally:
-            server.shutdown();server.server_close();t.join()
+
+    def test_gc_plan_tracks_old_open_file(self):
+        with self.remote_session() as (capture,token,server,env):
+            registry=self.root/'open-files'
+            env['TGFS_DRIVER_OPEN_FILES']=str(registry)
+            newer=self.root/'newer';newer.mkdir()
+            updated=json.loads((capture/'journal.json').read_text())
+            updated['boundary_id']='205'
+            empty=copy.deepcopy(next(r for r in updated['records'] if r['message_id']=='110'))
+            empty['message_id']='201'
+            empty['record'].update(operation_id=str(uuid.uuid4()),version_id=str(uuid.uuid4()),part_count=0,
+                                   file_sha256=hashlib.sha256(b'').hexdigest(),file_size='0')
+            server.payloads['file_201']=b'{"parts":[]}'
+            empty['document'].update(file_id='file_201',file_size=len(server.payloads['file_201']))
+            updated['records'].append(empty)
+            (newer/'journal.json').write_text(json.dumps(updated))
+            proc=subprocess.Popen([DRIVER,str(self.snapshot),'retain-open'],env=env,
+                                  stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            try:
+                self.assertTrue(select.select([proc.stdout],[],[],10)[0])
+                self.assertEqual(proc.stdout.readline(),'ready\n')
+                report_file=registry/'open-files.json'
+                saved=json.loads(report_file.read_text())
+                self.assertEqual(registry.stat().st_mode&0o777,0o700)
+                self.assertEqual(report_file.stat().st_mode&0o777,0o600)
+                self.assertEqual(saved['files'],[dict(commit_id='110',chunk_ids=['101','102'])])
+                args=['--capture',str(newer),'--token-file',str(token)]
+                current=subprocess.run([BINARY,'read','--no-cache',*args,'cat','/documents/hello.txt'],
+                                       env=env,capture_output=True,timeout=10)
+                self.assertEqual(current.returncode,0,current.stderr)
+                self.assertEqual(current.stdout,b'')
+                plan=[BINARY,'gc-plan',*args,'--retain-open-files',str(registry)]
+                result=subprocess.run(plan,env=env,capture_output=True,timeout=10)
+                self.assertEqual(result.returncode,0,result.stderr)
+                mounts=json.loads(result.stdout)['retained_open_files']
+                self.assertEqual(mounts,[dict(state_dir=str(registry),boundary_id='200',files=saved['files'])])
+                self.assertEqual(json.loads(result.stdout)['groups'],[])
+                for key,value in (('root_object_id',str(uuid.uuid4())),('boundary_id','206'),
+                                  ('files',[dict(commit_id='110',chunk_ids=['110'])])):
+                    with self.subTest(key=key):
+                        report_file.write_text(json.dumps(dict(saved,**{key:value})))
+                        rejected=subprocess.run(plan,env=env,capture_output=True,timeout=10)
+                        self.assertEqual(rejected.returncode,1,rejected.stderr)
+                        self.assertEqual(rejected.stdout,b'')
+                report_file.write_text(json.dumps(saved))
+                stdout,stderr=proc.communicate('r',timeout=10)
+                self.assertEqual(proc.returncode,0,stderr)
+                self.assertNotIn('AddressSanitizer',stderr);self.assertNotIn('runtime error:',stderr)
+                reply=json.loads(stdout)
+                self.assertEqual(reply['open'],0);self.assertEqual(reply['second_open'],0)
+                self.assertEqual(reply['first_release'],0);self.assertEqual(reply['release'],0)
+                self.assertEqual(bytes.fromhex(reply['hex']),b'hello\n')
+                self.assertEqual(json.loads(report_file.read_text())['files'],[])
+            finally:
+                if proc.poll() is None:
+                    proc.kill();proc.communicate(timeout=5)
+
     def test_mount_arguments_and_directory_validation(self):
         p=subprocess.run([BINARY,'mount','--help'],capture_output=True)
         self.assertEqual(p.returncode,0);self.assertIn(b'--offline',p.stdout)
