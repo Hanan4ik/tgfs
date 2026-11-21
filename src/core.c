@@ -957,3 +957,108 @@ done:
     free(commits);free(refs);free(ids);
     return rc;
 }
+
+enum {
+    GC_MANIFEST=1u<<0, GC_CATALOG=1u<<1, GC_RETAINED_CAPTURE=1u<<2,
+    GC_UPLOAD_INTENT=1u<<3, GC_OPEN_HANDLE=1u<<4
+};
+
+typedef struct {
+    uint64_t id;
+    unsigned reasons;
+    cJSON *entry;
+} gc_chunk;
+
+static int gc_chunk_order(const void *left,const void *right)
+{
+    uint64_t a=((const gc_chunk *)left)->id,b=((const gc_chunk *)right)->id;
+    return (a>b)-(a<b);
+}
+
+static void mark_gc_chunk(gc_chunk *chunks,size_t count,const char *id,unsigned reason)
+{
+    gc_chunk key={0};
+    if(decimal(id,&key.id)) return;
+    gc_chunk *chunk=bsearch(&key,chunks,count,sizeof(*chunks),gc_chunk_order);
+    if(chunk) chunk->reasons|=reason;
+}
+
+static void mark_gc_chunks(gc_chunk *chunks,size_t count,const cJSON *ids,unsigned reason)
+{
+    const cJSON *id;
+    cJSON_ArrayForEach(id,ids) mark_gc_chunk(chunks,count,id->valuestring,reason);
+}
+
+static void mark_intent_commit(tgfs *fs,gc_chunk *chunks,size_t count,const char *id)
+{
+    uint64_t mid;
+    if(decimal(id,&mid)) return;
+    const message *commit=message_find(fs,mid);
+    if(!commit || !same(commit->type,"FILE_COMMIT")) return;
+    const cJSON *part;
+    cJSON_ArrayForEach(part,cJSON_GetObjectItemCaseSensitive(commit->body,"parts"))
+        mark_gc_chunk(chunks,count,json_string(part,"message_id"),GC_UPLOAD_INTENT);
+}
+
+int tgfs_gc_retention_reasons(tgfs *fs,cJSON *report,tgfs_error *e)
+{
+    cJSON *refs=cJSON_GetObjectItemCaseSensitive(report,"chunk_references");
+    size_t count=(size_t)cJSON_GetArraySize(refs);
+    if(!count) return 0;
+    gc_chunk *chunks=calloc(count,sizeof(*chunks));
+    if(!chunks) return fail(e,"out of memory");
+    int rc=-1;
+    size_t i=0;
+    cJSON *entry;
+    cJSON_ArrayForEach(entry,refs) {
+        if(json_decimal(entry,"chunk_id",&chunks[i].id)) {fail(e,"invalid reported CHUNK ID");goto done;}
+        chunks[i].entry=entry;
+        if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(entry,"commit_ids"))) chunks[i].reasons=GC_MANIFEST;
+        i++;
+    }
+    qsort(chunks,count,sizeof(*chunks),gc_chunk_order);
+    const cJSON *source,*record,*id;
+    cJSON_ArrayForEach(source,cJSON_GetObjectItemCaseSensitive(report,"groups")) {
+        cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(source,"verified_commits")) {
+            if(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(record,"catalog_entries")))
+                mark_gc_chunks(chunks,count,cJSON_GetObjectItemCaseSensitive(record,"chunk_ids"),GC_CATALOG);
+        }
+    }
+    cJSON_ArrayForEach(source,cJSON_GetObjectItemCaseSensitive(report,"retained_captures")) {
+        cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(source,"commit_references"))
+            mark_gc_chunks(chunks,count,cJSON_GetObjectItemCaseSensitive(record,"chunk_ids"),GC_RETAINED_CAPTURE);
+    }
+    cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(report,"retained_intents")) {
+        const char *fields[]={"saved_chunk_ids","manifest_chunk_ids","observed_chunk_ids"};
+        for(size_t j=0;j<sizeof(fields)/sizeof(*fields);j++)
+            mark_gc_chunks(chunks,count,cJSON_GetObjectItemCaseSensitive(record,fields[j]),GC_UPLOAD_INTENT);
+        mark_intent_commit(fs,chunks,count,json_string(record,"file_commit_id"));
+        mark_intent_commit(fs,chunks,count,json_string(record,"base_commit_id"));
+        cJSON_ArrayForEach(id,cJSON_GetObjectItemCaseSensitive(record,"observed_commit_ids"))
+            mark_intent_commit(fs,chunks,count,id->valuestring);
+    }
+    cJSON_ArrayForEach(source,cJSON_GetObjectItemCaseSensitive(report,"retained_open_files")) {
+        cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(source,"files"))
+            mark_gc_chunks(chunks,count,cJSON_GetObjectItemCaseSensitive(record,"chunk_ids"),GC_OPEN_HANDLE);
+    }
+    static const struct {unsigned bit;const char *label;} labels[]={
+        {GC_MANIFEST,"manifest_in_capture"},{GC_CATALOG,"visible_in_current_capture"},
+        {GC_RETAINED_CAPTURE,"retained_capture"},{GC_UPLOAD_INTENT,"unfinished_put"},
+        {GC_OPEN_HANDLE,"open_file"}
+    };
+    for(i=0;i<count;i++) {
+        cJSON *reasons=cJSON_AddArrayToObject(chunks[i].entry,"retention_reasons");
+        if(!reasons) {fail(e,"out of memory");goto done;}
+        for(size_t j=0;j<sizeof(labels)/sizeof(*labels);j++) {
+            if(!(chunks[i].reasons&labels[j].bit)) continue;
+            cJSON *label=cJSON_CreateString(labels[j].label);
+            if(!label || !cJSON_AddItemToArray(reasons,label)) {
+                cJSON_Delete(label);fail(e,"out of memory");goto done;
+            }
+        }
+    }
+    rc=0;
+done:
+    free(chunks);
+    return rc;
+}
