@@ -140,6 +140,12 @@ class Remote(unittest.TestCase):
                     records.append(replacement)
                     retry['message_id']='160'  # A late replay cannot select the old version.
             records.sort(key=lambda r:int(r['message_id']))
+        if mode=='gc-navigation':
+            journal['superblock']['next_message']='101'
+            links={'101':'999','112':'113','113':'112'}
+            for record in records:
+                if record['message_id'] in links:
+                    record['record']['next_message']=links[record['message_id']]
         if mode=='badjson': payloads['file_10']=b'NOT JSON';records[0]['document']['file_size']=8
         if mode=='duplicate': records.append(copy.deepcopy(records[-1]))
         if mode=='incomplete': journal['scan_completed']=False
@@ -161,6 +167,11 @@ class Remote(unittest.TestCase):
                     saved['boundary_id']=boundary
                     saved['records']=[r for r in saved['records'] if int(r['message_id'])<int(boundary)
                                       and not (case=='missing-chunk' and r['message_id']=='101')]
+                    if case=='navigation':
+                        saved['superblock']['next_message']='113'
+                        saved['records']=[r for r in saved['records'] if r['message_id']!='101']
+                        for record in saved['records']:
+                            record['record']['next_message']='101' if record['message_id']=='10' else None
                     if case=='foreign-root': saved['superblock']['root_object_id']=str(uuid.uuid4())
                     if case=='foreign-channel': saved['storage_chat_id']=str(STORAGE+1)
                     if case=='foreign-start': saved['superblock']['start_id']='2'
@@ -297,6 +308,27 @@ class Remote(unittest.TestCase):
         self.assertEqual(rc,0,err)
         reasons={c['chunk_id']:c['retention_reasons'] for c in json.loads(out)['chunk_references']}
         self.assertEqual(reasons['101'],['manifest_in_capture'])
+
+    def test_gc_plan_retains_navigation_edges(self):
+        rc,out,err,files=self.run_read('gc-plan',mode='gc-navigation',retained=('navigation',))
+        self.assertEqual(rc,0,err)
+        report=json.loads(out)
+        self.assertEqual(report['navigation_references'],[
+            dict(source_message_id='1',source_type='SUPERBLOCK',chunk_id='101'),
+            dict(source_message_id='112',source_type='CHUNK',chunk_id='113'),
+            dict(source_message_id='113',source_type='CHUNK',chunk_id='112'),
+        ])
+        older,=report['retained_captures']
+        self.assertEqual(older['navigation_references'],[
+            dict(source_message_id='1',source_type='SUPERBLOCK',chunk_id='113'),
+            dict(source_message_id='10',source_type='DIRECTORY',chunk_id='101'),
+        ])
+        reasons={c['chunk_id']:c['retention_reasons'] for c in report['chunk_references']}
+        self.assertIn('navigation_in_capture',reasons['112'])
+        self.assertNotIn('navigation_in_retained_capture',reasons['112'])
+        self.assertIn('navigation_in_retained_capture',reasons['113'])
+        self.assertNotIn('retained_capture',reasons['113'])
+        for fid in ('file_101','file_112','file_113'): self.assertEqual(files.count(fid),1)
 
     def test_gc_plan_retained_captures(self):
         rc,out,err,files=self.run_read('gc-plan',mode='gc-detached',
