@@ -962,6 +962,7 @@ int tgfs_gc_plan_main(int argc,char **argv)
             fail(&e,"unsupported gc-plan input");goto done;
         }
     }
+    if(tgfs_gc_retention_reasons(session->fs,report,&e)) goto done;
     json=cJSON_PrintUnformatted(report);
     if(!json) {fail(&e,"out of memory");goto done;}
     if(puts(json)<0 || fflush(stdout)) {fail(&e,"cannot write duplicate report");goto done;}

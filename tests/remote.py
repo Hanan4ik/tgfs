@@ -44,7 +44,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data=b'X'+data[1:]
         self.reply(data)
 class Remote(unittest.TestCase):
-    def run_read(self,command='ls',path='/documents',mode='ok',retained=(),intents=()):
+    def run_read(self,command='ls',path='/documents',mode='ok',retained=(),intents=(),open_files=()):
         snap=json.loads((EXAMPLE/'snapshot.json').read_text())
         records=[];payloads={}
         for m in sorted(snap['messages'],key=lambda r:int(r['message_id'])):
@@ -167,6 +167,14 @@ class Remote(unittest.TestCase):
                     if case=='incomplete': saved['scan_completed']=False
                     (old/'journal.json').write_text(json.dumps(saved))
                     args.extend(['--retain-capture',str(old)])
+                if open_files:
+                    mounted=root/'mounted';mounted.mkdir(mode=0o700)
+                    report=mounted/'open-files.json'
+                    report.write_text(json.dumps(dict(schema='TGFS_OPEN_FILES_V1',storage_chat_id=str(STORAGE),
+                        root_object_id=journal['superblock']['root_object_id'],start_id=journal['superblock']['start_id'],
+                        boundary_id=journal['boundary_id'],files=open_files)))
+                    report.chmod(0o600)
+                    args.extend(['--retain-open-files',str(mounted)])
                 locks=[]
                 try:
                     for index,case in enumerate(intents):
@@ -181,6 +189,10 @@ class Remote(unittest.TestCase):
                             upload.pop('commit_document')
                         if case=='manifest-only':
                             upload.update(parts=[],file_commit_id='110',base_commit_id='90')
+                        if case=='base-only':
+                            upload.update(phase='prepared',parts=[],base_commit_id='110',
+                                          operation_id=str(uuid.uuid4()),version_id=str(uuid.uuid4()))
+                            upload.pop('commit_document')
                         if case=='complete': upload['phase']='complete'
                         if case=='foreign': upload['storage_chat_id']=str(STORAGE+1)
                         if case=='bad-parts': upload['parts']={}
@@ -263,6 +275,28 @@ class Remote(unittest.TestCase):
                     if name['name']=='alias.txt':
                         self.assertEqual(name['parent_object_id'],report['root_object_id'])
                 self.assertEqual(files.count('file_101'),1)
+
+    def test_gc_plan_combines_retention_reasons(self):
+        rc,out,err,_=self.run_read('gc-plan',mode='gc-history',retained=('older','older'),
+                                    intents=('base-only','complete'),
+                                    open_files=[dict(commit_id='110',chunk_ids=['101'])]*2)
+        self.assertEqual(rc,0,err)
+        report=json.loads(out)
+        reasons={c['chunk_id']:c['retention_reasons'] for c in report['chunk_references']}
+        self.assertEqual(reasons,{
+            '101':['manifest_in_capture','retained_capture','unfinished_put','open_file'],
+            '112':['manifest_in_capture','visible_in_current_capture'],
+            '113':['manifest_in_capture','visible_in_current_capture'],
+        })
+        intent,=report['retained_intents']
+        self.assertEqual(intent['base_commit_id'],'110')
+        for field in ('saved_chunk_ids','observed_chunk_ids','observed_commit_ids'):
+            self.assertEqual(intent[field],[])
+
+        rc,out,err,_=self.run_read('gc-plan',mode='gc-history')
+        self.assertEqual(rc,0,err)
+        reasons={c['chunk_id']:c['retention_reasons'] for c in json.loads(out)['chunk_references']}
+        self.assertEqual(reasons['101'],['manifest_in_capture'])
 
     def test_gc_plan_retained_captures(self):
         rc,out,err,files=self.run_read('gc-plan',mode='gc-detached',
