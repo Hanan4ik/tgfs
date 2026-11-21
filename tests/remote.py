@@ -1,5 +1,6 @@
 """Captured journal -> real curl -> metadata merge -> lazy verified cat."""
 import copy
+import fcntl
 import hashlib
 import http.server
 import json
@@ -43,7 +44,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data=b'X'+data[1:]
         self.reply(data)
 class Remote(unittest.TestCase):
-    def run_read(self,command='ls',path='/documents',mode='ok',retained=()):
+    def run_read(self,command='ls',path='/documents',mode='ok',retained=(),intents=()):
         snap=json.loads((EXAMPLE/'snapshot.json').read_text())
         records=[];payloads={}
         for m in sorted(snap['messages'],key=lambda r:int(r['message_id'])):
@@ -166,9 +167,41 @@ class Remote(unittest.TestCase):
                     if case=='incomplete': saved['scan_completed']=False
                     (old/'journal.json').write_text(json.dumps(saved))
                     args.extend(['--retain-capture',str(old)])
-                p=subprocess.run([BINARY,*args],
-                    env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{server.server_port}'),
-                    capture_output=True,timeout=10)
+                locks=[]
+                try:
+                    for index,case in enumerate(intents):
+                        state=root/f'intent-{index}';state.mkdir(mode=0o700)
+                        caption=next(r['record'] for r in records if r['message_id']=='110')
+                        upload=dict(kind='put',phase='commit_send_pending',storage_chat_id=str(STORAGE),
+                                    source_boundary_id='80',object_id=caption['object_id'],
+                                    version_id=caption['version_id'],operation_id=caption['operation_id'],
+                                    parts=[dict(message_id='101')],commit_document=dict(parts=[dict(message_id='101')]))
+                        if case=='unknown':
+                            upload.update(phase='chunk_response_uncertain',parts=[])
+                            upload.pop('commit_document')
+                        if case=='manifest-only':
+                            upload.update(parts=[],file_commit_id='110',base_commit_id='90')
+                        if case=='complete': upload['phase']='complete'
+                        if case=='foreign': upload['storage_chat_id']=str(STORAGE+1)
+                        if case=='bad-parts': upload['parts']={}
+                        if case=='bad-id': upload['parts']=[dict(message_id='0')]
+                        if case=='bad-manifest': upload['commit_document']={}
+                        if case=='public': state.chmod(0o755)
+                        local=state/'intent.json';local.write_text(json.dumps(upload));local.chmod(0o600)
+                        log=state/'backlink-repair.log'
+                        if case!='unknown':
+                            log.touch(mode=0o600)
+                        if case=='busy':
+                            handle=log.open()
+                            locks.append(handle)
+                            fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                        if case=='pending-local': (state/'intent.tmp').write_text('pending')
+                        args.extend(['--retain-intent',str(state)])
+                    p=subprocess.run([BINARY,*args],
+                        env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{server.server_port}'),
+                        capture_output=True,timeout=10)
+                finally:
+                    for handle in locks: handle.close()
                 err=p.stderr.decode()
                 self.assertNotIn(TOKEN,err);self.assertNotIn('AddressSanitizer',err);self.assertNotIn('runtime error:',err)
                 self.assertTrue(all(m in ('getChat','getFile') for m,_ in server.calls))
@@ -258,6 +291,37 @@ class Remote(unittest.TestCase):
                            ('incomplete','incomplete journal')):
             with self.subTest(case=case):
                 rc,out,err,_=self.run_read('gc-plan',mode='gc-detached',retained=(case,))
+                self.assertEqual(rc,1,err);self.assertEqual(out,b'');self.assertIn(error,err)
+
+    def test_gc_plan_retained_intents(self):
+        rc,out,err,files=self.run_read('gc-plan',mode='gc-detached',retained=('older',),
+                                       intents=('unknown','complete','manifest-only'))
+        self.assertEqual(rc,0,err)
+        report=json.loads(out)
+        self.assertEqual(report['scope'],'provided_captures_and_intents_only')
+        self.assertEqual(len(report['retained_captures']),1)
+        unknown,manifest=report['retained_intents']
+        self.assertEqual(unknown['saved_chunk_ids'],[])
+        self.assertEqual(unknown['observed_chunk_ids'],['101'])
+        self.assertEqual(unknown['observed_commit_ids'],['110','111'])
+        self.assertFalse(unknown['journal_locked'])
+        self.assertEqual(manifest['manifest_chunk_ids'],['101'])
+        self.assertEqual(manifest['file_commit_id'],'110')
+        self.assertEqual(manifest['base_commit_id'],'90')
+        self.assertTrue(manifest['journal_locked'])
+        self.assertEqual(files.count('file_101'),1)
+        rc,out,err,files=self.run_read('gc-plan',mode='ok',intents=('saved',))
+        self.assertEqual(rc,0,err)
+        self.assertEqual(json.loads(out)['retained_intents'][0]['saved_chunk_ids'],['101'])
+        self.assertNotIn('file_101',files)
+
+    def test_gc_plan_rejects_invalid_retained_intent(self):
+        for case,error in (('public','private state directory'),('busy','lock retained intent journal'),
+                           ('pending-local','pending local state file'),('foreign','different storage channel'),
+                           ('bad-parts','invalid saved upload parts'),('bad-manifest','invalid saved upload parts'),
+                           ('bad-id','invalid saved upload part ID')):
+            with self.subTest(case=case):
+                rc,out,err,_=self.run_read('gc-plan',intents=(case,))
                 self.assertEqual(rc,1,err);self.assertEqual(out,b'');self.assertIn(error,err)
 
     def test_gc_plan_retries_and_incomplete_copies(self):

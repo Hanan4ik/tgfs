@@ -694,31 +694,146 @@ done:
     return rc;
 }
 
+static int report_saved_parts(const cJSON *parts,cJSON *entry,const char *key,tgfs_error *e)
+{
+    if(!cJSON_IsArray(parts)) return fail(e,"invalid saved upload parts");
+    cJSON *ids=cJSON_AddArrayToObject(entry,key);
+    if(!ids) return fail(e,"out of memory");
+    const cJSON *part;
+    cJSON_ArrayForEach(part,parts) {
+        uint64_t id;
+        if(json_decimal(part,"message_id",&id) || !id || id>TGFS_BOT_MAX_EXACT_ID)
+            return fail(e,"invalid saved upload part ID");
+        if(report_id(ids,json_string(part,"message_id"),e)) return -1;
+    }
+    return 0;
+}
+
+static int report_intent_messages(const cJSON *journal,const cJSON *intent,cJSON *entry,tgfs_error *e)
+{
+    const char *object=json_string(intent,"object_id"),*version=json_string(intent,"version_id");
+    const char *operation=json_string(intent,"operation_id");
+    cJSON *chunks=cJSON_AddArrayToObject(entry,"observed_chunk_ids");
+    cJSON *commits=cJSON_AddArrayToObject(entry,"observed_commit_ids");
+    if(!chunks || !commits) return fail(e,"out of memory");
+    const cJSON *record;
+    cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(journal,"records")) {
+        const cJSON *caption=cJSON_GetObjectItemCaseSensitive(record,"record");
+        const char *type=json_string(caption,"type");
+        int same_version=same(json_string(caption,"object_id"),object) &&
+            same(json_string(caption,"version_id"),version);
+        if(same(type,"CHUNK") && same_version) {
+            if(report_id(chunks,json_string(record,"message_id"),e)) return -1;
+        } else if(same(type,"FILE_COMMIT") && (same_version || same(json_string(caption,"operation_id"),operation))) {
+            if(report_id(commits,json_string(record,"message_id"),e)) return -1;
+        }
+    }
+    return 0;
+}
+
+static int report_retained_intent(const cJSON *journal,const char *path,cJSON *intents,tgfs_error *e)
+{
+    int dir=open(path,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC),log=-1,rc=-1;
+    cJSON *intent=NULL;
+    struct stat st;
+    if(dir<0 || fstat(dir,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {
+        fail(e,"retain-intent requires a private state directory: %s",path);goto done;
+    }
+    log=openat(dir,"backlink-repair.log",O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK);
+    if(log<0 ? errno!=ENOENT : (fstat(log,&st) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() ||
+        (st.st_mode&0077) || st.st_nlink!=1 || flock(log,LOCK_SH|LOCK_NB))) {
+        fail(e,"cannot read or lock retained intent journal: %s",path);goto done;
+    }
+    if(!fstatat(dir,"intent.tmp",&st,AT_SYMLINK_NOFOLLOW) || errno!=ENOENT ||
+        !fstatat(dir,"intent.finalize.tmp",&st,AT_SYMLINK_NOFOLLOW) || errno!=ENOENT) {
+        fail(e,"retained intent has a pending local state file: %s",path);goto done;
+    }
+    if(fstatat(dir,"intent.json",&st,AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) || st.st_uid!=geteuid() ||
+        (st.st_mode&0077) || st.st_nlink!=1) {
+        fail(e,"retained intent must be an owner-only regular file: %s",path);goto done;
+    }
+    intent=json_load_at(dir,"intent.json",e);
+    if(!intent) goto done;
+    const char *phase=json_string(intent,"phase"),*object=json_string(intent,"object_id");
+    const char *version=json_string(intent,"version_id"),*operation=json_string(intent,"operation_id");
+    uint64_t boundary;
+    if(!same(json_string(intent,"kind"),"put") || !phase || !*phase || !uuid_valid(object) ||
+        !uuid_valid(version) || !uuid_valid(operation) ||
+        json_decimal(intent,"source_boundary_id",&boundary) || !boundary || boundary>TGFS_BOT_MAX_EXACT_ID) {
+        fail(e,"invalid retained put intent: %s",path);goto done;
+    }
+    if(!same(json_string(intent,"storage_chat_id"),json_string(journal,"storage_chat_id"))) {
+        fail(e,"retained intent belongs to a different storage channel: %s",path);goto done;
+    }
+    if(same(phase,"complete")) {rc=0;goto done;}
+    cJSON *entry=cJSON_CreateObject();
+    if(!entry || !cJSON_AddItemToArray(intents,entry)) {
+        cJSON_Delete(entry);fail(e,"out of memory");goto done;
+    }
+    if(!cJSON_AddStringToObject(entry,"state_dir",path) || !cJSON_AddStringToObject(entry,"local_phase",phase) ||
+        !cJSON_AddStringToObject(entry,"object_id",object) || !cJSON_AddStringToObject(entry,"version_id",version) ||
+        !cJSON_AddStringToObject(entry,"operation_id",operation) || !cJSON_AddBoolToObject(entry,"journal_locked",log>=0) ||
+        !cJSON_AddStringToObject(entry,"source_boundary_id",json_string(intent,"source_boundary_id"))) {
+        fail(e,"out of memory");goto done;
+    }
+    const char *keys[]={"file_commit_id","base_commit_id"};
+    for(size_t i=0;i<sizeof(keys)/sizeof(*keys);i++) {
+        if(!cJSON_HasObjectItem(intent,keys[i])) continue;
+        uint64_t id;
+        if(json_decimal(intent,keys[i],&id) || !id || id>TGFS_BOT_MAX_EXACT_ID) {
+            fail(e,"invalid retained intent commit ID");goto done;
+        }
+        if(!cJSON_AddStringToObject(entry,keys[i],json_string(intent,keys[i]))) {
+            fail(e,"out of memory");goto done;
+        }
+    }
+    const cJSON *manifest=cJSON_GetObjectItemCaseSensitive(intent,"commit_document");
+    if(report_saved_parts(cJSON_GetObjectItemCaseSensitive(intent,"parts"),entry,"saved_chunk_ids",e) ||
+        (manifest && report_saved_parts(cJSON_GetObjectItemCaseSensitive(manifest,"parts"),entry,"manifest_chunk_ids",e)))
+        goto done;
+    rc=report_intent_messages(journal,intent,entry,e);
+done:
+    cJSON_Delete(intent);
+    if(log>=0) close(log);
+    if(dir>=0) close(dir);
+    return rc;
+}
+
+typedef struct {
+    const char *path;
+    int is_intent;
+} gc_input;
+
 void tgfs_gc_plan_help(FILE *stream)
 {
     fputs("usage: tgfs gc-plan --capture DIRECTORY --token-file PATH [options]\n"
           "List content duplicates verified from a completed capture. Reads metadata and CHUNK bytes.\n"
           "  --retain-capture DIRECTORY  Include references from an older capture of this volume; repeatable.\n"
+          "  --retain-intent DIRECTORY   Include an unfinished put state directory; repeatable.\n"
           "  --proxy URL | --direct      Transport routing.\n"
           "  --timeout-seconds N         1..300, default 60.\n"
-          "Result is advisory and scoped to the supplied captures.\n",stream);
+          "Result is advisory and scoped to the supplied captures and intents.\n",stream);
 }
 
 int tgfs_gc_plan_main(int argc,char **argv)
 {
     tgfs_remote_options options={.no_cache=1,.timeout=60};
     const char *timeout_text=NULL;
-    const char **retained=NULL;
-    size_t retained_count=0;
+    gc_input *inputs=NULL;
+    size_t input_count=0;
+    int has_captures=0,has_intents=0;
     if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_gc_plan_help(stdout);return 0;}
-    retained=calloc((size_t)argc,sizeof(*retained));
-    if(!retained) {fputs("FAIL gc-plan: out of memory\n",stderr);return 1;}
+    inputs=calloc((size_t)argc,sizeof(*inputs));
+    if(!inputs) {fputs("FAIL gc-plan: out of memory\n",stderr);return 1;}
     for(int i=2;i<argc;i++) {
         const char **slot=NULL;
         if(same(argv[i],"--direct")) {if(options.proxy) goto usage;options.proxy="";continue;}
-        if(same(argv[i],"--retain-capture")) {
+        int is_intent=same(argv[i],"--retain-intent");
+        if(is_intent || same(argv[i],"--retain-capture")) {
             if(i+1>=argc || !*argv[i+1]) goto usage;
-            retained[retained_count++]=argv[++i];
+            inputs[input_count++]=(gc_input){argv[++i],is_intent};
+            has_intents |= is_intent;
+            has_captures |= !is_intent;
             continue;
         }
         if(same(argv[i],"--capture")) slot=&options.capture;
@@ -743,7 +858,8 @@ int tgfs_gc_plan_main(int argc,char **argv)
     report=cJSON_CreateObject();
     cJSON *groups=report?cJSON_AddArrayToObject(report,"groups"):NULL;
     if(!groups || !cJSON_AddStringToObject(report,"schema","TGFS_DUPLICATE_REPORT_V1") ||
-        !cJSON_AddStringToObject(report,"scope",retained_count?"provided_captures_only":"provided_capture_only") ||
+        !cJSON_AddStringToObject(report,"scope",has_intents?"provided_captures_and_intents_only":
+            has_captures?"provided_captures_only":"provided_capture_only") ||
         !cJSON_AddStringToObject(report,"storage_chat_id",json_string(journal,"storage_chat_id")) ||
         !cJSON_AddStringToObject(report,"root_object_id",json_string(superblock,"root_object_id")) ||
         !cJSON_AddStringToObject(report,"boundary_id",json_string(journal,"boundary_id")) ||
@@ -753,11 +869,13 @@ int tgfs_gc_plan_main(int argc,char **argv)
     cJSON *chunk_refs=cJSON_AddArrayToObject(report,"chunk_references");
     if(!chunk_refs) {fail(&e,"out of memory");goto done;}
     if(tgfs_duplicate_groups(session->fs,groups,chunk_refs,&e)) goto done;
-    if(retained_count) {
-        cJSON *captures=cJSON_AddArrayToObject(report,"retained_captures");
-        if(!captures) {fail(&e,"out of memory");goto done;}
-        for(size_t i=0;i<retained_count;i++)
-            if(report_retained_capture(session,retained[i],chunk_refs,captures,&e)) goto done;
+    cJSON *captures=has_captures?cJSON_AddArrayToObject(report,"retained_captures"):NULL;
+    cJSON *intents=has_intents?cJSON_AddArrayToObject(report,"retained_intents"):NULL;
+    if((has_captures && !captures) || (has_intents && !intents)) {fail(&e,"out of memory");goto done;}
+    for(size_t i=0;i<input_count;i++) {
+        int failed=inputs[i].is_intent?report_retained_intent(journal,inputs[i].path,intents,&e):
+            report_retained_capture(session,inputs[i].path,chunk_refs,captures,&e);
+        if(failed) goto done;
     }
     json=cJSON_PrintUnformatted(report);
     if(!json) {fail(&e,"out of memory");goto done;}
@@ -765,9 +883,9 @@ int tgfs_gc_plan_main(int argc,char **argv)
     result=0;
 done:
     if(result) fprintf(stderr,"FAIL gc-plan: %s\n",e.message);
-    free(retained);free(json);cJSON_Delete(report);tgfs_remote_close(session);
+    free(inputs);free(json);cJSON_Delete(report);tgfs_remote_close(session);
     return result;
 usage:
-    free(retained);
+    free(inputs);
     tgfs_gc_plan_help(stderr);return 2;
 }
