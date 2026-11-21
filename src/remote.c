@@ -654,21 +654,73 @@ usage:
     tgfs_intent_help(stderr);return 2;
 }
 
+static int report_retained_capture(tgfs_remote_session *current,const char *path,
+                                   const cJSON *chunk_refs,cJSON *captures,tgfs_error *e)
+{
+    int dir=open(path,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(dir<0) return fail(e,"cannot open retained capture: %s",path);
+    cJSON *journal=json_load_at(dir,"journal.json",e);
+    close(dir);
+    if(!journal) return -1;
+    const cJSON *current_sb=cJSON_GetObjectItemCaseSensitive(current->journal,"superblock");
+    const cJSON *saved_sb=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
+    uint64_t current_boundary,boundary;
+    remote saved={.bot=current->r.bot};
+    tgfs *fs=NULL;
+    int rc=-1;
+    if(!same(json_string(journal,"storage_chat_id"),json_string(current->journal,"storage_chat_id")) ||
+        !same(json_string(saved_sb,"root_object_id"),json_string(current_sb,"root_object_id")) ||
+        !same(json_string(saved_sb,"start_id"),json_string(current_sb,"start_id"))) {
+        fail(e,"retained capture belongs to a different volume: %s",path);goto done;
+    }
+    if(json_decimal(journal,"boundary_id",&boundary) ||
+        json_decimal(current->journal,"boundary_id",&current_boundary) || boundary>=current_boundary) {
+        fail(e,"retained capture must have an earlier boundary: %s",path);goto done;
+    }
+    if(read_capture(&saved,journal,NULL,NULL,&fs,e)) goto done;
+    cJSON *capture=cJSON_CreateObject();
+    if(!capture || !cJSON_AddItemToArray(captures,capture)) {
+        cJSON_Delete(capture);fail(e,"out of memory");goto done;
+    }
+    cJSON *refs=cJSON_AddArrayToObject(capture,"commit_references");
+    if(!refs || !cJSON_AddStringToObject(capture,"capture",path) ||
+        !cJSON_AddStringToObject(capture,"boundary_id",json_string(journal,"boundary_id")) ||
+        !cJSON_AddBoolToObject(capture,"coverage_verified",cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(journal,"coverage_verified")))) {
+        fail(e,"out of memory");goto done;
+    }
+    rc=tgfs_retained_capture_refs(fs,chunk_refs,refs,e);
+done:
+    tgfs_close(fs);cJSON_Delete(journal);
+    return rc;
+}
+
 void tgfs_gc_plan_help(FILE *stream)
 {
-    fputs("usage: tgfs gc-plan --capture DIRECTORY --token-file PATH [--proxy URL | --direct] [--timeout-seconds N]\n"
+    fputs("usage: tgfs gc-plan --capture DIRECTORY --token-file PATH [options]\n"
           "List content duplicates verified from a completed capture. Reads metadata and CHUNK bytes.\n"
-          "Result is advisory and scoped to the capture. No messages are deleted.\n",stream);
+          "  --retain-capture DIRECTORY  Include references from an older capture of this volume; repeatable.\n"
+          "  --proxy URL | --direct      Transport routing.\n"
+          "  --timeout-seconds N         1..300, default 60.\n"
+          "Result is advisory and scoped to the supplied captures.\n",stream);
 }
 
 int tgfs_gc_plan_main(int argc,char **argv)
 {
     tgfs_remote_options options={.no_cache=1,.timeout=60};
     const char *timeout_text=NULL;
+    const char **retained=NULL;
+    size_t retained_count=0;
     if(argc==3 && (same(argv[2],"--help") || same(argv[2],"-h"))) {tgfs_gc_plan_help(stdout);return 0;}
+    retained=calloc((size_t)argc,sizeof(*retained));
+    if(!retained) {fputs("FAIL gc-plan: out of memory\n",stderr);return 1;}
     for(int i=2;i<argc;i++) {
         const char **slot=NULL;
         if(same(argv[i],"--direct")) {if(options.proxy) goto usage;options.proxy="";continue;}
+        if(same(argv[i],"--retain-capture")) {
+            if(i+1>=argc || !*argv[i+1]) goto usage;
+            retained[retained_count++]=argv[++i];
+            continue;
+        }
         if(same(argv[i],"--capture")) slot=&options.capture;
         else if(same(argv[i],"--token-file")) slot=&options.token_file;
         else if(same(argv[i],"--proxy")) slot=&options.proxy;
@@ -691,7 +743,7 @@ int tgfs_gc_plan_main(int argc,char **argv)
     report=cJSON_CreateObject();
     cJSON *groups=report?cJSON_AddArrayToObject(report,"groups"):NULL;
     if(!groups || !cJSON_AddStringToObject(report,"schema","TGFS_DUPLICATE_REPORT_V1") ||
-        !cJSON_AddStringToObject(report,"scope","provided_capture_only") ||
+        !cJSON_AddStringToObject(report,"scope",retained_count?"provided_captures_only":"provided_capture_only") ||
         !cJSON_AddStringToObject(report,"storage_chat_id",json_string(journal,"storage_chat_id")) ||
         !cJSON_AddStringToObject(report,"root_object_id",json_string(superblock,"root_object_id")) ||
         !cJSON_AddStringToObject(report,"boundary_id",json_string(journal,"boundary_id")) ||
@@ -701,14 +753,21 @@ int tgfs_gc_plan_main(int argc,char **argv)
     cJSON *chunk_refs=cJSON_AddArrayToObject(report,"chunk_references");
     if(!chunk_refs) {fail(&e,"out of memory");goto done;}
     if(tgfs_duplicate_groups(session->fs,groups,chunk_refs,&e)) goto done;
+    if(retained_count) {
+        cJSON *captures=cJSON_AddArrayToObject(report,"retained_captures");
+        if(!captures) {fail(&e,"out of memory");goto done;}
+        for(size_t i=0;i<retained_count;i++)
+            if(report_retained_capture(session,retained[i],chunk_refs,captures,&e)) goto done;
+    }
     json=cJSON_PrintUnformatted(report);
     if(!json) {fail(&e,"out of memory");goto done;}
     if(puts(json)<0 || fflush(stdout)) {fail(&e,"cannot write duplicate report");goto done;}
     result=0;
 done:
     if(result) fprintf(stderr,"FAIL gc-plan: %s\n",e.message);
-    free(json);cJSON_Delete(report);tgfs_remote_close(session);
+    free(retained);free(json);cJSON_Delete(report);tgfs_remote_close(session);
     return result;
 usage:
+    free(retained);
     tgfs_gc_plan_help(stderr);return 2;
 }
