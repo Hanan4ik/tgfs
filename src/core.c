@@ -960,7 +960,8 @@ done:
 
 enum {
     GC_MANIFEST=1u<<0, GC_CATALOG=1u<<1, GC_RETAINED_CAPTURE=1u<<2,
-    GC_UPLOAD_INTENT=1u<<3, GC_OPEN_HANDLE=1u<<4
+    GC_UPLOAD_INTENT=1u<<3, GC_OPEN_HANDLE=1u<<4,
+    GC_NAVIGATION=1u<<5, GC_RETAINED_NAVIGATION=1u<<6
 };
 
 typedef struct {
@@ -1000,6 +1001,13 @@ static void mark_intent_commit(tgfs *fs,gc_chunk *chunks,size_t count,const char
         mark_gc_chunk(chunks,count,json_string(part,"message_id"),GC_UPLOAD_INTENT);
 }
 
+static void mark_navigation_refs(gc_chunk *chunks,size_t count,const cJSON *report,unsigned reason)
+{
+    const cJSON *edge;
+    cJSON_ArrayForEach(edge,cJSON_GetObjectItemCaseSensitive(report,"navigation_references"))
+        mark_gc_chunk(chunks,count,json_string(edge,"chunk_id"),reason);
+}
+
 int tgfs_gc_retention_reasons(tgfs *fs,cJSON *report,tgfs_error *e)
 {
     cJSON *refs=cJSON_GetObjectItemCaseSensitive(report,"chunk_references");
@@ -1024,7 +1032,9 @@ int tgfs_gc_retention_reasons(tgfs *fs,cJSON *report,tgfs_error *e)
                 mark_gc_chunks(chunks,count,cJSON_GetObjectItemCaseSensitive(record,"chunk_ids"),GC_CATALOG);
         }
     }
+    mark_navigation_refs(chunks,count,report,GC_NAVIGATION);
     cJSON_ArrayForEach(source,cJSON_GetObjectItemCaseSensitive(report,"retained_captures")) {
+        mark_navigation_refs(chunks,count,source,GC_RETAINED_NAVIGATION);
         cJSON_ArrayForEach(record,cJSON_GetObjectItemCaseSensitive(source,"commit_references"))
             mark_gc_chunks(chunks,count,cJSON_GetObjectItemCaseSensitive(record,"chunk_ids"),GC_RETAINED_CAPTURE);
     }
@@ -1044,7 +1054,8 @@ int tgfs_gc_retention_reasons(tgfs *fs,cJSON *report,tgfs_error *e)
     static const struct {unsigned bit;const char *label;} labels[]={
         {GC_MANIFEST,"manifest_in_capture"},{GC_CATALOG,"visible_in_current_capture"},
         {GC_RETAINED_CAPTURE,"retained_capture"},{GC_UPLOAD_INTENT,"unfinished_put"},
-        {GC_OPEN_HANDLE,"open_file"}
+        {GC_OPEN_HANDLE,"open_file"},
+        {GC_NAVIGATION,"navigation_in_capture"},{GC_RETAINED_NAVIGATION,"navigation_in_retained_capture"}
     };
     for(i=0;i<count;i++) {
         cJSON *reasons=cJSON_AddArrayToObject(chunks[i].entry,"retention_reasons");

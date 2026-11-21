@@ -655,6 +655,58 @@ usage:
     tgfs_intent_help(stderr);return 2;
 }
 
+static int compare_message_ids(const void *left,const void *right)
+{
+    uint64_t a=*(const uint64_t *)left,b=*(const uint64_t *)right;
+    return (a>b)-(a<b);
+}
+
+static int report_navigation_edge(const cJSON *source,const char *source_id,const uint64_t *ids,size_t count,
+                                  cJSON *edges,tgfs_error *e)
+{
+    const cJSON *next=cJSON_GetObjectItemCaseSensitive(source,"next_message");
+    if(!next || cJSON_IsNull(next)) return 0;
+    uint64_t target;
+    if(!cJSON_IsString(next) || decimal(next->valuestring,&target) || !target || target>TGFS_BOT_MAX_EXACT_ID)
+        return fail(e,"invalid next_message in capture at message %s",source_id);
+    if(!bsearch(&target,ids,count,sizeof(*ids),compare_message_ids)) return 0;
+    cJSON *edge=cJSON_CreateObject();
+    if(!edge || !cJSON_AddStringToObject(edge,"source_message_id",source_id) ||
+        !cJSON_AddStringToObject(edge,"source_type",json_string(source,"type")) ||
+        !cJSON_AddStringToObject(edge,"chunk_id",next->valuestring) || !cJSON_AddItemToArray(edges,edge)) {
+        cJSON_Delete(edge);
+        return fail(e,"out of memory");
+    }
+    return 0;
+}
+
+static int report_navigation_refs(const cJSON *journal,const cJSON *chunk_refs,cJSON *report,tgfs_error *e)
+{
+    cJSON *edges=cJSON_AddArrayToObject(report,"navigation_references");
+    if(!edges) return fail(e,"out of memory");
+    size_t count=(size_t)cJSON_GetArraySize(chunk_refs);
+    if(!count) return 0;
+    uint64_t *ids=calloc(count,sizeof(*ids));
+    if(!ids) return fail(e,"out of memory");
+    int rc=-1;
+    const cJSON *ref;
+    size_t i=0;
+    cJSON_ArrayForEach(ref,chunk_refs) {
+        if(json_decimal(ref,"chunk_id",&ids[i++])) {fail(e,"invalid reported CHUNK ID");goto done;}
+    }
+    /* The duplicate report emits chunk_references in source message order. */
+    const cJSON *sb=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
+    if(report_navigation_edge(sb,json_string(sb,"start_id"),ids,count,edges,e)) goto done;
+    cJSON_ArrayForEach(ref,cJSON_GetObjectItemCaseSensitive(journal,"records")) {
+        const cJSON *source=cJSON_GetObjectItemCaseSensitive(ref,"record");
+        if(report_navigation_edge(source,json_string(ref,"message_id"),ids,count,edges,e)) goto done;
+    }
+    rc=0;
+done:
+    free(ids);
+    return rc;
+}
+
 static int report_retained_capture(tgfs_remote_session *current,const char *path,
                                    const cJSON *chunk_refs,cJSON *captures,tgfs_error *e)
 {
@@ -689,7 +741,8 @@ static int report_retained_capture(tgfs_remote_session *current,const char *path
         !cJSON_AddBoolToObject(capture,"coverage_verified",cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(journal,"coverage_verified")))) {
         fail(e,"out of memory");goto done;
     }
-    rc=tgfs_retained_capture_refs(fs,chunk_refs,refs,e);
+    if(tgfs_retained_capture_refs(fs,chunk_refs,refs,e) || report_navigation_refs(journal,chunk_refs,capture,e)) goto done;
+    rc=0;
 done:
     tgfs_close(fs);cJSON_Delete(journal);
     return rc;
@@ -938,7 +991,8 @@ int tgfs_gc_plan_main(int argc,char **argv)
     }
     cJSON *chunk_refs=cJSON_AddArrayToObject(report,"chunk_references");
     if(!chunk_refs) {fail(&e,"out of memory");goto done;}
-    if(tgfs_duplicate_groups(session->fs,groups,chunk_refs,&e)) goto done;
+    if(tgfs_duplicate_groups(session->fs,groups,chunk_refs,&e) ||
+       report_navigation_refs(journal,chunk_refs,report,&e)) goto done;
     cJSON *retained[GC_INPUT_COUNT]={0};
     const char *keys[]={"retained_captures","retained_intents","retained_open_files"};
     for(size_t i=0;i<GC_INPUT_COUNT;i++) {
