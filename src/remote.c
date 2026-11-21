@@ -698,7 +698,9 @@ int tgfs_gc_plan_main(int argc,char **argv)
         !cJSON_AddBoolToObject(report,"coverage_verified",cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(journal,"coverage_verified")))) {
         fail(&e,"out of memory");goto done;
     }
-    if(tgfs_duplicate_groups(session->fs,groups,&e)) goto done;
+    cJSON *chunk_refs=cJSON_AddArrayToObject(report,"chunk_references");
+    if(!chunk_refs) {fail(&e,"out of memory");goto done;}
+    if(tgfs_duplicate_groups(session->fs,groups,chunk_refs,&e)) goto done;
     json=cJSON_PrintUnformatted(report);
     if(!json) {fail(&e,"out of memory");goto done;}
     if(puts(json)<0 || fflush(stdout)) {fail(&e,"cannot write duplicate report");goto done;}

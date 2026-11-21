@@ -108,6 +108,32 @@ class Remote(unittest.TestCase):
                 payloads['file_140']=json.dumps(dict(parts=parts)).encode()
                 other['document']['file_size']=len(payloads['file_140'])
                 records.append(other)
+            if mode in ('gc-catalog','gc-history','gc-detached'):
+                directory=next(r for r in records if r['message_id']=='10')
+                parent_id=directory['record']['object_id']
+                root_record=next(r for r in records if r['message_id']=='15')
+                def append_ops(record,operations):
+                    doc=record['document'];fid=doc['file_id']
+                    body=json.loads(payloads[fid]);body['operations'].extend(operations)
+                    payloads[fid]=json.dumps(body).encode();doc['file_size']=len(payloads[fid])
+                append_ops(directory,[dict(operation_id=str(uuid.uuid4()),action='ADD',name='renamed.bin',
+                    object_id=other['record']['object_id']),dict(operation_id=str(uuid.uuid4()),action='ADD',
+                    name='loop',object_id=parent_id)])
+                append_ops(root_record,[dict(operation_id=str(uuid.uuid4()),action='ADD',
+                    name='alias.txt',object_id=original_commit['record']['object_id'])])
+                if mode=='gc-detached':
+                    observed=json.loads(payloads['file_15'])['operations'][0]['operation_id']
+                    append_ops(root_record,[dict(operation_id=str(uuid.uuid4()),action='REMOVE',name='documents',
+                        observed_adds=[observed])])
+                if mode=='gc-history':
+                    replacement=copy.deepcopy(original_commit)
+                    replacement['message_id']='150';replacement['document']['file_id']='file_150'
+                    replacement['record'].update(version_id=str(uuid.uuid4()),operation_id=str(uuid.uuid4()),
+                        file_size='0',file_sha256=hashlib.sha256(b'').hexdigest(),part_count=0)
+                    payloads['file_150']=b'{"parts":[]}'
+                    replacement['document']['file_size']=len(payloads['file_150'])
+                    records.append(replacement)
+                    retry['message_id']='160'  # A late replay cannot select the old version.
             records.sort(key=lambda r:int(r['message_id']))
         if mode=='badjson': payloads['file_10']=b'NOT JSON';records[0]['document']['file_size']=8
         if mode=='duplicate': records.append(copy.deepcopy(records[-1]))
@@ -168,6 +194,25 @@ class Remote(unittest.TestCase):
         self.assertEqual({c['commit_id']:c['chunk_ids'] for c in group['verified_commits']},
                          {'110':['101'],'140':['112','113']})
         for fid in ('file_101','file_112','file_113'): self.assertEqual(files.count(fid),1)
+
+    def test_gc_plan_reports_capture_references(self):
+        for mode in ('gc-catalog','gc-history','gc-detached'):
+            with self.subTest(mode=mode):
+                rc,out,err,files=self.run_read('gc-plan',mode=mode)
+                self.assertEqual(rc,0,err)
+                report=json.loads(out)
+                commits={c['commit_id']:c for c in report['groups'][0]['verified_commits']}
+                refs={c['chunk_id']:c['commit_ids'] for c in report['chunk_references']}
+                self.assertEqual(refs,{'101':['110','160' if mode=='gc-history' else '111'],
+                                       '112':['140'],'113':['140']})
+                names={mid:{n['name'] for n in c['catalog_entries']} for mid,c in commits.items()}
+                self.assertEqual(names['110'],{'alias.txt','hello.txt'} if mode=='gc-catalog'
+                                 else {'alias.txt'} if mode=='gc-detached' else set())
+                self.assertEqual(names['140'],set() if mode=='gc-detached' else {'renamed.bin'})
+                for name in commits['110']['catalog_entries']:
+                    if name['name']=='alias.txt':
+                        self.assertEqual(name['parent_object_id'],report['root_object_id'])
+                self.assertEqual(files.count('file_101'),1)
 
     def test_gc_plan_retries_and_incomplete_copies(self):
         for mode in ('ok','gc-retry-only','empty'):
