@@ -669,7 +669,99 @@ static int same_parts(const message *a,const message *b)
     return !part_a && !part_b;
 }
 
-static int report_verified_commit(cJSON *group,tgfs *fs,message *commit,tgfs_error *e)
+typedef struct {
+    const char *id;
+    message *latest;
+    int directory;
+    int reached;
+} captured_object;
+
+typedef struct {
+    cJSON *catalog_entries;
+    cJSON *referencing_commits;
+    int reported_chunk;
+} capture_references;
+
+static int object_order(const void *left,const void *right)
+{
+    const captured_object *a=left,*b=right;
+    return strcmp(a->id,b->id);
+}
+
+static captured_object *find_object(captured_object *objects,size_t count,const char *id)
+{
+    captured_object key={.id=id};
+    return bsearch(&key,objects,count,sizeof(*objects),object_order);
+}
+
+static int add_report_id(cJSON *array,uint64_t id,tgfs_error *e)
+{
+    char text[32];snprintf(text,sizeof(text),"%" PRIu64,id);
+    cJSON *value=cJSON_CreateString(text);
+    if(!value || !cJSON_AddItemToArray(array,value)) {
+        cJSON_Delete(value);
+        return fail(e,"out of memory");
+    }
+    return 0;
+}
+
+/* The same directory can have more than one name. Visit each reachable directory once. */
+static int report_catalog_refs(tgfs *fs,captured_object *objects,size_t count,capture_references *refs,tgfs_error *e)
+{
+    captured_object **queue=calloc(count,sizeof(*queue));
+    if(!queue) return fail(e,"out of memory");
+    captured_object *root=find_object(objects,count,fs->root_id);
+    queue[0]=root;root->reached=1;
+    size_t head=0,tail=1;
+    int rc=-1;
+    while(head<tail) {
+        const char *parent=queue[head++]->id;
+        const cJSON *entries=directory_entries(fs,parent,e),*entry;
+        if(!entries) goto done;
+        cJSON_ArrayForEach(entry,entries) {
+            captured_object *child=find_object(objects,count,json_string(entry,"object_id"));
+            if(!child) continue;
+            if(child->directory) {
+                if(!child->reached) {child->reached=1;queue[tail++]=child;}
+                continue;
+            }
+            cJSON *array=child->latest?refs[child->latest-fs->messages].catalog_entries:NULL;
+            if(!array) continue;
+            cJSON *name=cJSON_CreateObject();
+            if(!name || !cJSON_AddItemToArray(array,name)) {
+                cJSON_Delete(name);fail(e,"out of memory");goto done;
+            }
+            if(!cJSON_AddStringToObject(name,"parent_object_id",parent) ||
+                !cJSON_AddStringToObject(name,"name",json_string(entry,"name"))) {
+                fail(e,"out of memory");goto done;
+            }
+        }
+    }
+    rc=0;
+done:
+    free(queue);
+    return rc;
+}
+
+static int report_chunk_refs(tgfs *fs,capture_references *refs,tgfs_error *e)
+{
+    for(size_t i=0;i<fs->count;i++) {
+        const message *commit=&fs->messages[i];
+        if(!same(commit->type,"FILE_COMMIT")) continue;
+        const cJSON *part;
+        cJSON_ArrayForEach(part,cJSON_GetObjectItemCaseSensitive(commit->body,"parts")) {
+            uint64_t id;
+            if(json_decimal(part,"message_id",&id)) return fail(e,"invalid CHUNK reference");
+            message *chunk=message_find(fs,id);
+            cJSON *commits=chunk?refs[chunk-fs->messages].referencing_commits:NULL;
+            if(commits && add_report_id(commits,commit->id,e))
+                return -1;
+        }
+    }
+    return 0;
+}
+
+static int report_verified_commit(cJSON *group,tgfs *fs,message *commit,capture_references *refs,tgfs_error *e)
 {
     tgfs_error verify={0};
     if(stream_commit(fs,commit,NULL,&verify))
@@ -681,34 +773,53 @@ static int report_verified_commit(cJSON *group,tgfs *fs,message *commit,tgfs_err
     }
     char id[32];snprintf(id,sizeof(id),"%" PRIu64,commit->id);
     cJSON *parts=cJSON_AddArrayToObject(entry,"chunk_ids");
-    if(!parts || !cJSON_AddStringToObject(entry,"commit_id",id) ||
+    refs[commit-fs->messages].catalog_entries=cJSON_AddArrayToObject(entry,"catalog_entries");
+    if(!parts || !refs[commit-fs->messages].catalog_entries || !cJSON_AddStringToObject(entry,"commit_id",id) ||
         !cJSON_AddStringToObject(entry,"object_id",commit->object_id) ||
         !cJSON_AddStringToObject(entry,"version_id",json_string(commit->caption,"version_id")))
         return fail(e,"out of memory");
     const cJSON *part;
     cJSON_ArrayForEach(part,cJSON_GetObjectItemCaseSensitive(commit->body,"parts")) {
-        cJSON *value=cJSON_CreateString(json_string(part,"message_id"));
-        if(!value || !cJSON_AddItemToArray(parts,value)) {cJSON_Delete(value);return fail(e,"out of memory");}
+        uint64_t chunk_id;
+        if(json_decimal(part,"message_id",&chunk_id) || add_report_id(parts,chunk_id,e)) return -1;
+        message *chunk=message_find(fs,chunk_id); /* stream_commit already checked the reference. */
+        refs[chunk-fs->messages].reported_chunk=1;
     }
     return 0;
 }
 
-int tgfs_duplicate_groups(tgfs *fs,cJSON *groups,tgfs_error *e)
+int tgfs_duplicate_groups(tgfs *fs,cJSON *groups,cJSON *chunk_refs,tgfs_error *e)
 {
-    duplicate_commit *commits=calloc(fs->count?fs->count:1,sizeof(*commits));
-    if(!commits) return fail(e,"out of memory");
+    duplicate_commit *commits=calloc(fs->count+1,sizeof(*commits));
+    captured_object *objects=calloc(fs->count+1,sizeof(*objects));
+    capture_references *refs=calloc(fs->count+1,sizeof(*refs));
+    int result=-1;
+    if(!commits || !objects || !refs) {fail(e,"out of memory");goto done;}
+    objects[0]=(captured_object){.id=fs->root_id,.directory=1};
     size_t count=0;
     for(size_t i=0;i<fs->count;i++) {
         message *commit=&fs->messages[i];
+        objects[i+1]=(captured_object){.id=commit->object_id,.directory=same(commit->type,"DIRECTORY")};
         if(!same(commit->type,"FILE_COMMIT")) continue;
         uint64_t size;
-        if(json_decimal(commit->caption,"file_size",&size)) {free(commits);return fail(e,"invalid FILE_COMMIT size");}
-        if(!size) continue;
+        if(json_decimal(commit->caption,"file_size",&size)) {fail(e,"invalid FILE_COMMIT size");goto done;}
         commits[count++]=(duplicate_commit){commit,size,json_string(commit->caption,"file_sha256"),
             json_string(commit->caption,"operation_id")};
     }
     qsort(commits,count,sizeof(*commits),duplicate_commit_order);
-    int result=-1;
+    qsort(objects,fs->count+1,sizeof(*objects),object_order);
+    size_t object_count=0;
+    for(size_t i=0;i<=fs->count;i++) {
+        if(object_count && same(objects[object_count-1].id,objects[i].id))
+            objects[object_count-1].directory |= objects[i].directory;
+        else objects[object_count++]=objects[i];
+    }
+    for(size_t i=0;i<count;i++) {
+        if(i && same(commits[i-1].operation,commits[i].operation)) continue;
+        message *commit=commits[i].commit;
+        captured_object *object=find_object(objects,object_count,commit->object_id);
+        if(!object->latest || object->latest->id<commit->id) object->latest=commit;
+    }
     for(size_t start=0;start<count;) {
         size_t end=start+1;
         int distinct_parts=0;
@@ -726,13 +837,26 @@ int tgfs_duplicate_groups(tgfs *fs,cJSON *groups,tgfs_error *e)
             for(size_t i=start;i<end;i++) {
                 /* A retry of the same operation points to the same CHUNKs. Verify the first publication. */
                 if(i>start && same(commits[i-1].operation,commits[i].operation)) continue;
-                if(report_verified_commit(members,fs,commits[i].commit,e)) goto done;
+                if(report_verified_commit(members,fs,commits[i].commit,refs,e)) goto done;
             }
         }
         start=end;
     }
+    if(groups->child) {
+        for(size_t i=0;i<fs->count;i++) {
+            if(!refs[i].reported_chunk) continue;
+            cJSON *entry=cJSON_CreateObject();
+            if(!entry || !cJSON_AddItemToArray(chunk_refs,entry)) {
+                cJSON_Delete(entry);fail(e,"out of memory");goto done;
+            }
+            char id[32];snprintf(id,sizeof(id),"%" PRIu64,fs->messages[i].id);
+            refs[i].referencing_commits=cJSON_AddArrayToObject(entry,"commit_ids");
+            if(!refs[i].referencing_commits || !cJSON_AddStringToObject(entry,"chunk_id",id)) {fail(e,"out of memory");goto done;}
+        }
+        if(report_catalog_refs(fs,objects,object_count,refs,e) || report_chunk_refs(fs,refs,e)) goto done;
+    }
     result=0;
 done:
-    free(commits);
+    free(refs);free(objects);free(commits);
     return result;
 }
