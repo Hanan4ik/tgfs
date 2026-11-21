@@ -43,7 +43,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data=b'X'+data[1:]
         self.reply(data)
 class Remote(unittest.TestCase):
-    def run_read(self,command='ls',path='/documents',mode='ok'):
+    def run_read(self,command='ls',path='/documents',mode='ok',retained=()):
         snap=json.loads((EXAMPLE/'snapshot.json').read_text())
         records=[];payloads={}
         for m in sorted(snap['messages'],key=lambda r:int(r['message_id'])):
@@ -123,8 +123,12 @@ class Remote(unittest.TestCase):
                     name='alias.txt',object_id=original_commit['record']['object_id'])])
                 if mode=='gc-detached':
                     observed=json.loads(payloads['file_15'])['operations'][0]['operation_id']
-                    append_ops(root_record,[dict(operation_id=str(uuid.uuid4()),action='REMOVE',name='documents',
+                    removal=copy.deepcopy(root_record)
+                    removal['message_id']='145';removal['document']['file_id']='file_145'
+                    payloads['file_145']=b'{"operations":[]}'
+                    append_ops(removal,[dict(operation_id=str(uuid.uuid4()),action='REMOVE',name='documents',
                         observed_adds=[observed])])
+                    records.append(removal)
                 if mode=='gc-history':
                     replacement=copy.deepcopy(original_commit)
                     replacement['message_id']='150';replacement['document']['file_id']='file_150'
@@ -149,6 +153,19 @@ class Remote(unittest.TestCase):
             try:
                 common=['--capture',str(root),'--token-file',str(token)]
                 args=['gc-plan',*common] if command=='gc-plan' else ['read','--no-cache',*common,command,path]
+                for index,case in enumerate(retained):
+                    old=root/f'retained-{index}';old.mkdir()
+                    saved=copy.deepcopy(journal)
+                    boundary='110' if case=='before-commit' else '200' if case=='same-boundary' else '139'
+                    saved['boundary_id']=boundary
+                    saved['records']=[r for r in saved['records'] if int(r['message_id'])<int(boundary)
+                                      and not (case=='missing-chunk' and r['message_id']=='101')]
+                    if case=='foreign-root': saved['superblock']['root_object_id']=str(uuid.uuid4())
+                    if case=='foreign-channel': saved['storage_chat_id']=str(STORAGE+1)
+                    if case=='foreign-start': saved['superblock']['start_id']='2'
+                    if case=='incomplete': saved['scan_completed']=False
+                    (old/'journal.json').write_text(json.dumps(saved))
+                    args.extend(['--retain-capture',str(old)])
                 p=subprocess.run([BINARY,*args],
                     env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{server.server_port}'),
                     capture_output=True,timeout=10)
@@ -213,6 +230,35 @@ class Remote(unittest.TestCase):
                     if name['name']=='alias.txt':
                         self.assertEqual(name['parent_object_id'],report['root_object_id'])
                 self.assertEqual(files.count('file_101'),1)
+
+    def test_gc_plan_retained_captures(self):
+        rc,out,err,files=self.run_read('gc-plan',mode='gc-detached',
+                                       retained=('older','before-commit','missing-chunk'))
+        self.assertEqual(rc,0,err)
+        report=json.loads(out)
+        self.assertEqual(report['scope'],'provided_captures_only')
+        current={c['commit_id']:c for c in report['groups'][0]['verified_commits']}
+        self.assertEqual([n['name'] for n in current['110']['catalog_entries']],['alias.txt'])
+        self.assertEqual(current['140']['catalog_entries'],[])
+        older,empty,gapped=report['retained_captures']
+        self.assertEqual([older['boundary_id'],empty['boundary_id'],gapped['boundary_id']],['139','110','139'])
+        self.assertEqual(empty['commit_references'],[])
+        self.assertFalse(gapped['coverage_verified'])
+        self.assertEqual(older['commit_references'],gapped['commit_references'])
+        first,replay=older['commit_references']
+        self.assertEqual(first['commit_id'],'110')
+        self.assertEqual(first['chunk_ids'],['101'])
+        self.assertEqual({name['name'] for name in first['catalog_entries']},{'alias.txt','hello.txt'})
+        self.assertEqual(replay,dict(commit_id='111',chunk_ids=['101'],catalog_entries=[]))
+        self.assertEqual(files.count('file_101'),1)
+
+    def test_gc_plan_rejects_invalid_retained_capture(self):
+        for case,error in (('foreign-root','different volume'),('foreign-channel','different volume'),
+                           ('foreign-start','different volume'),('same-boundary','earlier boundary'),
+                           ('incomplete','incomplete journal')):
+            with self.subTest(case=case):
+                rc,out,err,_=self.run_read('gc-plan',mode='gc-detached',retained=(case,))
+                self.assertEqual(rc,1,err);self.assertEqual(out,b'');self.assertIn(error,err)
 
     def test_gc_plan_retries_and_incomplete_copies(self):
         for mode in ('ok','gc-retry-only','empty'):
