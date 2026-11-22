@@ -93,7 +93,7 @@ unsigned char *bytes_load_at(int dirfd, const char *file, size_t limit,
 }
 
 /* cJSON does not validate UTF-8 and stores strings as NUL-terminated buffers. */
-static int utf8_valid(const unsigned char *s, size_t n)
+int utf8_valid(const unsigned char *s, size_t n)
 {
     for (size_t i = 0; i < n;) {
         unsigned c = s[i++], cp;

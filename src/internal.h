@@ -30,6 +30,7 @@ int json_count(const cJSON *o, const char *key, size_t *out);
 int uuid_valid(const char *s);
 int hash_valid(const char *s);
 int name_valid(const char *s);
+int utf8_valid(const unsigned char *s, size_t n);
 int json_semantic_equal(const cJSON *a, const cJSON *b);
 
 /* Batches must be sorted by source message ID. Bodies are borrowed. */
