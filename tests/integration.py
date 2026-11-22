@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import select
 from pathlib import Path
 import subprocess
 import sys
@@ -332,6 +333,40 @@ class ReadCore(unittest.TestCase):
         self.operation_directory(self.directory_op(1))
         self.directory_batch(20,parent=DIRECTORY)
         self.run_cli(ok=False,error='parent or document mode changed')
+
+    def test_shared_volume_lock_protocol(self):
+        lock=self.path/'shared.lock'
+        lock.touch(mode=0o600)
+        prefix=[BINARY,'--shared-volume-lock',str(lock)]
+        def attempt(*args,expected=0):
+            result=subprocess.run([*prefix,*args],capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,expected,result.stderr)
+            return result
+        for mode in ('--shared','--exclusive'):
+            with self.subTest(mode=mode):
+                holder=subprocess.Popen([*prefix,'lock-check',mode,'--hold'],
+                    stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                try:
+                    self.assertTrue(select.select([holder.stdout],[],[],5)[0])
+                    self.assertEqual(holder.stdout.readline(),f'OK volume lock {mode[2:]}\n')
+                    blocked=attempt('gc-plan',expected=1)
+                    self.assertIn('volume lock is busy',blocked.stderr)
+                    attempt('lock-check','--shared',expected=0 if mode=='--shared' else 1)
+                    if mode=='--exclusive':
+                        attempt('put',expected=1)
+                    holder.communicate('\n',timeout=5)
+                    self.assertEqual(holder.returncode,0)
+                finally:
+                    if holder.poll() is None: holder.kill();holder.communicate(timeout=5)
+                attempt('lock-check','--exclusive')
+        self.assertEqual(lock.read_bytes(),b'')
+        alias=self.path/'alias'
+        alias.symlink_to(lock)
+        rejected=subprocess.run([BINARY,'--shared-volume-lock',str(alias),'lock-check','--shared'],
+                                capture_output=True,text=True,timeout=5)
+        self.assertEqual(rejected.returncode,1)
+        self.assertIn('private regular file',rejected.stderr)
+        attempt('lock-check',expected=2)
 
     def test_volume_lock_modes(self):
         self.write('snapshot.json',self.snapshot)
