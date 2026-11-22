@@ -16,7 +16,7 @@ struct tgfs_remote_session;
 const cJSON *tgfs_remote_journal(const struct tgfs_remote_session *session);
 cJSON *tgfs_file_references(const tgfs_file *file);
 int tgfs_duplicate_groups(tgfs *fs, cJSON *groups, cJSON *chunk_refs, tgfs_error *e);
-int tgfs_gc_retention_reasons(tgfs *fs, cJSON *report, tgfs_error *e);
+int tgfs_gc_retention_reasons(tgfs *fs, cJSON *report, const size_t *keep_history, tgfs_error *e);
 int tgfs_retained_capture_refs(tgfs *fs, const cJSON *chunk_refs, cJSON *retained, tgfs_error *e);
 int stage_intent_at(int dirfd, const char *file, const char *raw, tgfs_error *e);
 cJSON *json_load_at(int dirfd, const char *file, tgfs_error *e);
