@@ -32,7 +32,9 @@ static void help(FILE *stream)
           "       tgfs --help\n\n"
           "Global option before the command:\n"
           "  --volume-lock DIRECTORY  Use an existing private directory as a local volume lock.\n"
-          "                           gc-plan takes it exclusively; other commands share it.\n\n"
+          "  --shared-volume-lock FILE  Use an existing private file on shared storage.\n"
+          "                           gc-plan takes it exclusively; other commands share it.\n"
+          "  lock-check {--shared | --exclusive} [--hold]  Test the selected lock; Enter releases it.\n\n"
           "Snapshot commands (local data, no Telegram connection):\n"
           "  --snapshot DIRECTORY     Read snapshot.json and documents from DIRECTORY.\n"
           "  ls /absolute/path        List immediate directory entries.\n"
@@ -89,13 +91,17 @@ static int dispatch(int argc, char **argv)
 }
 
 
-static int lock_volume(const char *path,int exclusive)
+static int lock_volume(const char *path,int exclusive,int shared_storage)
 {
-    int fd=open(path,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    int flags=shared_storage?O_RDWR|O_NONBLOCK:O_RDONLY|O_DIRECTORY;
+    int fd=open(path,flags|O_NOFOLLOW|O_CLOEXEC);
     struct stat st;
-    if(fd<0 || fstat(fd,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {
+    if(fd<0 || fstat(fd,&st) || st.st_uid!=geteuid() || (st.st_mode&0077) ||
+       (shared_storage && (!S_ISREG(st.st_mode) || st.st_nlink!=1))) {
         if(fd>=0) close(fd);
-        fprintf(stderr,"tgfs: volume lock must be an existing private directory owned by this user\n");
+        fprintf(stderr,shared_storage?
+                "tgfs: shared volume lock must be an existing private regular file owned by this user\n":
+                "tgfs: volume lock must be an existing private directory owned by this user\n");
         return -1;
     }
     int result;
@@ -112,23 +118,57 @@ static int lock_volume(const char *path,int exclusive)
     return fd;
 }
 
+static void lock_check_help(FILE *stream)
+{
+    fputs("usage: tgfs --shared-volume-lock FILE lock-check {--shared | --exclusive} [--hold]\n"
+          "       tgfs --volume-lock DIRECTORY lock-check {--shared | --exclusive} [--hold]\n"
+          "With --hold, keep the lock until Enter or EOF.\n",stream);
+}
+
 int main(int argc,char **argv)
 {
-    if(argc<2 || strcmp(argv[1],"--volume-lock")) return dispatch(argc,argv);
+    if(argc<2) return dispatch(argc,argv);
+    if(!strcmp(argv[1],"lock-check")) {
+        int help_only=argc==3 && (!strcmp(argv[2],"--help") || !strcmp(argv[2],"-h"));
+        lock_check_help(help_only?stdout:stderr);
+        return help_only?0:2;
+    }
+    int shared_storage=!strcmp(argv[1],"--shared-volume-lock");
+    if(!shared_storage && strcmp(argv[1],"--volume-lock")) return dispatch(argc,argv);
     if(argc<4 || !*argv[2]) {
-        fputs("usage: tgfs --volume-lock DIRECTORY COMMAND [args]\n",stderr);
+        fputs("usage: tgfs {--volume-lock DIRECTORY | --shared-volume-lock FILE} COMMAND [args]\n",stderr);
         return 2;
     }
     const char *lock_path=argv[2];
     argv[2]=argv[0];
     argc-=2;argv+=2;
+    int check=!strcmp(argv[1],"lock-check"),exclusive=!strcmp(argv[1],"gc-plan"),hold=0;
     const char *last=argv[argc-1];
-    if(argc<=3 && (!strcmp(last,"--help") || !strcmp(last,"-h")))
+    if(argc<=3 && (!strcmp(last,"--help") || !strcmp(last,"-h"))) {
+        if(check) {lock_check_help(stdout);return 0;}
         return dispatch(argc,argv);
-
-    int fd=lock_volume(lock_path,!strcmp(argv[1],"gc-plan"));
+    }
+    if(check) {
+        if(argc<3 || argc>4 || (strcmp(argv[2],"--shared") && strcmp(argv[2],"--exclusive")) ||
+           (argc==4 && strcmp(argv[3],"--hold"))) {
+            lock_check_help(stderr);return 2;
+        }
+        exclusive=!strcmp(argv[2],"--exclusive");
+        hold=argc==4;
+    }
+    int fd=lock_volume(lock_path,exclusive,shared_storage);
     if(fd<0) return 1;
-    int result=dispatch(argc,argv);
+    int result;
+    if(check) {
+        result=printf("OK volume lock %s\n",exclusive?"exclusive":"shared")<0 || fflush(stdout);
+        if(!result && hold) {
+            int c;
+            do {c=getchar();} while(c!=EOF && c!='\n');
+            result=ferror(stdin)!=0;
+        }
+    } else {
+        result=dispatch(argc,argv);
+    }
     close(fd);
     return result;
 }
