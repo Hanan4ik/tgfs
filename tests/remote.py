@@ -44,7 +44,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data=b'X'+data[1:]
         self.reply(data)
 class Remote(unittest.TestCase):
-    def run_read(self,command='ls',path='/documents',mode='ok',retained=(),intents=(),open_files=()):
+    def run_read(self,command='ls',path='/documents',mode='ok',retained=(),intents=(),open_files=(),keep_history=None):
         snap=json.loads((EXAMPLE/'snapshot.json').read_text())
         records=[];payloads={}
         for m in sorted(snap['messages'],key=lambda r:int(r['message_id'])):
@@ -160,6 +160,7 @@ class Remote(unittest.TestCase):
             try:
                 common=['--capture',str(root),'--token-file',str(token)]
                 args=['gc-plan',*common] if command=='gc-plan' else ['read','--no-cache',*common,command,path]
+                if keep_history is not None: args.extend(['--keep-history',str(keep_history)])
                 for index,case in enumerate(retained):
                     old=root/f'retained-{index}';old.mkdir()
                     saved=copy.deepcopy(journal)
@@ -308,6 +309,45 @@ class Remote(unittest.TestCase):
         self.assertEqual(rc,0,err)
         reasons={c['chunk_id']:c['retention_reasons'] for c in json.loads(out)['chunk_references']}
         self.assertEqual(reasons['101'],['manifest_in_capture'])
+
+    def test_gc_plan_history_preview(self):
+        cases=(
+            (0,{},False), (1,{},True), (0,dict(retained=('older',)),True),
+            (0,dict(intents=('base-only',)),True),
+            (0,dict(open_files=[dict(commit_id='110',chunk_ids=['101'])]),True),
+        )
+        for limit,extra,kept in cases:
+            with self.subTest(limit=limit,extra=extra):
+                rc,out,err,_=self.run_read('gc-plan',mode='gc-history',keep_history=limit,**extra)
+                self.assertEqual(rc,0,err)
+                report=json.loads(out)
+                self.assertEqual(report['keep_history'],limit)
+                chunks={c['chunk_id']:c for c in report['chunk_references']}
+                older=chunks['101']['history_preview']
+                self.assertEqual(older['within_limit_commit_ids'],['110','160'] if limit else [])
+                self.assertEqual(older['outside_limit_commit_ids'],[] if limit else ['110','160'])
+                self.assertEqual(older['retained_in_preview'],kept)
+                self.assertIn('manifest_in_capture',chunks['101']['retention_reasons'])
+                latest=dict(within_limit_commit_ids=['140'],outside_limit_commit_ids=[],
+                            retained_in_preview=True)
+                for mid in ('112','113'): self.assertEqual(chunks[mid]['history_preview'],latest)
+
+        rc,out,err,_=self.run_read('gc-plan',mode='gc-detached',keep_history=0)
+        self.assertEqual(rc,0,err)
+        chunks={c['chunk_id']:c for c in json.loads(out)['chunk_references']}
+        self.assertEqual(chunks['112']['retention_reasons'],['manifest_in_capture'])
+        self.assertTrue(chunks['112']['history_preview']['retained_in_preview'])
+
+        rc,out,err,_=self.run_read('gc-plan',mode='gc-history')
+        self.assertEqual(rc,0,err)
+        default=json.loads(out)
+        self.assertNotIn('keep_history',default)
+        self.assertTrue(all('history_preview' not in chunk for chunk in default['chunk_references']))
+
+        for limit in (-1,65537,'1.0'):
+            with self.subTest(invalid_limit=limit):
+                rc,out,_,files=self.run_read('gc-plan',mode='gc-history',keep_history=limit)
+                self.assertEqual(rc,2);self.assertEqual(out,b'');self.assertEqual(files,[])
 
     def test_gc_plan_retains_navigation_edges(self):
         rc,out,err,files=self.run_read('gc-plan',mode='gc-navigation',retained=('navigation',))

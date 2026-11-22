@@ -1008,14 +1008,77 @@ static void mark_navigation_refs(gc_chunk *chunks,size_t count,const cJSON *repo
         mark_gc_chunk(chunks,count,json_string(edge,"chunk_id"),reason);
 }
 
-int tgfs_gc_retention_reasons(tgfs *fs,cJSON *report,tgfs_error *e)
+static int newest_commit_by_object(const void *left,const void *right)
+{
+    const message *a=*(message *const *)left,*b=*(message *const *)right;
+    int object=strcmp(a->object_id,b->object_id);
+    return object?object:by_id(b,a);
+}
+
+static unsigned char *history_kept(tgfs *fs,size_t keep_history,tgfs_error *e)
+{
+    size_t count;
+    duplicate_commit *commits=capture_commits(fs,&count,e);
+    if(!commits) return NULL;
+    message **canonical=calloc(count+1,sizeof(*canonical));
+    unsigned char *kept=calloc(fs->count+1,sizeof(*kept));
+    if(!canonical || !kept) {
+        free(canonical);free(kept);free(commits);
+        fail(e,"out of memory");return NULL;
+    }
+    size_t canonical_count=0;
+    for(size_t i=0;i<count;i++) {
+        if(!i || !same(commits[i-1].operation,commits[i].operation))
+            canonical[canonical_count++]=commits[i].commit;
+    }
+    qsort(canonical,canonical_count,sizeof(*canonical),newest_commit_by_object);
+    const char *object=NULL;
+    size_t rank=0;
+    for(size_t i=0;i<canonical_count;i++) {
+        message *commit=canonical[i];
+        if(!same(commit->object_id,object)) {object=commit->object_id;rank=0;}
+        kept[commit-fs->messages]=rank++<=keep_history;
+    }
+    /* A replay inherits the rank of the first publication of that operation. */
+    unsigned char keep=0;
+    for(size_t i=0;i<count;i++) {
+        size_t index=(size_t)(commits[i].commit-fs->messages);
+        if(!i || !same(commits[i-1].operation,commits[i].operation)) keep=kept[index];
+        kept[index]=keep;
+    }
+    free(canonical);free(commits);
+    return kept;
+}
+
+static int report_chunk_history(tgfs *fs,const gc_chunk *chunk,const unsigned char *kept,tgfs_error *e)
+{
+    cJSON *preview=cJSON_AddObjectToObject(chunk->entry,"history_preview");
+    cJSON *within=preview?cJSON_AddArrayToObject(preview,"within_limit_commit_ids"):NULL;
+    cJSON *outside=preview?cJSON_AddArrayToObject(preview,"outside_limit_commit_ids"):NULL;
+    if(!within || !outside) return fail(e,"out of memory");
+    const cJSON *id;
+    cJSON_ArrayForEach(id,cJSON_GetObjectItemCaseSensitive(chunk->entry,"commit_ids")) {
+        uint64_t mid;
+        if(!cJSON_IsString(id) || decimal(id->valuestring,&mid)) return fail(e,"invalid reported FILE_COMMIT ID");
+        const message *commit=message_find(fs,mid);
+        if(!commit) return fail(e,"reported FILE_COMMIT missing from capture");
+        if(add_report_id(kept[commit-fs->messages]?within:outside,mid,e)) return -1;
+    }
+    int retained=within->child || (chunk->reasons & ~GC_MANIFEST);
+    if(!cJSON_AddBoolToObject(preview,"retained_in_preview",retained)) return fail(e,"out of memory");
+    return 0;
+}
+
+int tgfs_gc_retention_reasons(tgfs *fs,cJSON *report,const size_t *keep_history,tgfs_error *e)
 {
     cJSON *refs=cJSON_GetObjectItemCaseSensitive(report,"chunk_references");
     size_t count=(size_t)cJSON_GetArraySize(refs);
     if(!count) return 0;
     gc_chunk *chunks=calloc(count,sizeof(*chunks));
     if(!chunks) return fail(e,"out of memory");
+    unsigned char *kept=keep_history?history_kept(fs,*keep_history,e):NULL;
     int rc=-1;
+    if(keep_history && !kept) goto done;
     size_t i=0;
     cJSON *entry;
     cJSON_ArrayForEach(entry,refs) {
@@ -1058,6 +1121,7 @@ int tgfs_gc_retention_reasons(tgfs *fs,cJSON *report,tgfs_error *e)
         {GC_NAVIGATION,"navigation_in_capture"},{GC_RETAINED_NAVIGATION,"navigation_in_retained_capture"}
     };
     for(i=0;i<count;i++) {
+        if(kept && report_chunk_history(fs,&chunks[i],kept,e)) goto done;
         cJSON *reasons=cJSON_AddArrayToObject(chunks[i].entry,"retention_reasons");
         if(!reasons) {fail(e,"out of memory");goto done;}
         for(size_t j=0;j<sizeof(labels)/sizeof(*labels);j++) {
@@ -1070,6 +1134,6 @@ int tgfs_gc_retention_reasons(tgfs *fs,cJSON *report,tgfs_error *e)
     }
     rc=0;
 done:
-    free(chunks);
+    free(kept);free(chunks);
     return rc;
 }

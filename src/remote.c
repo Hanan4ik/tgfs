@@ -928,6 +928,7 @@ void tgfs_gc_plan_help(FILE *stream)
 {
     fputs("usage: tgfs gc-plan --capture DIRECTORY --token-file PATH [options]\n"
           "List content duplicates verified from a completed capture. Reads metadata and CHUNK bytes.\n"
+          "  --keep-history N           Preview keeping N older versions per object, plus the latest.\n"
           "  --retain-capture DIRECTORY  Include references from an older capture of this volume; repeatable.\n"
           "  --retain-intent DIRECTORY   Include an unfinished put state directory; repeatable.\n"
           "  --retain-open-files DIR     Include a mount open-file report; repeatable.\n"
@@ -939,7 +940,7 @@ void tgfs_gc_plan_help(FILE *stream)
 int tgfs_gc_plan_main(int argc,char **argv)
 {
     tgfs_remote_options options={.no_cache=1,.timeout=60};
-    const char *timeout_text=NULL;
+    const char *timeout_text=NULL,*history_text=NULL;
     gc_input *inputs=NULL;
     size_t input_count=0;
     int supplied[GC_INPUT_COUNT]={0};
@@ -961,11 +962,14 @@ int tgfs_gc_plan_main(int argc,char **argv)
         if(same(argv[i],"--capture")) slot=&options.capture;
         else if(same(argv[i],"--token-file")) slot=&options.token_file;
         else if(same(argv[i],"--proxy")) slot=&options.proxy;
+        else if(same(argv[i],"--keep-history")) slot=&history_text;
         else if(same(argv[i],"--timeout-seconds")) slot=&timeout_text;
         if(!slot || *slot || i+1>=argc) goto usage;
         *slot=argv[++i];
     }
-    uint64_t timeout=60;
+    uint64_t timeout=60,history=0;
+    if(history_text && (decimal(history_text,&history) || history>TGFS_MAX_RECORDS)) goto usage;
+    size_t keep_history=(size_t)history;
     if(!options.capture || !options.token_file || (timeout_text && (decimal(timeout_text,&timeout) || !timeout || timeout>300)))
         goto usage;
     options.timeout=(unsigned)timeout;
@@ -1016,7 +1020,10 @@ int tgfs_gc_plan_main(int argc,char **argv)
             fail(&e,"unsupported gc-plan input");goto done;
         }
     }
-    if(tgfs_gc_retention_reasons(session->fs,report,&e)) goto done;
+    if(history_text && !cJSON_AddNumberToObject(report,"keep_history",(double)keep_history)) {
+        fail(&e,"out of memory");goto done;
+    }
+    if(tgfs_gc_retention_reasons(session->fs,report,history_text?&keep_history:NULL,&e)) goto done;
     json=cJSON_PrintUnformatted(report);
     if(!json) {fail(&e,"out of memory");goto done;}
     if(puts(json)<0 || fflush(stdout)) {fail(&e,"cannot write duplicate report");goto done;}
