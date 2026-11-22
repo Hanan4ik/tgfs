@@ -161,6 +161,12 @@ class Remote(unittest.TestCase):
                 common=['--capture',str(root),'--token-file',str(token)]
                 args=['gc-plan',*common] if command=='gc-plan' else ['read','--no-cache',*common,command,path]
                 listed=dict(captures=[],intents=[],open_files=[])
+                discover=inventory is not None and inventory.startswith('discover-')
+                intent_root=root/'uploads' if discover else root
+                mount_root=root/'mounts' if discover else root
+                if discover:
+                    intent_root.mkdir(mode=0o700);mount_root.mkdir(mode=0o700)
+                    (intent_root/'README').write_text('ignored file')
                 def add_source(key,flag,path):
                     if inventory is not None: listed[key].append(str(path))
                     else: args.extend([flag,str(path)])
@@ -184,17 +190,17 @@ class Remote(unittest.TestCase):
                     (old/'journal.json').write_text(json.dumps(saved))
                     add_source('captures','--retain-capture',old)
                 if open_files:
-                    mounted=root/'mounted';mounted.mkdir(mode=0o700)
+                    mounted=mount_root/'mounted';mounted.mkdir(mode=0o700)
                     report=mounted/'open-files.json'
                     report.write_text(json.dumps(dict(schema='TGFS_OPEN_FILES_V1',storage_chat_id=str(STORAGE),
                         root_object_id=journal['superblock']['root_object_id'],start_id=journal['superblock']['start_id'],
                         boundary_id=journal['boundary_id'],files=open_files)))
                     report.chmod(0o600)
-                    add_source('open_files','--retain-open-files',mounted)
+                    if not discover: add_source('open_files','--retain-open-files',mounted)
                 locks=[]
                 try:
                     for index,case in enumerate(intents):
-                        state=root/f'intent-{index}';state.mkdir(mode=0o700)
+                        state=intent_root/f'intent-{index}';state.mkdir(mode=0o700)
                         caption=next(r['record'] for r in records if r['message_id']=='110')
                         upload=dict(kind='put',phase='commit_send_pending',storage_chat_id=str(STORAGE),
                                     source_boundary_id='80',object_id=caption['object_id'],
@@ -224,11 +230,21 @@ class Remote(unittest.TestCase):
                             locks.append(handle)
                             fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
                         if case=='pending-local': (state/'intent.tmp').write_text('pending')
-                        add_source('intents','--retain-intent',state)
+                        if not discover: add_source('intents','--retain-intent',state)
                     if inventory is not None:
                         sb=journal['superblock']
                         registered=dict(schema='TGFS_RETENTION_INVENTORY_V1',storage_chat_id=str(STORAGE),
                                         root_object_id=sb['root_object_id'],start_id=sb['start_id'],**listed)
+                        if discover:
+                            registered['intent_roots']=[str(intent_root)]
+                            registered['open_file_roots']=[str(mount_root)]
+                            if inventory=='discover-bad-root': intent_root.chmod(0o755)
+                            if inventory=='discover-empty-child': (intent_root/'unreadable').mkdir(mode=0o700)
+                            if inventory=='discover-symlink': (intent_root/'link').symlink_to(mount_root)
+                            if inventory=='discover-nonutf8': os.mkdir(os.fsencode(intent_root)+b'/\xff',0o700)
+                            if inventory=='discover-root-symlink':
+                                link=root/'symlink';link.symlink_to(intent_root)
+                                registered['intent_roots']=[str(link)+'/']
                         if inventory=='combined':
                             args.extend(['--retain-capture',registered['captures'].pop()])
                         if inventory=='missing-source': registered['intents'].append(str(root/'absent'))
@@ -386,6 +402,38 @@ class Remote(unittest.TestCase):
                                  ['manifest_in_capture','retained_capture','unfinished_put','open_file'])
                 self.assertTrue(historical['history_preview']['retained_in_preview'])
                 self.assertEqual(files.count('file_101'),1)
+
+    def test_gc_plan_discovers_local_state(self):
+        rc,out,err,_=self.run_read('gc-plan',mode='gc-history',inventory='discover-ok',
+            intents=('complete','base-only'),open_files=[dict(commit_id='110',chunk_ids=['101'])])
+        self.assertEqual(rc,0,err)
+        report=json.loads(out)
+        uploads,mounts=report['discovered_state_roots']
+        self.assertEqual(uploads['kind'],'intents')
+        self.assertEqual([Path(path).name for path in uploads['state_dirs']],['intent-0','intent-1'])
+        self.assertEqual(mounts['kind'],'open_files')
+        self.assertEqual(mounts['state_dirs'],[report['retained_open_files'][0]['state_dir']])
+        intent,=report['retained_intents']
+        self.assertEqual(intent['state_dir'],uploads['state_dirs'][1])
+        historical=next(c for c in report['chunk_references'] if c['chunk_id']=='101')
+        self.assertEqual(historical['retention_reasons'],['manifest_in_capture','unfinished_put','open_file'])
+
+        rc,out,err,_=self.run_read('gc-plan',mode='gc-history',inventory='discover-empty')
+        self.assertEqual(rc,0,err)
+        self.assertTrue(all(not root['state_dirs'] for root in json.loads(out)['discovered_state_roots']))
+
+    def test_gc_plan_rejects_invalid_discovery(self):
+        for case,diagnostic in (
+            ('bad-root','must be a private directory'),('root-symlink','must be a private directory'),
+            ('empty-child','owner-only regular file'),('symlink','symlink in retention state root'),
+            ('nonutf8','non-UTF-8 directory name'),('busy','lock retained intent journal'),
+        ):
+            with self.subTest(case=case):
+                rc,out,err,_=self.run_read('gc-plan',mode='gc-history',inventory='discover-'+case,
+                                            intents=('busy',) if case=='busy' else ())
+                self.assertEqual(rc,1,err)
+                self.assertEqual(out,b'')
+                self.assertIn(diagnostic,err)
 
     def test_gc_plan_rejects_invalid_inventory(self):
         for case,message in (

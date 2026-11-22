@@ -925,6 +925,19 @@ typedef struct {
 } gc_input;
 
 static const char *const inventory_keys[GC_INPUT_COUNT]={"captures","intents","open_files"};
+static const char *const inventory_root_keys[GC_INPUT_COUNT]={[GC_INTENT]="intent_roots",[GC_OPEN_FILES]="open_file_roots"};
+
+static int validate_inventory_paths(const cJSON *paths,const char *key,tgfs_error *e)
+{
+    if(!cJSON_IsArray(paths) || cJSON_GetArraySize(paths)>TGFS_MAX_RECORDS)
+        return fail(e,"invalid retention inventory array: %s",key);
+    const cJSON *path;
+    cJSON_ArrayForEach(path,paths) {
+        if(!cJSON_IsString(path) || path->valuestring[0]!='/')
+            return fail(e,"retention inventory %s must contain absolute directory paths",key);
+    }
+    return 0;
+}
 
 static cJSON *load_retention_inventory(const char *path,const cJSON *journal,int supplied[GC_INPUT_COUNT],tgfs_error *e)
 {
@@ -948,16 +961,15 @@ static cJSON *load_retention_inventory(const char *path,const cJSON *journal,int
         fail(e,"retention inventory belongs to a different volume");goto invalid;
     }
     for(size_t i=0;i<GC_INPUT_COUNT;i++) {
-        const cJSON *paths=cJSON_GetObjectItemCaseSensitive(inventory,inventory_keys[i]),*path_value;
-        if(!cJSON_IsArray(paths) || cJSON_GetArraySize(paths)>TGFS_MAX_RECORDS) {
-            fail(e,"invalid retention inventory array: %s",inventory_keys[i]);goto invalid;
-        }
-        cJSON_ArrayForEach(path_value,paths) {
-            if(!cJSON_IsString(path_value) || path_value->valuestring[0]!='/') {
-                fail(e,"retention inventory %s must contain absolute directory paths",inventory_keys[i]);goto invalid;
-            }
-        }
+        const cJSON *paths=cJSON_GetObjectItemCaseSensitive(inventory,inventory_keys[i]);
+        if(validate_inventory_paths(paths,inventory_keys[i],e)) goto invalid;
         supplied[i] |= paths->child!=NULL;
+        const char *key=inventory_root_keys[i];
+        if(!key) continue;
+        const cJSON *roots=cJSON_GetObjectItemCaseSensitive(inventory,key);
+        if(!roots) continue;
+        if(validate_inventory_paths(roots,key,e)) goto invalid;
+        supplied[i] |= roots->child!=NULL;
     }
     return inventory;
 invalid:
@@ -978,6 +990,82 @@ static int report_gc_input(tgfs_remote_session *session,const cJSON *chunk_refs,
         break;
     }
     return fail(e,"unsupported gc-plan input");
+}
+
+static int state_name_order(const void *left,const void *right)
+{
+    return strcmp(*(char *const *)left,*(char *const *)right);
+}
+
+static int list_state_dirs(DIR *root,const char *path,char **names,size_t *count,tgfs_error *e)
+{
+    for(;;) {
+        errno=0;
+        const struct dirent *entry=readdir(root);
+        if(!entry) return errno?fail(e,"cannot enumerate retention state root: %s",path):0;
+        if(same(entry->d_name,".") || same(entry->d_name,"..")) continue;
+        struct stat st;
+        if(fstatat(dirfd(root),entry->d_name,&st,AT_SYMLINK_NOFOLLOW))
+            return fail(e,"cannot inspect retention state entry: %s/%s",path,entry->d_name);
+        if(S_ISLNK(st.st_mode))
+            return fail(e,"symlink in retention state root: %s/%s",path,entry->d_name);
+        if(!S_ISDIR(st.st_mode)) continue;
+        if(!utf8_valid((const unsigned char *)entry->d_name,strlen(entry->d_name)))
+            return fail(e,"non-UTF-8 directory name in retention state root: %s",path);
+        if(*count>=TGFS_MAX_RECORDS) return fail(e,"too many directories in retention state root: %s",path);
+        char *name=strdup(entry->d_name);
+        if(!name) return fail(e,"out of memory");
+        names[(*count)++]=name;
+    }
+}
+
+static int report_gc_root(tgfs_remote_session *session,const cJSON *chunk_refs,cJSON **retained,
+                          const gc_input *root,cJSON *discovery,tgfs_error *e)
+{
+    size_t length=strlen(root->path);
+    while(length>1 && root->path[length-1]=='/') length--;
+    char *normalized=strndup(root->path,length);
+    if(!normalized) return fail(e,"out of memory");
+    int fd=open(normalized,O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+    free(normalized);
+    struct stat st;
+    if(fd<0 || fstat(fd,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {
+        if(fd>=0) close(fd);
+        return fail(e,"retention state root must be a private directory: %s",root->path);
+    }
+    DIR *dir=fdopendir(fd);
+    if(!dir) {close(fd);return fail(e,"cannot open retention state root: %s",root->path);}
+    char **names=calloc(TGFS_MAX_RECORDS,sizeof(*names));
+    size_t count=0;
+    int rc=-1;
+    if(!names) {fail(e,"out of memory");goto done;}
+    if(list_state_dirs(dir,root->path,names,&count,e)) goto done;
+    qsort(names,count,sizeof(*names),state_name_order);
+    cJSON *entry=cJSON_CreateObject();
+    if(!entry || !cJSON_AddItemToArray(discovery,entry)) {
+        cJSON_Delete(entry);fail(e,"out of memory");goto done;
+    }
+    cJSON *paths=cJSON_AddArrayToObject(entry,"state_dirs");
+    if(!paths || !cJSON_AddStringToObject(entry,"kind",inventory_keys[root->kind]) ||
+        !cJSON_AddStringToObject(entry,"root",root->path)) {
+        fail(e,"out of memory");goto done;
+    }
+    length=strlen(root->path);
+    for(size_t i=0;i<count;i++) {
+        size_t capacity=length+strlen(names[i])+2;
+        char *path=malloc(capacity);
+        if(!path) {fail(e,"out of memory");goto done;}
+        snprintf(path,capacity,"%s%s%s",root->path,root->path[length-1]=='/'?"":"/",names[i]);
+        gc_input child={path,root->kind};
+        int failed=report_id(paths,path,e) || report_gc_input(session,chunk_refs,retained,&child,e);
+        free(path);
+        if(failed) goto done;
+    }
+    rc=0;
+done:
+    for(size_t i=0;i<count;i++) free(names[i]);
+    free(names);closedir(dir);
+    return rc;
 }
 
 void tgfs_gc_plan_help(FILE *stream)
@@ -1074,6 +1162,19 @@ int tgfs_gc_plan_main(int argc,char **argv)
             cJSON_ArrayForEach(value,cJSON_GetObjectItemCaseSensitive(inventory,inventory_keys[i])) {
                 gc_input input={value->valuestring,(gc_input_kind)i};
                 if(report_gc_input(session,chunk_refs,retained,&input,&e)) goto done;
+            }
+        }
+        cJSON *discovery=NULL;
+        for(size_t i=0;i<GC_INPUT_COUNT;i++) {
+            const char *key=inventory_root_keys[i];
+            if(!key) continue;
+            const cJSON *root;
+            cJSON_ArrayForEach(root,cJSON_GetObjectItemCaseSensitive(inventory,key)) {
+                if(!discovery && !(discovery=cJSON_AddArrayToObject(report,"discovered_state_roots"))) {
+                    fail(&e,"out of memory");goto done;
+                }
+                gc_input input={root->valuestring,(gc_input_kind)i};
+                if(report_gc_root(session,chunk_refs,retained,&input,discovery,&e)) goto done;
             }
         }
     }
