@@ -924,10 +924,67 @@ typedef struct {
     gc_input_kind kind;
 } gc_input;
 
+static const char *const inventory_keys[GC_INPUT_COUNT]={"captures","intents","open_files"};
+
+static cJSON *load_retention_inventory(const char *path,const cJSON *journal,int supplied[GC_INPUT_COUNT],tgfs_error *e)
+{
+    const char *slash=strrchr(path,'/');
+    const char *name=slash?slash+1:path;
+    char *parent=slash && slash!=path?strndup(path,(size_t)(slash-path)):strdup(slash?"/":".");
+    if(!parent) {fail(e,"out of memory");return NULL;}
+    int dir=open(parent,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    free(parent);
+    if(dir<0) {fail(e,"cannot open retention inventory directory");return NULL;}
+    cJSON *inventory=json_load_at(dir,name,e);
+    close(dir);
+    if(!inventory) return NULL;
+    if(!same(json_string(inventory,"schema"),"TGFS_RETENTION_INVENTORY_V1")) {
+        fail(e,"invalid retention inventory schema");goto invalid;
+    }
+    const cJSON *sb=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
+    if(!same(json_string(inventory,"storage_chat_id"),json_string(journal,"storage_chat_id")) ||
+        !same(json_string(inventory,"root_object_id"),json_string(sb,"root_object_id")) ||
+        !same(json_string(inventory,"start_id"),json_string(sb,"start_id"))) {
+        fail(e,"retention inventory belongs to a different volume");goto invalid;
+    }
+    for(size_t i=0;i<GC_INPUT_COUNT;i++) {
+        const cJSON *paths=cJSON_GetObjectItemCaseSensitive(inventory,inventory_keys[i]),*path_value;
+        if(!cJSON_IsArray(paths) || cJSON_GetArraySize(paths)>TGFS_MAX_RECORDS) {
+            fail(e,"invalid retention inventory array: %s",inventory_keys[i]);goto invalid;
+        }
+        cJSON_ArrayForEach(path_value,paths) {
+            if(!cJSON_IsString(path_value) || path_value->valuestring[0]!='/') {
+                fail(e,"retention inventory %s must contain absolute directory paths",inventory_keys[i]);goto invalid;
+            }
+        }
+        supplied[i] |= paths->child!=NULL;
+    }
+    return inventory;
+invalid:
+    cJSON_Delete(inventory);return NULL;
+}
+
+static int report_gc_input(tgfs_remote_session *session,const cJSON *chunk_refs,cJSON **retained,
+                           const gc_input *input,tgfs_error *e)
+{
+    switch(input->kind) {
+    case GC_CAPTURE:
+        return report_retained_capture(session,input->path,chunk_refs,retained[GC_CAPTURE],e);
+    case GC_INTENT:
+        return report_retained_intent(session->journal,input->path,retained[GC_INTENT],e);
+    case GC_OPEN_FILES:
+        return report_open_files(session->journal,input->path,retained[GC_OPEN_FILES],e);
+    case GC_INPUT_COUNT:
+        break;
+    }
+    return fail(e,"unsupported gc-plan input");
+}
+
 void tgfs_gc_plan_help(FILE *stream)
 {
     fputs("usage: tgfs gc-plan --capture DIRECTORY --token-file PATH [options]\n"
           "List content duplicates verified from a completed capture. Reads metadata and CHUNK bytes.\n"
+          "  --retain-inventory PATH    Read all retained sources listed in a volume inventory.\n"
           "  --keep-history N           Preview keeping N older versions per object, plus the latest.\n"
           "  --retain-capture DIRECTORY  Include references from an older capture of this volume; repeatable.\n"
           "  --retain-intent DIRECTORY   Include an unfinished put state directory; repeatable.\n"
@@ -940,7 +997,7 @@ void tgfs_gc_plan_help(FILE *stream)
 int tgfs_gc_plan_main(int argc,char **argv)
 {
     tgfs_remote_options options={.no_cache=1,.timeout=60};
-    const char *timeout_text=NULL,*history_text=NULL;
+    const char *timeout_text=NULL,*history_text=NULL,*inventory_path=NULL;
     gc_input *inputs=NULL;
     size_t input_count=0;
     int supplied[GC_INPUT_COUNT]={0};
@@ -962,6 +1019,7 @@ int tgfs_gc_plan_main(int argc,char **argv)
         if(same(argv[i],"--capture")) slot=&options.capture;
         else if(same(argv[i],"--token-file")) slot=&options.token_file;
         else if(same(argv[i],"--proxy")) slot=&options.proxy;
+        else if(same(argv[i],"--retain-inventory")) slot=&inventory_path;
         else if(same(argv[i],"--keep-history")) slot=&history_text;
         else if(same(argv[i],"--timeout-seconds")) slot=&timeout_text;
         if(!slot || *slot || i+1>=argc) goto usage;
@@ -975,12 +1033,13 @@ int tgfs_gc_plan_main(int argc,char **argv)
     options.timeout=(unsigned)timeout;
     tgfs_error e={0};
     tgfs_remote_session *session=NULL;
-    cJSON *report=NULL;
+    cJSON *report=NULL,*inventory=NULL;
     char *json=NULL;
     int result=1;
     if(tgfs_remote_open(&options,&session,&e)) goto done;
     const cJSON *journal=session->journal;
     const cJSON *superblock=cJSON_GetObjectItemCaseSensitive(journal,"superblock");
+    if(inventory_path && !(inventory=load_retention_inventory(inventory_path,journal,supplied,&e))) goto done;
     report=cJSON_CreateObject();
     cJSON *groups=report?cJSON_AddArrayToObject(report,"groups"):NULL;
     if(!groups || !cJSON_AddStringToObject(report,"schema","TGFS_DUPLICATE_REPORT_V1") ||
@@ -1004,20 +1063,18 @@ int tgfs_gc_plan_main(int argc,char **argv)
             fail(&e,"out of memory");goto done;
         }
     }
-    for(size_t i=0;i<input_count;i++) {
-        const char *path=inputs[i].path;
-        switch(inputs[i].kind) {
-        case GC_CAPTURE:
-            if(report_retained_capture(session,path,chunk_refs,retained[GC_CAPTURE],&e)) goto done;
-            break;
-        case GC_INTENT:
-            if(report_retained_intent(journal,path,retained[GC_INTENT],&e)) goto done;
-            break;
-        case GC_OPEN_FILES:
-            if(report_open_files(journal,path,retained[GC_OPEN_FILES],&e)) goto done;
-            break;
-        case GC_INPUT_COUNT:
-            fail(&e,"unsupported gc-plan input");goto done;
+    for(size_t i=0;i<input_count;i++)
+        if(report_gc_input(session,chunk_refs,retained,&inputs[i],&e)) goto done;
+    if(inventory) {
+        if(!cJSON_AddStringToObject(report,"retention_inventory",inventory_path)) {
+            fail(&e,"out of memory");goto done;
+        }
+        for(size_t i=0;i<GC_INPUT_COUNT;i++) {
+            const cJSON *value;
+            cJSON_ArrayForEach(value,cJSON_GetObjectItemCaseSensitive(inventory,inventory_keys[i])) {
+                gc_input input={value->valuestring,(gc_input_kind)i};
+                if(report_gc_input(session,chunk_refs,retained,&input,&e)) goto done;
+            }
         }
     }
     if(history_text && !cJSON_AddNumberToObject(report,"keep_history",(double)keep_history)) {
@@ -1030,7 +1087,7 @@ int tgfs_gc_plan_main(int argc,char **argv)
     result=0;
 done:
     if(result) fprintf(stderr,"FAIL gc-plan: %s\n",e.message);
-    free(inputs);free(json);cJSON_Delete(report);tgfs_remote_close(session);
+    free(inputs);free(json);cJSON_Delete(inventory);cJSON_Delete(report);tgfs_remote_close(session);
     return result;
 usage:
     free(inputs);
