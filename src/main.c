@@ -1,8 +1,13 @@
 #include "tgfs/tgfs.h"
 #include "tgfs/bot_api.h"
 #include "tgfs/scan.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int print_entry(const char *name, const char *object_id, void *arg)
 {
@@ -25,6 +30,9 @@ static void help(FILE *stream)
           "       tgfs init --new-volume --token-file PATH --storage-chat-id ID --state-dir DIRECTORY [options]\n"
           "       tgfs mount --mountpoint DIRECTORY {--snapshot DIRECTORY | --capture DIRECTORY --token-file PATH} [options]\n"
           "       tgfs --help\n\n"
+          "Global option before the command:\n"
+          "  --volume-lock DIRECTORY  Use an existing private directory as a local volume lock.\n"
+          "                           gc-plan takes it exclusively; other commands share it.\n\n"
           "Snapshot commands (local data, no Telegram connection):\n"
           "  --snapshot DIRECTORY     Read snapshot.json and documents from DIRECTORY.\n"
           "  ls /absolute/path        List immediate directory entries.\n"
@@ -46,7 +54,7 @@ static void help(FILE *stream)
     fputc('\n',stream);tgfs_intent_help(stream);
 }
 
-int main(int argc, char **argv)
+static int dispatch(int argc, char **argv)
 {
     if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
         help(stdout); return 0;
@@ -78,4 +86,49 @@ int main(int argc, char **argv)
     if (result) fprintf(stderr, "tgfs: %s\n", error.message);
     tgfs_close(fs);
     return result ? 1 : 0;
+}
+
+
+static int lock_volume(const char *path,int exclusive)
+{
+    int fd=open(path,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    struct stat st;
+    if(fd<0 || fstat(fd,&st) || st.st_uid!=geteuid() || (st.st_mode&0077)) {
+        if(fd>=0) close(fd);
+        fprintf(stderr,"tgfs: volume lock must be an existing private directory owned by this user\n");
+        return -1;
+    }
+    int result;
+    do {result=flock(fd,(exclusive?LOCK_EX:LOCK_SH)|LOCK_NB);} while(result && errno==EINTR);
+    if(result) {
+        int error=errno;
+        close(fd);
+        if(error==EWOULDBLOCK)
+            fprintf(stderr,"tgfs: volume lock is busy: %s\n",path);
+        else
+            fprintf(stderr,"tgfs: cannot acquire volume lock: %s\n",strerror(error));
+        return -1;
+    }
+    return fd;
+}
+
+int main(int argc,char **argv)
+{
+    if(argc<2 || strcmp(argv[1],"--volume-lock")) return dispatch(argc,argv);
+    if(argc<4 || !*argv[2]) {
+        fputs("usage: tgfs --volume-lock DIRECTORY COMMAND [args]\n",stderr);
+        return 2;
+    }
+    const char *lock_path=argv[2];
+    argv[2]=argv[0];
+    argc-=2;argv+=2;
+    const char *last=argv[argc-1];
+    if(argc<=3 && (!strcmp(last,"--help") || !strcmp(last,"-h")))
+        return dispatch(argc,argv);
+
+    int fd=lock_volume(lock_path,!strcmp(argv[1],"gc-plan"));
+    if(fd<0) return 1;
+    int result=dispatch(argc,argv);
+    close(fd);
+    return result;
 }
