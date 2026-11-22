@@ -44,7 +44,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data=b'X'+data[1:]
         self.reply(data)
 class Remote(unittest.TestCase):
-    def run_read(self,command='ls',path='/documents',mode='ok',retained=(),intents=(),open_files=(),keep_history=None):
+    def run_read(self,command='ls',path='/documents',mode='ok',retained=(),intents=(),open_files=(),keep_history=None,inventory=None):
         snap=json.loads((EXAMPLE/'snapshot.json').read_text())
         records=[];payloads={}
         for m in sorted(snap['messages'],key=lambda r:int(r['message_id'])):
@@ -160,6 +160,10 @@ class Remote(unittest.TestCase):
             try:
                 common=['--capture',str(root),'--token-file',str(token)]
                 args=['gc-plan',*common] if command=='gc-plan' else ['read','--no-cache',*common,command,path]
+                listed=dict(captures=[],intents=[],open_files=[])
+                def add_source(key,flag,path):
+                    if inventory is not None: listed[key].append(str(path))
+                    else: args.extend([flag,str(path)])
                 if keep_history is not None: args.extend(['--keep-history',str(keep_history)])
                 for index,case in enumerate(retained):
                     old=root/f'retained-{index}';old.mkdir()
@@ -178,7 +182,7 @@ class Remote(unittest.TestCase):
                     if case=='foreign-start': saved['superblock']['start_id']='2'
                     if case=='incomplete': saved['scan_completed']=False
                     (old/'journal.json').write_text(json.dumps(saved))
-                    args.extend(['--retain-capture',str(old)])
+                    add_source('captures','--retain-capture',old)
                 if open_files:
                     mounted=root/'mounted';mounted.mkdir(mode=0o700)
                     report=mounted/'open-files.json'
@@ -186,7 +190,7 @@ class Remote(unittest.TestCase):
                         root_object_id=journal['superblock']['root_object_id'],start_id=journal['superblock']['start_id'],
                         boundary_id=journal['boundary_id'],files=open_files)))
                     report.chmod(0o600)
-                    args.extend(['--retain-open-files',str(mounted)])
+                    add_source('open_files','--retain-open-files',mounted)
                 locks=[]
                 try:
                     for index,case in enumerate(intents):
@@ -220,7 +224,23 @@ class Remote(unittest.TestCase):
                             locks.append(handle)
                             fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
                         if case=='pending-local': (state/'intent.tmp').write_text('pending')
-                        args.extend(['--retain-intent',str(state)])
+                        add_source('intents','--retain-intent',state)
+                    if inventory is not None:
+                        sb=journal['superblock']
+                        registered=dict(schema='TGFS_RETENTION_INVENTORY_V1',storage_chat_id=str(STORAGE),
+                                        root_object_id=sb['root_object_id'],start_id=sb['start_id'],**listed)
+                        if inventory=='combined':
+                            args.extend(['--retain-capture',registered['captures'].pop()])
+                        if inventory=='missing-source': registered['intents'].append(str(root/'absent'))
+                        if inventory=='wrong-root': registered['root_object_id']=str(uuid.uuid4())
+                        if inventory=='wrong-start': registered['start_id']='2'
+                        if inventory=='wrong-channel': registered['storage_chat_id']=str(STORAGE+1)
+                        if inventory=='relative': registered['captures']=['capture-008']
+                        if inventory=='bad-element': registered['captures']=[123]
+                        if inventory=='bad-schema': registered['schema']='TGFS_RETENTION_INVENTORY_V2'
+                        if inventory=='missing-array': del registered['open_files']
+                        registry=root/'inventory.json';registry.write_text(json.dumps(registered))
+                        args.extend(['--retain-inventory',str(registry)])
                     p=subprocess.run([BINARY,*args],
                         env=dict(os.environ,TGFS_TEST_API_BASE=f'http://127.0.0.1:{server.server_port}'),
                         capture_output=True,timeout=10)
@@ -348,6 +368,38 @@ class Remote(unittest.TestCase):
             with self.subTest(invalid_limit=limit):
                 rc,out,_,files=self.run_read('gc-plan',mode='gc-history',keep_history=limit)
                 self.assertEqual(rc,2);self.assertEqual(out,b'');self.assertEqual(files,[])
+
+    def test_gc_plan_retention_inventory(self):
+        for inventory in ('ok','combined'):
+            with self.subTest(inventory=inventory):
+                rc,out,err,files=self.run_read('gc-plan',mode='gc-history',keep_history=0,
+                    retained=('older',),intents=('base-only',),
+                    open_files=[dict(commit_id='110',chunk_ids=['101'])],inventory=inventory)
+                self.assertEqual(rc,0,err)
+                report=json.loads(out)
+                self.assertTrue(report['retention_inventory'].endswith('/inventory.json'))
+                self.assertEqual(report['scope'],'provided_captures_and_local_state_only')
+                for key in ('retained_captures','retained_intents','retained_open_files'):
+                    self.assertEqual(len(report[key]),1)
+                historical=next(c for c in report['chunk_references'] if c['chunk_id']=='101')
+                self.assertEqual(historical['retention_reasons'],
+                                 ['manifest_in_capture','retained_capture','unfinished_put','open_file'])
+                self.assertTrue(historical['history_preview']['retained_in_preview'])
+                self.assertEqual(files.count('file_101'),1)
+
+    def test_gc_plan_rejects_invalid_inventory(self):
+        for case,message in (
+            ('missing-source','private state directory'),('wrong-root','different volume'),
+            ('wrong-start','different volume'),('wrong-channel','different volume'),
+            ('relative','absolute directory paths'),('bad-element','absolute directory paths'),
+            ('bad-schema','invalid retention inventory schema'),('missing-array','inventory array'),
+        ):
+            with self.subTest(case=case):
+                rc,out,err,files=self.run_read('gc-plan',mode='gc-history',inventory=case)
+                self.assertEqual(rc,1,err)
+                self.assertEqual(out,b'')
+                self.assertIn(message,err)
+                if case!='missing-source': self.assertNotIn('file_101',files)
 
     def test_gc_plan_retains_navigation_edges(self):
         rc,out,err,files=self.run_read('gc-plan',mode='gc-navigation',retained=('navigation',))
