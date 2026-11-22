@@ -50,6 +50,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 command,env=s.lock_probe;s.lock_probe=None
                 s.lock_probe_result=subprocess.run(command,env=env,capture_output=True,timeout=5)
                 assert b'cannot exclusively lock private backlink-repair.log' in s.lock_probe_result.stderr
+            if getattr(s,'maintenance_probe',None):
+                command,env=s.maintenance_probe;s.maintenance_probe=None
+                s.maintenance_result=subprocess.run(command,env=env,capture_output=True,timeout=5)
             if s.mode.startswith('mkdir-child-') and expected=='child_send_pending':
                 pending=json.loads((s.intent.parent/'backlink-repair.log').read_text().splitlines()[-1])
                 assert pending==dict(event='child_send_pending',message_id=intent['object_id'])
@@ -170,7 +173,7 @@ class Put(unittest.TestCase):
         else:
             self.assertNotIn('sendDocument',s.calls[start:]);self.assertEqual(s.sent,before)
         self.assertEqual((state/'intent.json').read_bytes(),original)
-    def exercise(self,data=b'hello\n',mode='ok',readback=True,recover=False,recovery_mode='ok',finalize_case=None):
+    def exercise(self,data=b'hello\n',mode='ok',readback=True,recover=False,recovery_mode='ok',finalize_case=None,volume_lock=False):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);capture=root/'capture';capture.mkdir()
             journal=dict(schema='TGFS_JOURNAL_CAPTURE_V1',scan_completed=True,gap_policy='forward_400_is_gap',
@@ -193,8 +196,21 @@ class Put(unittest.TestCase):
             args=['put','--capture',str(capture),'--file',str(source),'--name','hello.txt',
                   '--state-dir',str(state),'--token-file',str(token),'--chunk-bytes','3','--send-interval-ms','0']
             if mode.startswith('reject-'): s.reject_kind='DIRECTORY'
+            if volume_lock:
+                guard=root/'volume-lock';guard.mkdir(mode=0o700)
+                guarded=['--volume-lock',str(guard)]
+                maintenance=[*guarded,'gc-plan','--capture',str(capture),'--token-file',str(token)]
+                s.maintenance_probe=([BINARY,*maintenance],env)
+                args=[*guarded,*args]
             try:
                 p=run(args)
+                if volume_lock:
+                    result=s.maintenance_result
+                    self.assertEqual(result.returncode,1,result.stderr)
+                    self.assertIn(b'volume lock is busy',result.stderr)
+                    self.assertEqual(result.stdout,b'')
+                    result=run(maintenance)
+                    self.assertEqual(result.returncode,0,result.stderr)
                 if mode!='ok':
                     self.assertEqual(p.returncode,1,p.stderr)
                     if mode!='put-lost-add': self.assertNotIn('DIRECTORY',s.sent)
@@ -1137,6 +1153,9 @@ class Put(unittest.TestCase):
         self.assertTrue(json.loads(result.stdout)['finalized'])
         result=run(['read','--no-cache','--capture',str(cap),'--token-file',cmd[-1],'cat','/hello.txt'])
         self.assertEqual(result.returncode,0,result.stderr);self.assertEqual(result.stdout,data)
+    def test_gc_plan_conflicts_with_active_put(self):
+        self.exercise(volume_lock=True)
+
     def test_put_records_chunk_rejections(self):
         for reason in ('400','403','429','twice','then-lost','wrong-op','bad-log','staging','pin','lock','later','500','mismatch','nodescription','result','badretry','no-retry'):
             with self.subTest(reason=reason): self.upload_recovery(writer_retry='chunk:'+reason)

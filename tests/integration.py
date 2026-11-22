@@ -1,7 +1,9 @@
 """End-to-end tests of the C executable with local message snapshots."""
 import copy
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -330,6 +332,41 @@ class ReadCore(unittest.TestCase):
         self.operation_directory(self.directory_op(1))
         self.directory_batch(20,parent=DIRECTORY)
         self.run_cli(ok=False,error='parent or document mode changed')
+
+    def test_volume_lock_modes(self):
+        self.write('snapshot.json',self.snapshot)
+        guard=self.path/'volume-lock'
+        guard.mkdir(mode=0o700)
+        prefix=[BINARY,'--volume-lock',str(guard)]
+        read=['--snapshot',str(self.path),'cat','/documents/hello.txt']
+        directory_fd=os.open(guard,os.O_RDONLY|os.O_DIRECTORY)
+        try:
+            fcntl.flock(directory_fd,fcntl.LOCK_SH)
+            shared=subprocess.run([*prefix,*read],capture_output=True,timeout=5)
+            self.assertEqual(shared.returncode,0,shared.stderr)
+            self.assertEqual(shared.stdout,self.data)
+            blocked=subprocess.run([*prefix,'gc-plan'],capture_output=True,timeout=5)
+            self.assertEqual(blocked.returncode,1,blocked.stderr)
+            self.assertIn(b'volume lock is busy',blocked.stderr)
+            fcntl.flock(directory_fd,fcntl.LOCK_EX)
+            for command in (read,['gc-plan']):
+                blocked=subprocess.run([*prefix,*command],capture_output=True,timeout=5)
+                self.assertEqual(blocked.returncode,1,blocked.stderr)
+                self.assertIn(b'volume lock is busy',blocked.stderr)
+                self.assertEqual(blocked.stdout,b'')
+            help_result=subprocess.run([*prefix,'gc-plan','--help'],capture_output=True,timeout=5)
+            self.assertEqual(help_result.returncode,0,help_result.stderr)
+        finally:
+            os.close(directory_fd)
+
+        unlocked=subprocess.run([*prefix,*read],capture_output=True,timeout=5)
+        self.assertEqual(unlocked.returncode,0,unlocked.stderr)
+        link=self.path/'volume-lock-link';link.symlink_to(guard,target_is_directory=True)
+        guard.chmod(0o755)
+        for invalid in (guard,link,self.path/'missing'):
+            rejected=subprocess.run([BINARY,'--volume-lock',str(invalid),*read],capture_output=True,timeout=5)
+            self.assertEqual(rejected.returncode,1,rejected.stderr)
+            self.assertIn(b'volume lock must be an existing private directory',rejected.stderr)
 
     def test_directory_malformed_operations(self):
         a=self.directory_op(1)

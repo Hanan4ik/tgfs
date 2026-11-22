@@ -212,12 +212,17 @@ class Fuse(unittest.TestCase):
     @unittest.skipUnless(Path('/dev/fuse').exists() and shutil.which('fusermount3'),'kernel mount unavailable: /dev/fuse or fusermount3 missing')
     def test_kernel_mount_when_available(self):
         point=self.root/'mnt';point.mkdir();log=self.root/'fuse.log'
+        guard=self.root/'volume-lock';guard.mkdir(mode=0o700)
+        prefix=[BINARY,'--volume-lock',str(guard)]
         with log.open('wb') as stream:
-            process=subprocess.Popen([BINARY,'mount','--snapshot',str(self.snapshot),'--mountpoint',str(point)],stdout=stream,stderr=stream)
+            process=subprocess.Popen([*prefix,'mount','--snapshot',str(self.snapshot),'--mountpoint',str(point)],stdout=stream,stderr=stream)
             try:
                 end=time.monotonic()+15
                 while time.monotonic()<end and process.poll() is None and not os.path.ismount(point): time.sleep(.05)
                 self.assertTrue(os.path.ismount(point),log.read_text())
+                blocked=subprocess.run([*prefix,'gc-plan'],capture_output=True,timeout=5)
+                self.assertEqual(blocked.returncode,1,blocked.stderr)
+                self.assertIn(b'volume lock is busy',blocked.stderr)
                 self.assertEqual(sorted(p.name for p in (point/'documents').iterdir()),['hello.txt','notes.txt','photo.jpg'])
                 with (point/'documents/hello.txt').open('rb',buffering=0) as f:
                     self.assertEqual(os.pread(f.fileno(),3,2),b'llo');self.assertEqual(os.pread(f.fileno(),1,6),b'')
@@ -231,6 +236,8 @@ class Fuse(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     process.send_signal(signal.SIGINT);process.wait(timeout=10)
                 self.assertEqual(process.returncode,0,log.read_text())
+                next_plan=subprocess.run([*prefix,'gc-plan'],capture_output=True,timeout=5)
+                self.assertEqual(next_plan.returncode,2,next_plan.stderr)
                 self.assertNotIn('AddressSanitizer',log.read_text())
                 self.assertNotIn('runtime error:',log.read_text())
 unittest.main()
